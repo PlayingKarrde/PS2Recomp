@@ -37,6 +37,7 @@ namespace ps2x::iop::detail
         m_interruptMask = 0;
         m_interruptControl = 1;
         m_dmaStart.reset();
+        m_spu2.reset();
     }
 
     uint32_t IopMemory::physicalAddress(uint32_t address) noexcept
@@ -58,6 +59,8 @@ namespace ps2x::iop::detail
     uint16_t IopMemory::read16(uint32_t address) const
     {
         const uint32_t phys = physicalAddress(address);
+        if (isSpu2Address(phys))
+            return m_spu2.readRegister(phys - Spu2Base);
         if (phys + 1u < RamSize)
         {
             uint16_t value;
@@ -115,6 +118,11 @@ namespace ps2x::iop::detail
     void IopMemory::write16(uint32_t address, uint16_t value)
     {
         const uint32_t phys = physicalAddress(address);
+        if (isSpu2Address(phys))
+        {
+            m_spu2.writeRegister(phys - Spu2Base, value);
+            return;
+        }
         if (phys + 1u < RamSize)
         {
             std::memcpy(m_ram.data() + phys, &value, sizeof(value));
@@ -253,15 +261,6 @@ namespace ps2x::iop::detail
         const bool secondCore = address == kDmaSpu1Chcr;
         m_hardware[address] = value & ~kDmaStart;
 
-        const uint32_t statusAddress = 0x1F900344u + (secondCore ? 0x400u : 0u);
-        const uint32_t alignedStatus = statusAddress & ~3u;
-        const uint32_t shift = (statusAddress & 2u) * 8u;
-        uint32_t status = 0u;
-        if (const auto current = m_hardware.find(alignedStatus); current != m_hardware.end())
-            status = current->second;
-        status |= 0x80u << shift;
-        m_hardware[alignedStatus] = status;
-
         const uint32_t blockControlAddress = address - sizeof(uint32_t);
         uint32_t blockControl = 0u;
         if (const auto current = m_hardware.find(blockControlAddress); current != m_hardware.end())
@@ -269,6 +268,15 @@ namespace ps2x::iop::detail
         const uint32_t wordsPerBlock = std::max<uint32_t>(blockControl & 0xFFFFu, 1u);
         const uint32_t blockCount = std::max<uint32_t>(blockControl >> 16u, 1u);
         const uint64_t transferWords = static_cast<uint64_t>(wordsPerBlock) * blockCount;
+
+        const uint32_t madrAddress = address - 2u * sizeof(uint32_t);
+        uint32_t madr = 0u;
+        if (const auto current = m_hardware.find(madrAddress); current != m_hardware.end())
+            madr = current->second;
+        const bool toSpu = (value & 1u) != 0u;
+        if (m_spu2.startDma(secondCore ? 1 : 0, m_ram, madr & 0x1FFFFFu, static_cast<uint32_t>(transferWords * 4u), toSpu))
+            return; // Auto-DMA completes as the mixer consumes it, not after a fixed delay.
+
         m_dmaStart = DmaStart{
             secondCore ? kDmaSpu1Irq : kDmaSpu0Irq,
             std::max<uint64_t>(transferWords * 2u, 64u),

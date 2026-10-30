@@ -28,6 +28,9 @@ namespace ps2x::iop
         [[nodiscard]] bool stopModule(int32_t moduleId, int32_t *result = nullptr);
         void runEeCycles(uint64_t eeCycles) noexcept;
 
+        // Called from the host's audio thread: interleaved stereo at 48 kHz.
+        void mixAudio(int16_t *output, size_t frames);
+
         [[nodiscard]] RpcAbi selectRpcAbi(const RpcAbiRequest &request) const;
         [[nodiscard]] bool canBindRpc(uint32_t sid) const noexcept;
         [[nodiscard]] RpcResult handleRpc(const RpcRequest &request);

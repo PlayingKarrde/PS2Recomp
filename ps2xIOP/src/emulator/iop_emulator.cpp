@@ -553,10 +553,22 @@ namespace ps2x::iop::detail
             servicingGuestCallbacks = false;
         }
 
+        void pollSpu2()
+        {
+            IopSpu2 &spu2 = memory.spu2();
+            if (spu2.takeAdmaComplete(0))
+                pendingDmaInterrupts[0x24] = totalCycles;
+            if (spu2.takeAdmaComplete(1))
+                pendingDmaInterrupts[0x28] = totalCycles;
+            if (spu2.takeIrq())
+                pendingDmaInterrupts[9] = totalCycles;
+        }
+
         void runCycles(uint64_t cycles) noexcept
         {
             try
             {
+                pollSpu2();
                 const uint64_t target = totalCycles + cycles;
                 while (totalCycles < target)
                 {
@@ -737,6 +749,11 @@ namespace ps2x::iop::detail
     bool IopEmulator::stopModule(int32_t moduleId, int32_t *result)
     {
         return m_impl->stopModule(moduleId, result);
+    }
+
+    void IopEmulator::mixAudio(int16_t *output, size_t frames)
+    {
+        m_impl->memory.spu2().mix(output, frames);
     }
 
     void IopEmulator::runEeCycles(uint64_t eeCycles) noexcept

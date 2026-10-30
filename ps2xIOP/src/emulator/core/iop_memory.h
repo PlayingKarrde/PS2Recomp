@@ -1,5 +1,7 @@
 #pragma once
 
+#include "iop_spu2.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -68,12 +70,14 @@ namespace ps2x::iop::detail
         void setInterruptControl(uint32_t value) noexcept { m_interruptControl = value & 1u; }
 
         [[nodiscard]] std::optional<DmaStart> takeDmaStart() noexcept;
+        [[nodiscard]] IopSpu2 &spu2() noexcept { return m_spu2; }
         [[nodiscard]] std::span<const uint8_t> ram() const noexcept { return m_ram; }
 
         [[nodiscard]] static uint32_t physicalAddress(uint32_t address) noexcept;
 
     private:
         [[nodiscard]] uint32_t readHardware32(uint32_t address) const;
+        [[nodiscard]] static bool isSpu2Address(uint32_t phys) noexcept { return phys >= Spu2Base && phys < Spu2End; }
         void writeHardware32(uint32_t address, uint32_t value);
         void markOwned(uint32_t address, size_t size);
 
@@ -87,5 +91,6 @@ namespace ps2x::iop::detail
         uint32_t m_interruptMask = 0;
         uint32_t m_interruptControl = 1;
         std::optional<DmaStart> m_dmaStart;
+        mutable IopSpu2 m_spu2; // register reads can have side effects
     };
 }

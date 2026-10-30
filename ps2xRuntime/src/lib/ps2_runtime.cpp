@@ -503,6 +503,23 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     s_hasUploadedFrame = true;
 }
 
+#if !defined(PLATFORM_VITA)
+namespace
+{
+    std::atomic<ps2x::iop::IopSubsystem *> s_audioSubsystem{nullptr};
+    AudioStream s_spu2Stream{};
+
+    void mixSpu2Audio(void *buffer, unsigned int frames)
+    {
+        auto *output = static_cast<int16_t *>(buffer);
+        if (ps2x::iop::IopSubsystem *subsystem = s_audioSubsystem.load())
+            subsystem->mixAudio(output, frames);
+        else
+            std::memset(output, 0, static_cast<size_t>(frames) * 2u * sizeof(int16_t));
+    }
+}
+#endif
+
 PS2Runtime::PS2Runtime()
 {
     m_iopHost = std::make_unique<PS2IopHostAdapter>(*this);
@@ -555,6 +572,14 @@ PS2Runtime::~PS2Runtime()
     try
     {
         requestStop();
+#if !defined(PLATFORM_VITA)
+        if (IsAudioDeviceReady())
+        {
+            s_audioSubsystem.store(nullptr);
+            StopAudioStream(s_spu2Stream);
+            UnloadAudioStream(s_spu2Stream);
+        }
+#endif
         m_iopSubsystem.reset();
         m_iopHost.reset();
 #if defined(PLATFORM_VITA)
@@ -761,6 +786,15 @@ bool PS2Runtime::initialize(const char *title)
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
         InitAudioDevice();
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
+        if (IsAudioDeviceReady())
+        {
+            // The SPU2 is mixed on raylib's audio thread and pulled at the device's pace.
+            s_audioSubsystem.store(m_iopSubsystem.get());
+            SetAudioStreamBufferSizeDefault(1024);
+            s_spu2Stream = LoadAudioStream(48000, 16, 2);
+            SetAudioStreamCallback(s_spu2Stream, mixSpu2Audio);
+            PlayAudioStream(s_spu2Stream);
+        }
 #endif
         SetTargetFPS(60);
         if (m_debugUiInitCallback)

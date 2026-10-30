@@ -169,6 +169,11 @@ namespace ps2x::iop
         m_impl->emulator.runEeCycles(eeCycles);
     }
 
+    void IopSubsystem::mixAudio(int16_t *output, size_t frames)
+    {
+        m_impl->emulator.mixAudio(output, frames);
+    }
+
     RpcAbi IopSubsystem::selectRpcAbi(const RpcAbiRequest &request) const
     {
         for (const auto &service : m_impl->coreServices)
