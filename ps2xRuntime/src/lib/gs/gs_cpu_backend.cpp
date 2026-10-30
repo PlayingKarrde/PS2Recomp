@@ -994,7 +994,10 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
         return;
     }
 
-    const uint32_t ztestMethod = static_cast<uint32_t>((ctx.test >> 17) & 3u);
+    // TEST.ZTE (bit 16) = 0 turns the depth test off: every pixel passes, as with ZTST = ALWAYS
+    // (PCSX2 does the same). FPR draws its in-match HUD with ZTE = 0 and ZTST = GEQUAL.
+    const bool depthTestEnabled = ((ctx.test >> 16) & 1u) != 0u;
+    const uint32_t ztestMethod = depthTestEnabled ? static_cast<uint32_t>((ctx.test >> 17) & 3u) : 1u;
     const bool alphaBlendEnabled = state.prim.abe;
     const bool preserveDestinationAlpha = writeMask.writeRgb && !writeMask.writeAlpha && fpsm == GS_PSM_CT32;
     const bool destinationAlphaTestNeedsRead = ((ctx.test >> 14) & 0x1u) != 0u && (fpsm == GS_PSM_CT32 || fpsm == GS_PSM_CT16 || fpsm == GS_PSM_CT16S);
