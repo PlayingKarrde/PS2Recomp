@@ -468,6 +468,10 @@ namespace ps2_syscalls
         setReturnS32(ctx, 0);
     }
 
+    // FPWR: low end of the main thread's stack, recorded by SetupThread. SetupHeap(-1) means
+    // "the rest of RAM", which on hardware ends where this stack begins (FPWR's pool needs all of it).
+    static uint32_t g_mainStackBase = 0u;
+
     // 0x3C SetupThread
     // args: $a0 = gp, $a1 = stack, $a2 = stack_size, $a3 = args, $t0 = root_func
     void SetupThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -529,6 +533,10 @@ namespace ps2_syscalls
         {
             initialStack = stack;
         }
+        if (stack != 0u)
+        {
+            g_mainStackBase = (stack == 0xFFFFFFFFu) ? sp : stack; // FPWR
+        }
 
         scheduler.setupCurrentThread(initialStack, stackSize, getRegU32(ctx, 28));
         setReturnU32(ctx, sp);
@@ -544,17 +552,19 @@ namespace ps2_syscalls
 
         // Silent Hill and other games often pass -1 (0xFFFFFFFF) to mean "rest of RAM".
         static constexpr uint32_t kDefaultGuestHeapEnd = 0x01F00000u;
-        uint32_t heapLimit = kDefaultGuestHeapEnd;
+        // FPWR: default to the main stack's low end when SetupThread gave one.
+        const uint32_t defaultHeapEnd = (g_mainStackBase > heapBase) ? g_mainStackBase : kDefaultGuestHeapEnd;
+        uint32_t heapLimit = defaultHeapEnd;
 
         if (heapSize != 0u && heapSize != 0xFFFFFFFFu)
         {
             const uint64_t candidate = static_cast<uint64_t>(heapBase) + static_cast<uint64_t>(heapSize);
-            heapLimit = static_cast<uint32_t>(std::min<uint64_t>(candidate, kDefaultGuestHeapEnd));
+            heapLimit = static_cast<uint32_t>(std::min<uint64_t>(candidate, defaultHeapEnd));
         }
 
         if (heapLimit <= heapBase)
         {
-            heapLimit = kDefaultGuestHeapEnd;
+            heapLimit = defaultHeapEnd;
         }
 
         if (runtime)

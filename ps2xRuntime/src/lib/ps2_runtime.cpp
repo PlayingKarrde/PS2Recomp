@@ -90,7 +90,11 @@ namespace
     constexpr uint32_t kGuestHeapDefaultBase = 0x00100000u;
     constexpr uint32_t kGuestHeapDefaultAlignment = 16u;
     constexpr uint32_t kGuestHeapSafetyPad = 0x1000u;
-    constexpr uint32_t kGuestHeapHardLimit = 0x01F00000u;
+    // FPWR: the game may own RAM up to its main stack (SetupHeap clamps to that), so the runtime keeps
+// its own guest-visible memory in low RAM below the ELF instead of at 0x01F00000+ (see State.h pools).
+constexpr uint32_t kGuestHeapHardLimit = 0x02000000u;
+constexpr uint32_t kAsyncCallbackStackFloor = 0x000C1000u;
+constexpr uint32_t kAsyncCallbackStackTop = 0x00100000u;
 
     constexpr uint32_t COP0_CAUSE_EXCCODE_MASK = 0x0000007Cu;
     constexpr uint32_t COP0_CAUSE_BD = 0x80000000u;
@@ -503,8 +507,8 @@ PS2Runtime::PS2Runtime()
     m_guestHeapLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
     m_guestHeapSuggestedBase = kGuestHeapDefaultBase;
     m_guestHeapConfigured = false;
-    m_asyncCallbackStackFloor = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
-    m_asyncCallbackStackTop = PS2_RAM_SIZE;
+    m_asyncCallbackStackFloor = kAsyncCallbackStackFloor; // FPWR
+    m_asyncCallbackStackTop = kAsyncCallbackStackTop;     // FPWR
 }
 
 void PS2Runtime::setDebugUiCallbacks(DebugUiCallback initCallback,
@@ -971,9 +975,8 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
     }
     {
         std::lock_guard<std::mutex> lock(m_asyncCallbackStackMutex);
-        const uint32_t hardLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
-        m_asyncCallbackStackFloor = std::min(std::max(hardLimit, suggestedHeapBase), PS2_RAM_SIZE);
-        m_asyncCallbackStackTop = PS2_RAM_SIZE;
+        m_asyncCallbackStackFloor = kAsyncCallbackStackFloor; // FPWR
+        m_asyncCallbackStackTop = kAsyncCallbackStackTop;     // FPWR
     }
 
     LoadedModule module;
