@@ -1602,12 +1602,59 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
     const uint64_t area = (maxX >= minX && maxY >= minY)
                               ? static_cast<uint64_t>(maxX - minX + 1) * static_cast<uint64_t>(maxY - minY + 1) / 2u
                               : 0u;
+    // Each barycentric weight is linear in px along a row: w = slope * px + intercept.
+    // Solving w >= -kEdgeEpsilon for all three gives the row's covered span, so only that
+    // span is visited. It is padded by a pixel on each side and every pixel still goes through
+    // the exact per-pixel test below, so the pixels drawn are the same as a full bounding-box scan.
+    const float slope0 = (fy1 - fy2) * winding * invAbsDenom;
+    const float slope1 = (fy2 - fy0) * winding * invAbsDenom;
+    const float slope2 = -slope0 - slope1;
+    auto rowSpan = [&](float py, int &spanX0, int &spanX1) -> bool
+    {
+        const float intercept0 = ((fy1 - fy2) * -fx2 + (fx2 - fx1) * (py - fy2)) * winding * invAbsDenom;
+        const float intercept1 = ((fy2 - fy0) * -fx2 + (fx0 - fx2) * (py - fy2)) * winding * invAbsDenom;
+        const float intercept2 = 1.0f - intercept0 - intercept1;
+        if (!std::isfinite(slope2) || !std::isfinite(intercept2) || !std::isfinite(intercept0))
+        {
+            // Non-finite weights would slip through the per-pixel test; scan the whole row as before.
+            spanX0 = minX;
+            spanX1 = maxX;
+            return true;
+        }
+        float lo = -std::numeric_limits<float>::infinity();
+        float hi = std::numeric_limits<float>::infinity();
+        const float slopes[3] = {slope0, slope1, slope2};
+        const float intercepts[3] = {intercept0, intercept1, intercept2};
+        for (int i = 0; i < 3; ++i)
+        {
+            const float bound = (-kEdgeEpsilon - intercepts[i]);
+            if (slopes[i] > 0.0f)
+                lo = std::max(lo, bound / slopes[i]);
+            else if (slopes[i] < 0.0f)
+                hi = std::min(hi, bound / slopes[i]);
+            else if (intercepts[i] < -kEdgeEpsilon)
+                return false;
+        }
+        if (!(lo <= hi + 2.0f) || lo > static_cast<float>(maxX) + 2.0f || hi < static_cast<float>(minX) - 2.0f)
+            return false;
+        // px = x + 0.5; the padding absorbs rounding differences against the per-pixel test.
+        spanX0 = lo > static_cast<float>(minX) ? static_cast<int>(std::floor(lo - 0.5f)) - 1 : minX;
+        spanX1 = hi < static_cast<float>(maxX) ? static_cast<int>(std::ceil(hi - 0.5f)) + 1 : maxX;
+        spanX0 = std::max(spanX0, minX);
+        spanX1 = std::min(spanX1, maxX);
+        return spanX0 <= spanX1;
+    };
+
     RasterizeRows(minY, maxY, area, batch, [&](int firstRow, int lastRow, GSMem::TexturePageCache &pageCache, bool storeTexels)
     {
         for (int y = firstRow; y <= lastRow; ++y)
         {
             float py = static_cast<float>(y) + 0.5f;
-            for (int x = minX; x <= maxX; ++x)
+            int spanX0, spanX1;
+            const bool rowHit = rowSpan(py, spanX0, spanX1);
+            if (!rowHit)
+                continue;
+            for (int x = spanX0; x <= spanX1; ++x)
             {
                 float px = static_cast<float>(x) + 0.5f;
 
