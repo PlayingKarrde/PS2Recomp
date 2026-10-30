@@ -512,6 +512,7 @@ namespace ps2_stubs
             uint64_t presentationEndTickQ32 = std::numeric_limits<uint64_t>::max();
             int64_t firstPresentedPts90k = -1;
             uint64_t ptsPresentationBaseTickQ32 = 0u;
+            uint32_t nodataCallsWithoutPicture = 0u; // FPWR
         };
 
         struct MpegStreamCallbackEvent
@@ -546,6 +547,11 @@ namespace ps2_stubs
 
         std::mutex g_mpeg_stub_mutex;
         constexpr uint32_t kMpegPictureWaitType = 1u;
+        // FPWR: sceMpegCbNodata, and how many back-to-back no-data callbacks may run without a
+        // decoded picture before the stream is treated as ended (end of file, or a callback that
+        // never delivers).
+        constexpr uint32_t kMpegCbNodata = 1u;
+        constexpr uint32_t kMaxNodataCallsWithoutPicture = 256u;
         MpegStubState g_mpeg_stub_state;
 
         // TODO this resolution should follow runtime resolution
@@ -2280,6 +2286,44 @@ namespace ps2_stubs
         setReturnU32(ctx, getPlaybackState(mpegAddr).decodeMode);
     }
 
+    // FPWR: run the guest's sceMpegCbNodata callback on the current thread, then finish the
+    // sceMpegGetPicture call it interrupted. A callback result <= 0 aborts decoding (-1).
+    [[noreturn]] static void invokeNodataCallback(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime,
+                                                  uint32_t mpegAddr, uint32_t func, uint32_t data)
+    {
+        const uint32_t cbDataAddr = runtime->guestMalloc(kMpegCallbackDataSize, 16u);
+        if (uint8_t *cbData = cbDataAddr ? getMemPtr(rdram, cbDataAddr) : nullptr)
+        {
+            std::memset(cbData, 0, kMpegCallbackDataSize);
+            *reinterpret_cast<uint32_t *>(cbData) = kMpegCbNodata;
+        }
+
+        GuestInvocation invocation{};
+        invocation.kind = GuestInvocationKind::HleCall;
+        invocation.context = *ctx;
+        invocation.context.pc = func;
+        SET_GPR_U32(&invocation.context, 4, mpegAddr);
+        SET_GPR_U32(&invocation.context, 5, cbDataAddr);
+        SET_GPR_U32(&invocation.context, 6, data);
+        SET_GPR_U32(&invocation.context, 7, 0u);
+        SET_GPR_U32(&invocation.context, 29, 0u);
+        SET_GPR_U32(&invocation.context, 31, 0u);
+        invocation.onComplete = [rdram, runtime, cbDataAddr](const R5900Context &callback, R5900Context &parent)
+        {
+            if (cbDataAddr != 0u)
+            {
+                runtime->guestFree(cbDataAddr);
+            }
+            if (static_cast<int32_t>(getRegU32(&callback, 2)) <= 0)
+            {
+                setReturnS32(&parent, -1);
+                return;
+            }
+            sceMpegGetPicture(rdram, &parent, runtime);
+        };
+        runtime->eeScheduler().invokeCurrent(std::move(invocation));
+    }
+
     void sceMpegGetPicture(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const uint32_t mpegAddr = getRegU32(ctx, 4);
@@ -2292,6 +2336,39 @@ namespace ps2_stubs
         {
             std::unique_lock<std::mutex> lock(g_mpeg_stub_mutex);
             MpegPlaybackState &playback = getPlaybackState(mpegAddr);
+            // FPWR: games that feed the decoder themselves (no sceCdSt* stream) register a "no data"
+            // callback. The real library calls it from inside sceMpegGetPicture whenever the
+            // bitstream runs dry; it reads more from disc and calls sceMpegDemuxPssRing. Parking
+            // the thread instead deadlocks such games, because the parked thread is the one that
+            // feeds the ring (Fire Pro Wrestling Returns intro movie).
+            if (playback.decodedFrames.empty() &&
+                g_mpeg_stub_state.cdStreamGeneration == 0u &&
+                !playback.streamEnded &&
+                !playback.decoderFailed)
+            {
+                const MpegRegisteredCallback *nodata = nullptr;
+                for (const MpegRegisteredCallback &callback : g_mpeg_stub_state.callbacksByMpeg[mpegAddr])
+                {
+                    if (callback.type == kMpegCbNodata && !callback.stream && runtime->hasFunction(callback.func))
+                    {
+                        nodata = &callback;
+                        break;
+                    }
+                }
+                if (nodata)
+                {
+                    if (playback.nodataCallsWithoutPicture < kMaxNodataCallsWithoutPicture)
+                    {
+                        ++playback.nodataCallsWithoutPicture;
+                        const uint32_t func = nodata->func;
+                        const uint32_t data = nodata->data;
+                        lock.unlock();
+                        invokeNodataCallback(rdram, ctx, runtime, mpegAddr, func, data);
+                    }
+                    playback.streamEnded = true;
+                }
+            }
+
             if (playback.decodedFrames.empty() &&
                 !g_mpeg_stub_state.currentCdStreamEofSeen &&
                 !playback.streamEnded &&
@@ -2360,6 +2437,7 @@ namespace ps2_stubs
 
                 frame = std::move(playback.decodedFrames.front());
                 playback.decodedFrames.pop_front();
+                playback.nodataCallsWithoutPicture = 0u; // FPWR
                 playback.width = static_cast<uint32_t>(frame.width);
                 playback.height = static_cast<uint32_t>(frame.height);
                 width = playback.width;
