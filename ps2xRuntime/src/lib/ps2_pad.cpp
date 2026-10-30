@@ -87,37 +87,36 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
         data[4] = static_cast<uint8_t>(128 + rx * 127);
         data[5] = static_cast<uint8_t>(128 + ry * 127);
     }
-    else
-    {
-        if (IsKeyDown(KEY_UP) || IsKeyDown(KEY_W))
-            clearBit(PAD_UP);
-        if (IsKeyDown(KEY_DOWN) || IsKeyDown(KEY_S))
-            clearBit(PAD_DOWN);
-        if (IsKeyDown(KEY_LEFT) || IsKeyDown(KEY_A))
-            clearBit(PAD_LEFT);
-        if (IsKeyDown(KEY_RIGHT) || IsKeyDown(KEY_D))
-            clearBit(PAD_RIGHT);
-        if (IsKeyDown(KEY_X) || IsKeyDown(KEY_SPACE))
-            clearBit(PAD_CROSS);
-        if (IsKeyDown(KEY_C) || IsKeyDown(KEY_ESCAPE))
-            clearBit(PAD_CIRCLE);
-        if (IsKeyDown(KEY_Z) || IsKeyDown(KEY_KP_0))
-            clearBit(PAD_SQUARE);
-        if (IsKeyDown(KEY_V) || IsKeyDown(KEY_KP_1))
-            clearBit(PAD_TRIANGLE);
-        if (IsKeyDown(KEY_Q))
-            clearBit(PAD_L1);
-        if (IsKeyDown(KEY_E))
-            clearBit(PAD_R1);
-        if (IsKeyDown(KEY_LEFT_SHIFT))
-            clearBit(PAD_L2);
-        if (IsKeyDown(KEY_RIGHT_SHIFT))
-            clearBit(PAD_R2);
-        if (IsKeyDown(KEY_ENTER))
-            clearBit(PAD_START);
-        if (IsKeyDown(KEY_TAB))
-            clearBit(PAD_SELECT);
-    }
+
+    // The keyboard stays live with a controller connected.
+    if (IsKeyDown(KEY_UP) || IsKeyDown(KEY_W))
+        clearBit(PAD_UP);
+    if (IsKeyDown(KEY_DOWN) || IsKeyDown(KEY_S))
+        clearBit(PAD_DOWN);
+    if (IsKeyDown(KEY_LEFT) || IsKeyDown(KEY_A))
+        clearBit(PAD_LEFT);
+    if (IsKeyDown(KEY_RIGHT) || IsKeyDown(KEY_D))
+        clearBit(PAD_RIGHT);
+    if (IsKeyDown(KEY_X) || IsKeyDown(KEY_SPACE))
+        clearBit(PAD_CROSS);
+    if (IsKeyDown(KEY_C) || IsKeyDown(KEY_ESCAPE))
+        clearBit(PAD_CIRCLE);
+    if (IsKeyDown(KEY_Z) || IsKeyDown(KEY_KP_0))
+        clearBit(PAD_SQUARE);
+    if (IsKeyDown(KEY_V) || IsKeyDown(KEY_KP_1))
+        clearBit(PAD_TRIANGLE);
+    if (IsKeyDown(KEY_Q))
+        clearBit(PAD_L1);
+    if (IsKeyDown(KEY_E))
+        clearBit(PAD_R1);
+    if (IsKeyDown(KEY_LEFT_SHIFT))
+        clearBit(PAD_L2);
+    if (IsKeyDown(KEY_RIGHT_SHIFT))
+        clearBit(PAD_R2);
+    if (IsKeyDown(KEY_ENTER))
+        clearBit(PAD_START);
+    if (IsKeyDown(KEY_TAB))
+        clearBit(PAD_SELECT);
 
     data[2] = static_cast<uint8_t>(btns & 0xFF);
     data[3] = static_cast<uint8_t>(btns >> 8);
