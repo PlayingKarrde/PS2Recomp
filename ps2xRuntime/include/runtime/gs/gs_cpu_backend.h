@@ -4,14 +4,20 @@
 #include "runtime/gs/gs_texture_page_cache.h"
 
 #include <array>
+#include <condition_variable>
+#include <deque>
 #include <functional>
+#include <memory>
 #include <mutex>
+#include <thread>
+#include <unordered_map>
 #include <vector>
 
 class GSCpuBackend final : public GSRasterBackend
 {
 public:
     GSCpuBackend();
+    ~GSCpuBackend() override;
 
     void Initialize(uint8_t *vram, uint32_t vramSize) override;
     void Reset() override;
@@ -99,23 +105,27 @@ private:
     std::vector<GSMem::TexturePageCache> m_workerPageCaches;
 
     // FPWR: triangles and sprites are queued, then drawn together by all raster threads. Each
-    // thread owns whole row bands for the length of the queue and walks the queue in order, so
-    // every pixel still sees its primitives in submission order. Ordering against everything
-    // else is kept as follows:
-    // - most other entry points flush the queue first;
+    // thread owns whole row bands for the length of a batch and walks it in order, so every
+    // pixel still sees its primitives in submission order. A full queue is handed to a drawer
+    // thread as a batch ("kick") and the caller carries on; batches are drawn one after another.
+    // Ordering against everything else is kept as follows:
+    // - entry points that read or write VRAM directly kick and wait until every batch is drawn;
+    //   FINISH and Flush() only kick, and presentation waits without holding m_mutex;
     // - a primitive that writes memory the queue reads or writes differently, or reads memory the
-    //   queue writes, flushes it first;
-    // - a CLUT load does not flush: each queued primitive keeps the CLUT it was queued with;
-    // - a host-to-GS upload over memory queued primitives read does not flush: the old pages are
-    //   saved first, and those primitives read the saved copies ("epochs" below). An upload over
-    //   memory the queue writes flushes it.
+    //   queue writes, kicks the queue first (batches are drawn in order, so no wait is needed);
+    // - a CLUT load does not kick: each queued primitive keeps the CLUT it was queued with;
+    // - a host-to-GS upload over memory queued primitives read saves the old pages first, and those
+    //   primitives read the saved copies ("epochs" below). An upload over memory the queue writes
+    //   kicks and waits;
+    // - a kicked batch takes its own copy of every page it reads (after waiting for batches that
+    //   write them), so an upload or CLUT load only waits for batches that write what it touches.
     // PS2X_GS_DEFER=0 turns the queue off.
     struct QueuedPrimitive
     {
         GSPrimitiveBatch batch;
         int minY;
         int maxY;
-        uint32_t clut;  // index into m_clutSnapshots
+        uint32_t clut;  // index into Batch::cluts
         uint32_t epoch; // uploads that saved pages before this primitive was queued
     };
     struct VramRange
@@ -129,33 +139,51 @@ private:
         uint32_t epoch; // content seen by primitives with epoch <= this
         std::vector<uint8_t> bytes;
     };
+    struct Batch
+    {
+        std::vector<QueuedPrimitive> prims;
+        std::vector<std::array<uint16_t, 512>> cluts;
+        std::unordered_map<uint32_t, std::vector<SavedPage>> savedPages; // by page index, oldest first
+        std::vector<VramRange> reads;
+        std::vector<VramRange> writes;
+    };
     struct BandContext
     {
         int first;
         int last;
         GSMem::TexturePageCache *pageCache;
         TexelCache *texelCache;
-        const GSCpuBackend *backend;
+        const Batch *batch;
         uint32_t epoch;
     };
     bool QueuePrimitive(const GSPrimitiveBatch &batch);
     void CollectUploadRange(const GSTransferCommand &command, std::vector<VramRange> &out) const;
     bool PrepareUpload(const GSTransferCommand &command);
-    void FlushQueueUnlocked();
+    void KickQueueUnlocked();                        // hand the queue to the drawer
+    uint64_t KickedBatches() const;                  // batches kicked so far
+    void WaitForBatches(uint64_t count) const;       // until `count` batches are drawn
+    void FlushQueueUnlocked();                       // kick and wait until everything is drawn
+    void WaitIfInFlight(const std::vector<VramRange> &ranges, bool includeReads);
+    void DrawBatch(const Batch &batch);
+    void DrawerMain();
     static const uint8_t *SavedPageSource(const void *band, uint32_t pageBase);
     TexelCache &ActiveTexelCache() { return t_band ? *t_band->texelCache : m_texelCache; }
-    std::vector<QueuedPrimitive> m_queue;
-    std::vector<VramRange> m_queueWrites;
-    std::vector<VramRange> m_queueReads;
+    Batch m_pending; // the queue being filled
     std::vector<TexelCache> m_workerTexelCaches;
-    std::vector<std::array<uint16_t, 512>> m_clutSnapshots;
     bool m_clutChanged = true;
-    std::vector<std::vector<SavedPage>> m_savedPages; // by page index, oldest first
-    std::vector<uint32_t> m_savedPageList;             // page indices with saved copies
     uint32_t m_queueEpoch = 0;
     size_t m_queueSizeAtTransfer = 0;
     static thread_local BandContext *t_band;
     static thread_local const uint16_t *t_clut; // CLUT of the queued primitive being drawn
+
+    mutable std::mutex m_drawMutex; // guards the fields below
+    mutable std::condition_variable m_drawWake;
+    mutable std::condition_variable m_drawDone;
+    std::deque<std::unique_ptr<Batch>> m_inFlight; // front is being drawn
+    uint64_t m_batchesKicked = 0;
+    uint64_t m_batchesDrawn = 0;
+    bool m_drawerStop = false;
+    std::thread m_drawer;
 
     GSTransferCommand m_transfer{};
     GSTransferSnapshot m_transferState{};

@@ -322,7 +322,7 @@ namespace
     }
 
     // FPWR: worker threads that rasterize in row bands, either the rows of one large primitive
-    // or a whole queue of primitives (see FlushQueueUnlocked). Bands never share a framebuffer
+    // or a whole queue of primitives (see DrawBatch). Bands never share a framebuffer
     // pixel. PS2X_GS_THREADS sets the total thread
     // count including the caller (1 disables the pool).
     class RasterPool
@@ -674,8 +674,8 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
         return;
     if (QueuePrimitive(batch))
     {
-        if (m_queue.size() >= kMaxQueuedPrimitives)
-            FlushQueueUnlocked();
+        if (m_pending.prims.size() >= kMaxQueuedPrimitives)
+            KickQueueUnlocked();
         return;
     }
     FlushQueueUnlocked();
@@ -818,16 +818,16 @@ bool GSCpuBackend::QueuePrimitive(const GSPrimitiveBatch &batch)
     bool hazard = false;
     for (const VramRange &w : writes)
     {
-        for (const VramRange &q : m_queueWrites)
+        for (const VramRange &q : m_pending.writes)
             hazard |= q.key != w.key && rangesOverlap(q, w);
-        for (const VramRange &q : m_queueReads)
+        for (const VramRange &q : m_pending.reads)
             hazard |= rangesOverlap(q, w);
     }
     for (const VramRange &r : reads)
-        for (const VramRange &q : m_queueWrites)
+        for (const VramRange &q : m_pending.writes)
             hazard |= rangesOverlap(q, r);
     if (hazard)
-        FlushQueueUnlocked();
+        KickQueueUnlocked();
 
     auto remember = [](std::vector<VramRange> &list, const VramRange &range)
     {
@@ -837,23 +837,128 @@ bool GSCpuBackend::QueuePrimitive(const GSPrimitiveBatch &batch)
         list.push_back(range);
     };
     for (const VramRange &w : writes)
-        remember(m_queueWrites, w);
+        remember(m_pending.writes, w);
     for (const VramRange &r : reads)
-        remember(m_queueReads, r);
-    if (m_clutSnapshots.empty() || m_clutChanged)
+        remember(m_pending.reads, r);
+    if (m_pending.cluts.empty() || m_clutChanged)
     {
-        m_clutSnapshots.push_back(m_clut);
+        m_pending.cluts.push_back(m_clut);
         m_clutChanged = false;
     }
-    m_queue.push_back({batch, minY, maxY, static_cast<uint32_t>(m_clutSnapshots.size() - 1u), m_queueEpoch});
+    m_pending.prims.push_back({batch, minY, maxY, static_cast<uint32_t>(m_pending.cluts.size() - 1u), m_queueEpoch});
     return true;
+}
+
+void GSCpuBackend::KickQueueUnlocked()
+{
+    if (m_pending.prims.empty())
+        return;
+
+    // Give the batch its own copy of every page it reads, so uploads after this point need not
+    // wait for it. Pages that batches in flight still write (render to texture) are copied once
+    // those batches are done.
+    WaitIfInFlight(m_pending.reads, false);
+    constexpr uint32_t kPage = GSMem::TexturePageCache::kPageSize;
+    for (const VramRange &r : m_pending.reads)
+        for (uint32_t page = r.begin / kPage; page * kPage < r.end; ++page)
+        {
+            std::vector<SavedPage> &history = m_pending.savedPages[page];
+            if (history.empty() || history.back().epoch != m_queueEpoch)
+                history.push_back({m_queueEpoch, std::vector<uint8_t>(m_vram + page * kPage, m_vram + (page + 1u) * kPage)});
+        }
+
+    auto batch = std::make_unique<Batch>(std::move(m_pending));
+    m_pending = Batch{};
+    m_clutChanged = true;
+    m_queueEpoch = 0u;
+    m_queueSizeAtTransfer = 0u;
+    {
+        std::lock_guard<std::mutex> lock(m_drawMutex);
+        if (!m_drawer.joinable())
+            m_drawer = std::thread([this] { DrawerMain(); });
+        m_inFlight.push_back(std::move(batch));
+        ++m_batchesKicked;
+    }
+    m_drawWake.notify_one();
+}
+
+uint64_t GSCpuBackend::KickedBatches() const
+{
+    std::lock_guard<std::mutex> lock(m_drawMutex);
+    return m_batchesKicked;
+}
+
+void GSCpuBackend::WaitForBatches(uint64_t count) const
+{
+    std::unique_lock<std::mutex> lock(m_drawMutex);
+    m_drawDone.wait(lock, [&] { return m_batchesDrawn >= count; });
 }
 
 void GSCpuBackend::FlushQueueUnlocked()
 {
-    if (m_queue.empty())
-        return;
+    KickQueueUnlocked();
+    WaitForBatches(KickedBatches());
+}
 
+void GSCpuBackend::WaitIfInFlight(const std::vector<VramRange> &ranges, bool includeReads)
+{
+    bool overlap = false;
+    {
+        std::lock_guard<std::mutex> lock(m_drawMutex);
+        for (const std::unique_ptr<Batch> &batch : m_inFlight)
+            for (const VramRange &range : ranges)
+            {
+                for (const VramRange &w : batch->writes)
+                    overlap |= rangesOverlap(range, w);
+                if (includeReads)
+                    for (const VramRange &r : batch->reads)
+                        overlap |= rangesOverlap(range, r);
+            }
+    }
+    if (overlap)
+        WaitForBatches(KickedBatches());
+}
+
+void GSCpuBackend::DrawerMain()
+{
+    for (;;)
+    {
+        Batch *batch = nullptr;
+        {
+            std::unique_lock<std::mutex> lock(m_drawMutex);
+            m_drawWake.wait(lock, [&] { return m_drawerStop || !m_inFlight.empty(); });
+            if (m_inFlight.empty())
+                return;
+            batch = m_inFlight.front().get();
+        }
+        DrawBatch(*batch);
+        {
+            std::lock_guard<std::mutex> lock(m_drawMutex);
+            m_inFlight.pop_front();
+            ++m_batchesDrawn;
+        }
+        m_drawDone.notify_all();
+    }
+}
+
+GSCpuBackend::~GSCpuBackend()
+{
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        KickQueueUnlocked();
+    }
+    WaitForBatches(KickedBatches());
+    {
+        std::lock_guard<std::mutex> lock(m_drawMutex);
+        m_drawerStop = true;
+    }
+    m_drawWake.notify_all();
+    if (m_drawer.joinable())
+        m_drawer.join();
+}
+
+void GSCpuBackend::DrawBatch(const Batch &batch)
+{
     RasterPool &pool = RasterPool::instance();
     const size_t slots = pool.workerCount() + 1u;
     if (m_workerPageCaches.size() < slots)
@@ -861,22 +966,22 @@ void GSCpuBackend::FlushQueueUnlocked()
     if (m_workerTexelCaches.size() < slots)
         m_workerTexelCaches.resize(slots);
 
-    int firstRow = m_queue.front().minY;
-    int lastRow = m_queue.front().maxY;
-    for (const QueuedPrimitive &q : m_queue)
+    int firstRow = batch.prims.front().minY;
+    int lastRow = batch.prims.front().maxY;
+    for (const QueuedPrimitive &q : batch.prims)
     {
         firstRow = std::min(firstRow, q.minY);
         lastRow = std::max(lastRow, q.maxY);
     }
 
-    const bool savedPages = !m_savedPageList.empty();
+    const bool savedPages = !batch.savedPages.empty();
     pool.run(firstRow, lastRow, [&](int bandFirst, int bandLast, unsigned slot)
              {
         GSMem::TexturePageCache &pageCache = m_workerPageCaches[slot];
-        BandContext band{bandFirst, bandLast, &pageCache, &m_workerTexelCaches[slot], this, 0u};
+        BandContext band{bandFirst, bandLast, &pageCache, &m_workerTexelCaches[slot], &batch, 0u};
         pageCache.SetSource(savedPages ? &SavedPageSource : nullptr, &band);
         t_band = &band;
-        for (const QueuedPrimitive &q : m_queue)
+        for (const QueuedPrimitive &q : batch.prims)
         {
             if (q.maxY < bandFirst || q.minY > bandLast)
                 continue;
@@ -885,34 +990,22 @@ void GSCpuBackend::FlushQueueUnlocked()
                 band.epoch = q.epoch;
                 pageCache.Invalidate();
             }
-            t_clut = m_clutSnapshots[q.clut].data();
+            t_clut = batch.cluts[q.clut].data();
             DrawPrimitive(q.batch);
         }
         t_clut = nullptr;
         t_band = nullptr;
         pageCache.SetSource(nullptr, nullptr); });
-
-    m_queue.clear();
-    m_clutSnapshots.clear();
-    m_clutChanged = true;
-    m_queueWrites.clear();
-    m_queueReads.clear();
-    for (uint32_t page : m_savedPageList)
-        m_savedPages[page].clear();
-    m_savedPageList.clear();
-    m_queueEpoch = 0u;
-    m_queueSizeAtTransfer = 0u;
 }
 
 const uint8_t *GSCpuBackend::SavedPageSource(const void *context, uint32_t pageBase)
 {
     // The content a primitive of this epoch saw is the oldest copy saved at or after its epoch.
     const BandContext &band = *static_cast<const BandContext *>(context);
-    const uint32_t page = pageBase / GSMem::TexturePageCache::kPageSize;
-    const auto &history = band.backend->m_savedPages;
-    if (page >= history.size())
+    const auto found = band.batch->savedPages.find(pageBase / GSMem::TexturePageCache::kPageSize);
+    if (found == band.batch->savedPages.end())
         return nullptr;
-    for (const SavedPage &saved : history[page])
+    for (const SavedPage &saved : found->second)
         if (saved.epoch >= band.epoch)
             return saved.bytes.data();
     return nullptr;
@@ -928,15 +1021,17 @@ void GSCpuBackend::CollectUploadRange(const GSTransferCommand &command, std::vec
 
 bool GSCpuBackend::PrepareUpload(const GSTransferCommand &command)
 {
-    // Returns true when the queue had to be flushed. Otherwise saves the pages queued primitives
+    // Before a host-to-GS upload. Waits for batches being drawn that touch the destination.
+    // Returns true when the queue had to be flushed; otherwise saves the pages queued primitives
     // read that this upload will overwrite, and starts a new epoch.
-    if (m_queue.empty())
-        return false;
     thread_local std::vector<VramRange> dest;
     dest.clear();
     CollectUploadRange(command, dest);
+    WaitIfInFlight(dest, false);
+    if (m_pending.prims.empty())
+        return false;
     for (const VramRange &d : dest)
-        for (const VramRange &w : m_queueWrites)
+        for (const VramRange &w : m_pending.writes)
             if (rangesOverlap(d, w))
             {
                 FlushQueueUnlocked();
@@ -944,8 +1039,6 @@ bool GSCpuBackend::PrepareUpload(const GSTransferCommand &command)
             }
 
     constexpr uint32_t kPage = GSMem::TexturePageCache::kPageSize;
-    if (m_savedPages.size() < GSMem::MEMORY_SIZE / kPage)
-        m_savedPages.resize(GSMem::MEMORY_SIZE / kPage);
     bool saved = false;
     for (const VramRange &d : dest)
     {
@@ -953,22 +1046,20 @@ bool GSCpuBackend::PrepareUpload(const GSTransferCommand &command)
         {
             const VramRange pageRange{page * kPage, (page + 1u) * kPage, 0u};
             bool read = false;
-            for (const VramRange &r : m_queueReads)
+            for (const VramRange &r : m_pending.reads)
                 read |= rangesOverlap(pageRange, r);
             if (!read)
                 continue;
-            std::vector<SavedPage> &history = m_savedPages[page];
+            std::vector<SavedPage> &history = m_pending.savedPages[page];
             if (!history.empty() && history.back().epoch == m_queueEpoch)
                 continue; // already saved for this epoch
-            if (history.empty())
-                m_savedPageList.push_back(page);
             history.push_back({m_queueEpoch, std::vector<uint8_t>(m_vram + page * kPage, m_vram + (page + 1u) * kPage)});
             saved = true;
         }
     }
     if (saved)
         ++m_queueEpoch;
-    m_queueSizeAtTransfer = m_queue.size();
+    m_queueSizeAtTransfer = m_pending.prims.size();
     return false;
 }
 
@@ -1006,17 +1097,17 @@ void GSCpuBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
         return;
     }
 
-    if (!m_queue.empty())
     {
-        // Queued primitives keep the CLUT they were queued with (m_clutSnapshots), so a load only
-        // has to wait for them if it reads memory they write.
+        // Queued primitives keep the CLUT they were queued with (Batch::cluts), so a load only
+        // has to wait for primitives that write the memory it reads.
         thread_local std::vector<VramRange> source;
         source.clear();
         addBufferRange(source, tex0.cbp * 256u, std::max<uint32_t>(texclut.cbw, 1u) * 64u,
                        static_cast<uint32_t>(texclut.cov) + 16u, tex0.cpsm, 0u);
+        WaitIfInFlight(source, false);
         bool overlap = false;
         for (const VramRange &r : source)
-            for (const VramRange &w : m_queueWrites)
+            for (const VramRange &w : m_pending.writes)
                 overlap |= rangesOverlap(r, w);
         if (overlap)
             FlushQueueUnlocked();
@@ -1076,7 +1167,7 @@ void GSCpuBackend::LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &t
 void GSCpuBackend::Flush()
 {
     std::lock_guard<std::mutex> lock(m_mutex);
-    FlushQueueUnlocked();
+    KickQueueUnlocked();
 }
 
 void GSCpuBackend::TextureFlush()
@@ -1087,10 +1178,19 @@ void GSCpuBackend::TextureFlush()
     m_texturePageCache.Invalidate();
 }
 
-void GSCpuBackend::Sync(GSSyncReason)
+void GSCpuBackend::Sync(GSSyncReason reason)
 {
-    std::lock_guard<std::mutex> lock(m_mutex);
-    FlushQueueUnlocked();
+    // FINISH needs no wait: anything that reads the result waits for it. Other syncs wait without
+    // holding m_mutex, so the EE can keep queuing meanwhile.
+    uint64_t kicked;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        KickQueueUnlocked();
+        if (reason == GSSyncReason::Finish)
+            return;
+        kicked = KickedBatches();
+    }
+    WaitForBatches(kicked);
 }
 
 uint32_t GSCpuBackend::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const
@@ -1131,8 +1231,16 @@ void GSCpuBackend::WriteVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, u
 
 void GSCpuBackend::SnapshotVram(std::vector<uint8_t> &out) const
 {
+    // Waits only for what was queued before the call; later batches may be drawing into other
+    // buffers while the copy is taken.
+    uint64_t kicked;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        const_cast<GSCpuBackend *>(this)->KickQueueUnlocked();
+        kicked = KickedBatches();
+    }
+    WaitForBatches(kicked);
     std::lock_guard<std::mutex> lock(m_mutex);
-    const_cast<GSCpuBackend *>(this)->FlushQueueUnlocked();
     if (!m_vram || m_vramSize == 0u)
     {
         out.clear();
@@ -2164,8 +2272,17 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
 void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
-    if (m_queue.size() != m_queueSizeAtTransfer)
+    if (m_pending.prims.size() != m_queueSizeAtTransfer)
+    {
         PrepareUpload(m_transfer); // primitives were queued since the transfer started
+    }
+    else
+    {
+        thread_local std::vector<VramRange> dest;
+        dest.clear();
+        CollectUploadRange(m_transfer, dest);
+        WaitIfInFlight(dest, false); // batches kicked since the transfer started
+    }
     UploadImageUnlocked(data, sizeBytes);
 }
 
