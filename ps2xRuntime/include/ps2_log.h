@@ -2,6 +2,7 @@
 #define PS2_LOG_H
 
 #include <algorithm>
+#include <cstdlib>
 #include <deque>
 #include <filesystem>
 #include <fstream>
@@ -160,8 +161,21 @@ inline int &depth()
     static thread_local int d = 0;
     return d;
 }
+// FPWR: per-function enter/exit tracing writes and flushes two lines per guest call, which took
+// ~40% of the game thread and made movies crawl. It is now opt-in: set PS2X_FUNCTION_LOG=1.
+inline bool function_log_enabled()
+{
+    static const bool enabled = []
+    {
+        const char *value = std::getenv("PS2X_FUNCTION_LOG");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
 inline void log_entry(const char *name)
 {
+    if (!function_log_enabled())
+        return;
     for (int i = 0; i < depth(); ++i)
         log_stream() << '\t';
     log_stream() << ">> " << name << " enter\n";
@@ -170,6 +184,8 @@ inline void log_entry(const char *name)
 }
 inline void log_exit(const char *name)
 {
+    if (!function_log_enabled())
+        return;
     depth()--;
     for (int i = 0; i < depth(); ++i)
         log_stream() << '\t';
