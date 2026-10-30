@@ -500,6 +500,17 @@ uint32_t GS::getLastDisplayBaseBytes() const
 
 void GS::refreshDisplaySnapshot()
 {
+    // FPWR: the EE scheduler calls this at each VBlankStart. The CPU backend then presents VRAM as
+    // of this point in the command stream (GSCpuBackend::MarkPresentation); other backends keep
+    // the old full snapshot.
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    if (!m_backend || !m_privRegs)
+        return;
+    if (auto *cpu = dynamic_cast<GSCpuBackend *>(m_backend.get()))
+    {
+        cpu->MarkPresentation(buildPresentationRequestUnlocked());
+        return;
+    }
     snapshotVRAM();
 }
 
@@ -539,7 +550,6 @@ void GS::latchHostPresentationFrame()
         }
         request = buildPresentationRequestUnlocked();
     }
-
     PresentationFrame frame{};
     {
         std::lock_guard<std::mutex> backendLock(m_backendLifetimeMutex);

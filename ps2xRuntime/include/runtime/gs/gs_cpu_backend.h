@@ -40,6 +40,13 @@ public:
     void SnapshotVram(std::vector<uint8_t> &out) const override;
     GSTransferSnapshot GetTransferSnapshot() const override;
 
+    // FPWR: called at each guest VBlankStart. FPR draws straight into the buffer it displays
+    // (the real GS finishes a frame within the vertical blank), so presenting VRAM at an arbitrary
+    // host moment showed half-drawn frames: elements flickered. The marker goes into the draw
+    // queue behind everything submitted so far, the drawer copies VRAM when it reaches it, and
+    // Present() shows that copy.
+    void MarkPresentation(const GSPresentationRequest &request);
+
 private:
     void ResetUnlocked();
     void LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &texclut);
@@ -146,6 +153,8 @@ private:
         std::unordered_map<uint32_t, std::vector<SavedPage>> savedPages; // by page index, oldest first
         std::vector<VramRange> reads;
         std::vector<VramRange> writes;
+        bool present = false; // a presentation marker (no primitives): copy VRAM when reached
+        GSPresentationRequest request{};
     };
     struct BandContext
     {
@@ -184,6 +193,12 @@ private:
     uint64_t m_batchesDrawn = 0;
     bool m_drawerStop = false;
     std::thread m_drawer;
+
+    mutable std::mutex m_presentMutex; // guards the presented copy below
+    std::vector<uint8_t> m_presentVram; // VRAM as of the latest presentation marker
+    GSPresentationRequest m_presentRequest{};
+    bool m_hasPresentVram = false;
+    std::vector<uint8_t> m_presentScratch; // drawer thread only
 
     GSTransferCommand m_transfer{};
     GSTransferSnapshot m_transferState{};

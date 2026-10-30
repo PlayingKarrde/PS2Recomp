@@ -882,6 +882,36 @@ void GSCpuBackend::KickQueueUnlocked()
     m_drawWake.notify_one();
 }
 
+void GSCpuBackend::MarkPresentation(const GSPresentationRequest &request)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!m_vram)
+        return;
+    KickQueueUnlocked();
+    auto marker = std::make_unique<Batch>();
+    marker->present = true;
+    marker->request = request;
+    // The displayed buffers count as read until the copy is taken, so an upload into them waits.
+    const auto addDisplay = [&](uint64_t dispfb, uint64_t display)
+    {
+        const uint32_t fbp = static_cast<uint32_t>(dispfb & 0x1FFu);
+        const uint32_t fbw = static_cast<uint32_t>((dispfb >> 9) & 0x3Fu);
+        const uint32_t psm = static_cast<uint32_t>((dispfb >> 15) & 0x1Fu);
+        const uint32_t height = static_cast<uint32_t>((display >> 44) & 0x7FFu) + 1u;
+        addBufferRange(marker->reads, fbp * 8192u, std::max(fbw, 1u) * 64u, height, psm, 0u);
+    };
+    addDisplay(request.dispfb1, request.display1);
+    addDisplay(request.dispfb2, request.display2);
+    {
+        std::lock_guard<std::mutex> drawLock(m_drawMutex);
+        if (!m_drawer.joinable())
+            m_drawer = std::thread([this] { DrawerMain(); });
+        m_inFlight.push_back(std::move(marker));
+        ++m_batchesKicked;
+    }
+    m_drawWake.notify_one();
+}
+
 uint64_t GSCpuBackend::KickedBatches() const
 {
     std::lock_guard<std::mutex> lock(m_drawMutex);
@@ -931,7 +961,18 @@ void GSCpuBackend::DrawerMain()
                 return;
             batch = m_inFlight.front().get();
         }
-        DrawBatch(*batch);
+        if (batch->present)
+        {
+            m_presentScratch.assign(m_vram, m_vram + m_vramSize);
+            std::lock_guard<std::mutex> lock(m_presentMutex);
+            m_presentVram.swap(m_presentScratch);
+            m_presentRequest = batch->request;
+            m_hasPresentVram = true;
+        }
+        else
+        {
+            DrawBatch(*batch);
+        }
         {
             std::lock_guard<std::mutex> lock(m_drawMutex);
             m_inFlight.pop_front();
@@ -2709,12 +2750,22 @@ PresentationFrame GSCpuBackend::Present(const GSPresentationRequest &request)
 {
     // Snapshot local memory under the backend lock, then perform the expensive
     // display conversion without holding the producer-side raster lock.
+    thread_local GSCpuBackend snapshotBackend;
+    {
+        // FPWR: show VRAM as of the latest guest VBlankStart (see MarkPresentation).
+        std::lock_guard<std::mutex> lock(m_presentMutex);
+        if (m_hasPresentVram)
+        {
+            snapshotBackend.Initialize(m_presentVram.data(), static_cast<uint32_t>(m_presentVram.size()));
+            return snapshotBackend.PresentFromLocalMemory(m_presentRequest);
+        }
+    }
+
     thread_local std::vector<uint8_t> snapshot;
     SnapshotVram(snapshot);
     if (snapshot.empty())
         return {};
 
-    thread_local GSCpuBackend snapshotBackend;
     snapshotBackend.Initialize(snapshot.data(), static_cast<uint32_t>(snapshot.size()));
     return snapshotBackend.PresentFromLocalMemory(request);
 }

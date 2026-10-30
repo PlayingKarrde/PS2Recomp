@@ -1941,6 +1941,8 @@ void EeScheduler::processEvent(const EeEvent &event)
         requestStop();
         break;
     case EeEventType::VBlankStart:
+        // FPWR: present what the game has drawn up to now (the frame it finished before this vblank).
+        m_runtime.gs().refreshDisplaySnapshot();
         ++m_vsyncTick;
         m_runtime.memory().gs().vsyncTick.store(m_vsyncTick, std::memory_order_release);
         if ((m_vsyncTick & 1u) != 0u)
