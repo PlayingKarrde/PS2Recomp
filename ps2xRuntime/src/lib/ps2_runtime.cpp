@@ -399,6 +399,131 @@ constexpr uint32_t kAsyncCallbackStackTop = 0x00100000u;
     }
 }
 
+namespace
+{
+    // Games in the PS2's field mode draw one 224-line picture per VBlank, with every other picture
+    // half a line higher. A TV lays those pictures between each other's lines. Shown one at a time
+    // they bounce, so we rebuild the 448-line picture: lines from the newest picture stay, and the
+    // lines between come from the previous picture where nothing moved and are interpolated where
+    // something did.
+    class FieldDeinterlacer
+    {
+    public:
+        void reset()
+        {
+            m_hasPrevious = false;
+            m_hasOlder = false;
+        }
+
+        void process(const uint8_t *current, uint32_t width, uint32_t height, uint8_t *output, size_t outputStride)
+        {
+            const size_t stride = static_cast<size_t>(width) * 4u;
+            const size_t bytes = stride * height;
+            if (m_previous.size() != bytes)
+            {
+                m_previous.resize(bytes);
+                m_older.resize(bytes);
+                m_motion.resize(static_cast<size_t>(width) * height);
+                reset();
+            }
+
+            if (m_hasPrevious)
+                m_lower = currentIsLower(current, width, height);
+            const bool lower = m_lower;
+
+            for (uint32_t y = 0; y < height; ++y)
+            {
+                const uint8_t *row = current + y * stride;
+                const uint8_t *older = m_older.data() + y * stride;
+                uint8_t *motion = m_motion.data() + static_cast<size_t>(y) * width;
+                for (uint32_t x = 0; x < width; ++x)
+                    motion[x] = m_hasOlder ? channelDifference(row + x * 4u, older + x * 4u) : 255u;
+            }
+
+            for (uint32_t y = 0; y < height; ++y)
+            {
+                std::memcpy(output + (y * 2u + (lower ? 1u : 0u)) * outputStride, current + y * stride, stride);
+
+                const uint32_t above = lower ? (y > 0u ? y - 1u : 0u) : y;
+                const uint32_t below = lower ? y : std::min(y + 1u, height - 1u);
+                const uint8_t *rowAbove = current + above * stride;
+                const uint8_t *rowBelow = current + below * stride;
+                const uint8_t *motionAbove = m_motion.data() + static_cast<size_t>(above) * width;
+                const uint8_t *motionBelow = m_motion.data() + static_cast<size_t>(below) * width;
+                const uint8_t *previous = m_previous.data() + y * stride;
+                uint8_t *target = output + (y * 2u + (lower ? 0u : 1u)) * outputStride;
+                for (uint32_t x = 0; x < width; ++x)
+                {
+                    const uint32_t left = x > 0u ? x - 1u : 0u;
+                    const uint32_t right = std::min(x + 1u, width - 1u);
+                    const uint8_t motion = std::max({motionAbove[left], motionAbove[x], motionAbove[right],
+                                                     motionBelow[left], motionBelow[x], motionBelow[right]});
+                    uint8_t *pixel = target + x * 4u;
+                    if (m_hasPrevious && motion <= kStillThreshold)
+                    {
+                        std::memcpy(pixel, previous + x * 4u, 4u);
+                        continue;
+                    }
+                    const uint8_t *a = rowAbove + x * 4u;
+                    const uint8_t *b = rowBelow + x * 4u;
+                    for (int channel = 0; channel < 4; ++channel)
+                        pixel[channel] = static_cast<uint8_t>((a[channel] + b[channel] + 1) / 2);
+                }
+            }
+
+            m_older.swap(m_previous);
+            std::memcpy(m_previous.data(), current, bytes);
+            m_hasOlder = m_hasPrevious;
+            m_hasPrevious = true;
+        }
+
+    private:
+        static constexpr uint8_t kStillThreshold = 16u;
+
+        static uint8_t channelDifference(const uint8_t *a, const uint8_t *b)
+        {
+            const int red = std::abs(static_cast<int>(a[0]) - b[0]);
+            const int green = std::abs(static_cast<int>(a[1]) - b[1]);
+            const int blue = std::abs(static_cast<int>(a[2]) - b[2]);
+            return static_cast<uint8_t>(std::max({red, green, blue}));
+        }
+
+        // Which way a picture is offset can't be read from the display registers, so measure it:
+        // a picture half a line below the last one sits between that one's rows y and y + 1.
+        // A tie, such as two identical pictures, flips the last answer as the fields would.
+        bool currentIsLower(const uint8_t *current, uint32_t width, uint32_t height) const
+        {
+            const size_t stride = static_cast<size_t>(width) * 4u;
+            int64_t lowerError = 0;
+            int64_t upperError = 0;
+            for (uint32_t y = 0; y + 1u < height; ++y)
+            {
+                const uint8_t *row = current + y * stride;
+                const uint8_t *nextRow = row + stride;
+                const uint8_t *previous = m_previous.data() + y * stride;
+                const uint8_t *nextPrevious = previous + stride;
+                for (uint32_t x = 0; x < width; x += 4u)
+                {
+                    const size_t i = static_cast<size_t>(x) * 4u + 1u; // green
+                    const int between = previous[i] + nextPrevious[i];
+                    lowerError += std::abs(2 * row[i] - between);
+                    upperError += std::abs(2 * nextRow[i] - between);
+                }
+            }
+            if (lowerError == upperError)
+                return !m_lower;
+            return lowerError < upperError;
+        }
+
+        std::vector<uint8_t> m_previous;
+        std::vector<uint8_t> m_older;
+        std::vector<uint8_t> m_motion;
+        bool m_hasPrevious = false;
+        bool m_hasOlder = false;
+        bool m_lower = false;
+    };
+}
+
 static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
 {
     static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
@@ -408,6 +533,8 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     static bool s_lastPreferred = false;
     static uint32_t s_lastWidth = 0u;
     static uint32_t s_lastHeight = 0u;
+    static uint32_t s_lastOutputHeight = 0u;
+    static FieldDeinterlacer s_deinterlacer;
     static bool s_hasUploadedFrame = false;
     static std::vector<uint8_t> s_scratch;
     static std::vector<uint8_t> s_uploadBuffer(DEFAULT_FB_SIZE, 0u);
@@ -423,7 +550,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     else if (s_hasUploadedFrame)
     {
         outWidth = (s_lastWidth != 0u) ? s_lastWidth : FB_WIDTH;
-        outHeight = (s_lastHeight != 0u) ? s_lastHeight : DEFAULT_DISPLAY_HEIGHT;
+        outHeight = (s_lastOutputHeight != 0u) ? s_lastOutputHeight : DEFAULT_DISPLAY_HEIGHT;
         return;
     }
 
@@ -447,6 +574,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
         outHeight = DEFAULT_DISPLAY_HEIGHT;
         s_lastWidth = outWidth;
         s_lastHeight = outHeight;
+        s_lastOutputHeight = outHeight;
         s_hasUploadedFrame = true;
         return;
     }
@@ -477,8 +605,18 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     s_lastHeight = height;
 
     std::fill(s_uploadBuffer.begin(), s_uploadBuffer.end(), 0u);
-    if (!s_scratch.empty() && width != 0u && height != 0u)
+    uint32_t outputHeight = height;
+    const bool fieldPictures = (rt->memory().gs().smode2 & 0x1ull) != 0ull && height != 0u && height * 2u <= FB_HEIGHT &&
+                               width != 0u && width <= FB_WIDTH &&
+                               s_scratch.size() >= static_cast<size_t>(width) * height * 4u;
+    if (fieldPictures)
     {
+        s_deinterlacer.process(s_scratch.data(), width, height, s_uploadBuffer.data(), static_cast<size_t>(FB_WIDTH) * 4u);
+        outputHeight = height * 2u;
+    }
+    else if (!s_scratch.empty() && width != 0u && height != 0u)
+    {
+        s_deinterlacer.reset();
         const uint32_t copyWidth = std::min<uint32_t>(width, FB_WIDTH);
         const uint32_t copyHeight = std::min<uint32_t>(height, FB_HEIGHT);
         const size_t srcRowBytes = static_cast<size_t>(width) * 4u;
@@ -499,7 +637,8 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
 
     UpdateTexture(tex, s_uploadBuffer.data());
     outWidth = width;
-    outHeight = height;
+    outHeight = outputHeight;
+    s_lastOutputHeight = outputHeight;
     s_hasUploadedFrame = true;
 }
 
