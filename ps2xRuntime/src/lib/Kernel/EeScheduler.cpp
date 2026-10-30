@@ -55,6 +55,29 @@ namespace
     constexpr uint64_t kVBlankDurationCycles = microsecondsToEeCycles(500u);
     constexpr uint64_t kAlarmTickCycles = microsecondsToEeCycles(kAlarmTickMicroseconds);
 
+    // FPWR: invocation stacks of deleted threads, for reuse. Stacks are cached per (thread id,
+    // depth) and the runtime's callback-stack region holds only ~15 of them, so with FPR creating
+    // threads under new ids all session long it ran out ("EE invocation stack space exhausted").
+    // A static keeps ee_scheduler.h (included by generated code) unchanged.
+    std::vector<uint32_t> s_freeInvocationStacks;
+
+    void releaseInvocationStacks(std::unordered_map<uint64_t, uint32_t> &tops, int id)
+    {
+        const uint32_t owner = static_cast<uint32_t>(id);
+        for (auto it = tops.begin(); it != tops.end();)
+        {
+            if (static_cast<uint32_t>(it->first >> 32u) == owner)
+            {
+                s_freeInvocationStacks.push_back(it->second);
+                it = tops.erase(it);
+            }
+            else
+            {
+                ++it;
+            }
+        }
+    }
+
     template <typename Map>
     int allocatePositiveId(int &nextId, const Map &objects)
     {
@@ -512,6 +535,7 @@ int EeScheduler::deleteThread(int id, uint32_t &ownedStack)
         ownedStack = it->second.stack;
     }
     m_threads.erase(it);
+    releaseInvocationStacks(m_invocationStackTops, id);
     publishSnapshot();
     return KE_OK;
 }
@@ -560,6 +584,7 @@ int EeScheduler::startThread(int id, uint32_t arg, const R5900Context &caller, b
     if (deleteThreadRecord && id != kMainThreadId)
     {
         m_threads.erase(id);
+        releaseInvocationStacks(m_invocationStackTops, id);
     }
     if (ownedStack != 0u)
     {
@@ -1211,7 +1236,16 @@ uint32_t EeScheduler::invocationStackTop()
         return existing->second;
     }
     constexpr uint32_t kInvocationStackSize = 0x4000u;
-    const uint32_t top = m_runtime.reserveAsyncCallbackStack(kInvocationStackSize, 16u);
+    uint32_t top = 0u;
+    if (!s_freeInvocationStacks.empty())
+    {
+        top = s_freeInvocationStacks.back();
+        s_freeInvocationStacks.pop_back();
+    }
+    else
+    {
+        top = m_runtime.reserveAsyncCallbackStack(kInvocationStackSize, 16u);
+    }
     if (top == 0u)
     {
         throw std::runtime_error("EE invocation stack space exhausted");
