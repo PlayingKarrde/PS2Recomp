@@ -358,6 +358,34 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
 {
     accountCycles(cycles);
 
+    // FPWR: guest time must not fall behind host time. Each dispatch only accounts a few cycles,
+    // so while any thread is busy the EE clock ran far slower than real time, and every alarm
+    // (DelayThread) took many times longer than asked (FPR's 4 ms movie-loop sleep took ~200 ms).
+    // Statics instead of members keep ee_scheduler.h (included by generated code) unchanged.
+    static uint32_t s_realtimeCheck = 0u;
+    if ((++s_realtimeCheck & 0x3FFu) == 0u)
+    {
+        using HostClock = std::chrono::steady_clock;
+        static const HostClock::time_point s_hostBase = HostClock::now();
+        static uint64_t s_cycleBase = m_eeCycle;
+        const uint64_t elapsedUs = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(HostClock::now() - s_hostBase).count());
+        const uint64_t hostCycle = s_cycleBase + elapsedUs * (kEeClockHz / 1000u) / 1000u;
+        if (hostCycle > m_eeCycle)
+        {
+            // After a long host stall (debugger, window drag), catch up at most two frames and
+            // re-anchor instead of firing a burst of timers.
+            constexpr uint64_t kMaxCatchUpCycles = kEeClockHz / 30u;
+            uint64_t lag = hostCycle - m_eeCycle;
+            if (lag > kMaxCatchUpCycles)
+            {
+                s_cycleBase -= lag - kMaxCatchUpCycles;
+                lag = kMaxCatchUpCycles;
+            }
+            accountCycles(static_cast<uint32_t>(lag));
+        }
+    }
+
     if (m_checkpointPending.load(std::memory_order_acquire) ||
         m_stopRequested.load(std::memory_order_acquire))
     {
