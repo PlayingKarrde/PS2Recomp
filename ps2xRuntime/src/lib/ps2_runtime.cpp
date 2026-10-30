@@ -11,6 +11,7 @@
 #include "Kernel/Stubs/GS.h"
 #include "Kernel/Stubs/MPEG.h"
 #include "ps2_host_backend.h"
+#include <rlgl.h>
 #include "ps2_iop_host.h"
 #include "ps2x/iop/iop_subsystem.h"
 
@@ -71,6 +72,48 @@ static float hostDisplayAspect()
     }();
     return s_aspect;
 }
+// Scaling filter for the picture on screen. PS2X_SCALE picks it: "sharp" (default), "nearest" or
+// "bilinear". Sharp blows each pixel up by a whole number, which keeps it crisp and even, and only
+// smooths the last fraction of a pixel where the window size doesn't divide evenly.
+enum class HostScaleFilter
+{
+    Sharp,
+    Nearest,
+    Bilinear
+};
+
+static HostScaleFilter hostScaleFilter()
+{
+    static const HostScaleFilter s_filter = []()
+    {
+        const char *value = std::getenv("PS2X_SCALE");
+        if (value && std::strcmp(value, "nearest") == 0)
+            return HostScaleFilter::Nearest;
+        if (value && std::strcmp(value, "bilinear") == 0)
+            return HostScaleFilter::Bilinear;
+        return HostScaleFilter::Sharp;
+    }();
+    return s_filter;
+}
+
+static const char *const kSharpScaleFragmentShader = R"(#version 330
+in vec2 fragTexCoord;
+in vec4 fragColor;
+out vec4 finalColor;
+uniform sampler2D texture0;
+uniform vec4 colDiffuse;
+uniform vec2 textureSize;
+uniform vec2 wholeScale;
+void main()
+{
+    vec2 texel = fragTexCoord * textureSize;
+    vec2 centre = fract(texel) - 0.5;
+    vec2 flat_ = 0.5 - 0.5 / wholeScale;
+    vec2 offset = (centre - clamp(centre, -flat_, flat_)) * wholeScale + 0.5;
+    finalColor = texture(texture0, (floor(texel) + offset) / textureSize) * colDiffuse * fragColor;
+}
+)";
+
 struct ElfHeader
 {
     uint32_t magic;
@@ -2558,6 +2601,23 @@ void PS2Runtime::run()
     // A blank image to use as a framebuffer
     Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, BLANK);
     Texture2D frameTex = LoadTextureFromImage(blank);
+    SetTextureFilter(frameTex, hostScaleFilter() == HostScaleFilter::Nearest ? TEXTURE_FILTER_POINT : TEXTURE_FILTER_BILINEAR);
+    Shader sharpScale{};
+    bool sharpScaleReady = false;
+    int sharpScaleTextureSize = -1;
+    int sharpScaleWholeScale = -1;
+    if (hostScaleFilter() == HostScaleFilter::Sharp)
+    {
+        sharpScale = LoadShaderFromMemory(nullptr, kSharpScaleFragmentShader);
+        sharpScaleReady = IsShaderValid(sharpScale) && sharpScale.id != rlGetShaderIdDefault();
+        if (sharpScaleReady)
+        {
+            sharpScaleTextureSize = GetShaderLocation(sharpScale, "textureSize");
+            sharpScaleWholeScale = GetShaderLocation(sharpScale, "wholeScale");
+            const float textureSize[2] = {static_cast<float>(frameTex.width), static_cast<float>(frameTex.height)};
+            SetShaderValue(sharpScale, sharpScaleTextureSize, textureSize, SHADER_UNIFORM_VEC2);
+        }
+    }
     UnloadImage(blank);
 
     std::atomic<bool> gameThreadFinished{false};
@@ -2637,7 +2697,16 @@ void PS2Runtime::run()
             (screenHeight - dstHeight) * 0.5f,
             dstWidth,
             dstHeight};
+        if (sharpScaleReady)
+        {
+            const float wholeScale[2] = {std::max(1.0f, std::floor(dstWidth / srcWidth)),
+                                         std::max(1.0f, std::floor(dstHeight / srcHeight))};
+            SetShaderValue(sharpScale, sharpScaleWholeScale, wholeScale, SHADER_UNIFORM_VEC2);
+            BeginShaderMode(sharpScale);
+        }
         DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+        if (sharpScaleReady)
+            EndShaderMode();
         if (m_debugUiInitialized && m_debugUiDrawCallback)
         {
             m_debugUiDrawCallback(*this, m_debugUiUserData);
@@ -2663,6 +2732,8 @@ void PS2Runtime::run()
         m_debugUiShutdownCallback(*this, m_debugUiUserData);
         m_debugUiInitialized = false;
     }
+    if (sharpScaleReady)
+        UnloadShader(sharpScale);
     UnloadTexture(frameTex);
     CloseWindow();
 
