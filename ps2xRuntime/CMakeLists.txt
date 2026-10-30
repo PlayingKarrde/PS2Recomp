@@ -469,6 +469,15 @@ if(PS2X_ENABLE_RUNNER_UNITY_BUILD)
     )
 endif()
 
+# The crash reporter includes windows.h, which clashes with raylib's names, so it is compiled alone.
+set(RUNNER_CRASH_REPORT_CPP "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/zzz_crash_report.cpp")
+if(EXISTS "${RUNNER_CRASH_REPORT_CPP}")
+    set_source_files_properties("${RUNNER_CRASH_REPORT_CPP}" PROPERTIES
+        SKIP_UNITY_BUILD_INCLUSION TRUE
+        SKIP_PRECOMPILE_HEADERS TRUE
+    )
+endif()
+
 if(PS2X_ENABLE_RUNNER_PCH)
     set(PS2X_RUNNER_PCH_HEADERS
         "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_runtime_macros.h"
@@ -499,6 +508,11 @@ endif()
 
 if(MSVC)
     target_compile_options(ps2EntryRunner PRIVATE /FS)
+    # Guest code runs on one host thread, and a huge generated function can get a multi-megabyte
+    # frame (probably because MSVC stops optimising very large functions). The 1 MB default stack
+    # overflowed on FPR's 1.1 MB FUN_001a45a0. This only reserves address space; pages are
+    # committed as the stack grows. std::thread uses this default too.
+    target_link_options(ps2EntryRunner PRIVATE /STACK:67108864)
 endif()
 
 target_include_directories(ps2_runtime PUBLIC
