@@ -19,6 +19,8 @@
 #include <fstream>
 #include <algorithm>
 #include <array>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <chrono>
@@ -47,8 +49,28 @@ static constexpr int HOST_WINDOW_WIDTH = 960;
 static constexpr int HOST_WINDOW_HEIGHT = 544;
 #else
 static constexpr int HOST_WINDOW_WIDTH = FB_WIDTH;
-static constexpr int HOST_WINDOW_HEIGHT = DEFAULT_DISPLAY_HEIGHT;
+static constexpr int HOST_WINDOW_HEIGHT = 480; // 4:3, the shape of the TV picture
 #endif
+
+// A PS2 game's display can be any size (FPR uses 640x224), but a TV always stretches the visible
+// area to its own 4:3 shape. Returns width/height for the picture on screen, or 0 to keep the
+// source's pixel shape. PS2X_ASPECT overrides it: "16:9", "4:3" or "source".
+static float hostDisplayAspect()
+{
+    static const float s_aspect = []()
+    {
+        const char *value = std::getenv("PS2X_ASPECT");
+        if (!value || !*value)
+            return 4.0f / 3.0f;
+        if (std::strcmp(value, "source") == 0)
+            return 0.0f;
+        float w = 0.0f, h = 0.0f;
+        if (std::sscanf(value, "%f:%f", &w, &h) == 2 && w > 0.0f && h > 0.0f)
+            return w / h;
+        return 4.0f / 3.0f;
+    }();
+    return s_aspect;
+}
 struct ElfHeader
 {
     uint32_t magic;
@@ -2433,9 +2455,9 @@ void PS2Runtime::run()
         const float srcHeight = static_cast<float>(std::max<uint32_t>(1u, presentHeight));
         const float screenWidth = static_cast<float>(GetScreenWidth());
         const float screenHeight = static_cast<float>(GetScreenHeight());
-        const float scale = std::min(screenWidth / srcWidth, screenHeight / srcHeight);
-        const float dstWidth = srcWidth * scale;
-        const float dstHeight = srcHeight * scale;
+        const float aspect = hostDisplayAspect() > 0.0f ? hostDisplayAspect() : srcWidth / srcHeight;
+        const float dstWidth = std::min(screenWidth, screenHeight * aspect);
+        const float dstHeight = dstWidth / aspect;
         const Rectangle srcRect{0.0f, 0.0f, srcWidth, srcHeight};
         const Rectangle dstRect{
             (screenWidth - dstWidth) * 0.5f,
