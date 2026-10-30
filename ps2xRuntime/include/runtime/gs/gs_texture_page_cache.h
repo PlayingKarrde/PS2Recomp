@@ -17,6 +17,15 @@ namespace GSMem
             m_pageBase = UINT32_MAX;
         }
 
+        // FPWR: an optional source that can supply an older copy of a page (nullptr = use VRAM).
+        using PageSource = const uint8_t *(*)(const void *context, uint32_t pageBase);
+        void SetSource(PageSource source, const void *context) noexcept
+        {
+            m_source = source;
+            m_sourceContext = context;
+            m_pageBase = UINT32_MAX;
+        }
+
         // byteAddress is the wrapped, swizzled VRAM address. The returned
         // pointer is valid only until the next miss or invalidation.
         const uint8_t* Resolve(const uint8_t* vram, uint32_t byteAddress) noexcept
@@ -24,7 +33,8 @@ namespace GSMem
             const uint32_t pageBase = byteAddress & ~(kPageSize - 1u);
             if (m_pageBase != pageBase)
             {
-                std::memcpy(m_bytes.data(), vram + pageBase, kPageSize);
+                const uint8_t *page = m_source ? m_source(m_sourceContext, pageBase) : nullptr;
+                std::memcpy(m_bytes.data(), page ? page : vram + pageBase, kPageSize);
                 m_pageBase = pageBase;
             }
             return m_bytes.data() + (byteAddress & (kPageSize - 1u));
@@ -33,5 +43,7 @@ namespace GSMem
     private:
         alignas(64) std::array<uint8_t, kPageSize> m_bytes{};
         uint32_t m_pageBase = UINT32_MAX;
+        PageSource m_source = nullptr;
+        const void *m_sourceContext = nullptr;
     };
 }
