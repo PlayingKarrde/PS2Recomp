@@ -4,6 +4,7 @@
 #include "runtime/gs/gs_texture_page_cache.h"
 
 #include <array>
+#include <functional>
 #include <mutex>
 #include <vector>
 
@@ -45,7 +46,17 @@ private:
     void DrawTriangle(const GSPrimitiveBatch &batch);
     void DrawLine(const GSPrimitiveBatch &batch);
     void WritePixel(const GSDrawState &state, int x, int y, int z, uint8_t r, uint8_t g, uint8_t b, uint8_t a, uint8_t fog);
-    uint32_t SampleTexture(const GSDrawState &state, float s, float t, float q, uint16_t u, uint16_t v);
+    // FPWR: texture sampling goes through a per-primitive texel cache (decoded RGBA, indexed by
+    // wrapped texel coordinates) and large primitives are rasterized in row bands on worker threads.
+    // `pageCache` is the calling thread's VRAM page cache; `storeTexels` is false on worker threads,
+    // which only read the texel cache.
+    uint32_t SampleTexture(const GSDrawState &state, float s, float t, float q, uint16_t u, uint16_t v,
+                           GSMem::TexturePageCache &pageCache, bool storeTexels);
+    uint32_t DecodeTexel(const GSDrawState &state, int u, int v, GSMem::TexturePageCache &pageCache);
+    uint32_t FetchTexel(const GSDrawState &state, int u, int v, GSMem::TexturePageCache &pageCache, bool storeTexels);
+    void PrepareTexelCache(const GSPrimitiveBatch &batch, bool decodeFootprint);
+    using RowBandFunc = std::function<void(int firstRow, int lastRow, GSMem::TexturePageCache &pageCache, bool storeTexels)>;
+    void RasterizeRows(int firstRow, int lastRow, uint64_t pixelArea, const GSPrimitiveBatch &batch, const RowBandFunc &fn);
     uint32_t LookupCLUT(const GSDrawState &state, uint8_t index, uint8_t cpsm, uint8_t csm, uint8_t csa, uint8_t sourcePsm);
 
     void PerformLocalToLocalTransfer();
@@ -73,6 +84,18 @@ private:
     std::array<uint16_t, 512> m_clut{};
     std::array<uint32_t, 2> m_clutCbp{};
     GSMem::TexturePageCache m_texturePageCache;
+
+    struct TexelCache
+    {
+        std::vector<uint32_t> texels;
+        std::vector<uint32_t> stamps; // texel is valid when stamps[i] == generation
+        uint32_t generation = 0;
+        int width = 0;
+        int height = 0;
+        bool active = false;
+    };
+    TexelCache m_texelCache;
+    std::vector<GSMem::TexturePageCache> m_workerPageCaches;
 
     GSTransferCommand m_transfer{};
     GSTransferSnapshot m_transferState{};
