@@ -105,7 +105,18 @@ namespace ps2recomp
             addEntry(address, name);
         }
 
+        // Visit owners in address order. When several owners can resume at one target the first
+        // claims its slot, and the map's own order differs between standard libraries.
+        std::vector<uint32_t> resumeOwners;
+        resumeOwners.reserve(cg.m_resumeEntryTargetsByOwner.size());
         for (const auto &[ownerStart, targets] : cg.m_resumeEntryTargetsByOwner)
+        {
+            (void)targets;
+            resumeOwners.push_back(ownerStart);
+        }
+        std::sort(resumeOwners.begin(), resumeOwners.end());
+
+        for (uint32_t ownerStart : resumeOwners)
         {
             const std::string ownerName = cg.getFunctionName(ownerStart);
             if (ownerName.empty())
@@ -113,7 +124,7 @@ namespace ps2recomp
                 continue;
             }
 
-            for (uint32_t target : targets)
+            for (uint32_t target : cg.m_resumeEntryTargetsByOwner.at(ownerStart))
             {
                 addEntry(target, ownerName);
             }

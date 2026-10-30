@@ -79,6 +79,17 @@ if(PS2X_IS_ARM_TARGET)
     endif()
 endif()
 
+if(NOT MSVC)
+    # The runtime and generated code are written for how MSVC behaves: they cast guest memory
+    # to any type and rely on signed integers wrapping. GCC and Clang would optimise on the
+    # assumption that neither happens.
+    add_compile_options(-fno-strict-aliasing -fwrapv)
+    if(NOT PS2X_IS_ARM_TARGET)
+        # MSVC allows SSE4.1 intrinsics without a flag; GCC and Clang refuse them.
+        add_compile_options(-msse4.1)
+    endif()
+endif()
+
 if(PS2X_BUILD_RECOMP)
     add_subdirectory("ps2xRecomp")
 endif()
