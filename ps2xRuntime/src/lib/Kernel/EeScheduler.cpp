@@ -35,6 +35,7 @@ namespace
     constexpr auto kVBlankDuration = std::chrono::microseconds(500);
     constexpr uint64_t kAlarmTickMicroseconds = 64u;
     constexpr uint32_t kDebugPublishDispatchInterval = 4096u;
+    constexpr uint32_t kStatusEie = 0x10000u; // COP0 Status: interrupts enabled (EI/DI)
 
     constexpr uint64_t microsecondsToEeCycles(uint64_t microseconds)
     {
@@ -259,7 +260,11 @@ void EeScheduler::run()
             continue;
         }
 
-        if (!m_pendingInvocations.empty() && running->invocations.empty())
+        // FPWR: interrupts reach a running thread only while it has them enabled (Status.EIE).
+        // Games disable them around lists the handlers also change; FPR's alarm code does, and
+        // a timer interrupt delivered inside it lost an alarm and left a thread in DelayThread
+        // for good. Pending invocations wait until the thread re-enables or blocks.
+        if (!m_pendingInvocations.empty() && running->invocations.empty() && (context.cop0_status & kStatusEie) != 0u)
         {
             GuestInvocation invocation = std::move(m_pendingInvocations.front());
             m_pendingInvocations.pop_front();
@@ -409,8 +414,10 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
         return false;
     }
 
+    // FPWR: no time-slice switch while the thread has interrupts disabled (a critical section).
     const GuestThread *running = currentThread();
-    if (running != nullptr && hasReadyAtOrAbovePriority(running->currentPriority))
+    if (running != nullptr && (running->activeContext().cop0_status & kStatusEie) != 0u &&
+        hasReadyAtOrAbovePriority(running->currentPriority))
     {
         m_rescheduleRequested = true;
         m_timeSliceExpired = true;
