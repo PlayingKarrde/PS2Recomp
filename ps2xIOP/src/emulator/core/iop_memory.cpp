@@ -307,7 +307,8 @@ namespace ps2x::iop::detail
             return address;
         }
 
-        uint32_t candidate = alignUp(m_heapCursor, alignment);
+        // First fit from the bottom, so freed blocks get used again.
+        uint32_t candidate = alignUp(HeapBase, alignment);
         for (;;)
         {
             bool overlap = false;
