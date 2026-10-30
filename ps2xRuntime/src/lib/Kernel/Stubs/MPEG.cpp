@@ -2332,10 +2332,30 @@ namespace ps2_stubs
         uint32_t height = kStubMovieHeight;
         uint32_t frameCount = 0u;
         bool haveFrame = false;
+        bool selfFedEnded = false;
         MpegDecodedFrame frame;
         {
             std::unique_lock<std::mutex> lock(g_mpeg_stub_mutex);
             MpegPlaybackState &playback = getPlaybackState(mpegAddr);
+            // FPWR: a game that feeds the decoder itself (no sceCdSt stream) learns that a movie is
+            // over from sceMpegIsEnd, which reads mpeg->sys->isEnd. FPR runs its own copy of it
+            // (0x10B468) instead of the runtime's. libmpeg sets the flag once sequence_end_code is
+            // decoded and the last picture is out; without it, FPR's looping menu movie never
+            // rewound and its worker waited here for data that never came, so the match never
+            // started (the main thread waits for that worker to stop).
+            if (g_mpeg_stub_state.cdStreamGeneration == 0u &&
+                playback.sawSequenceEnd &&
+                playback.decodedFrames.empty() &&
+                playback.pssBuffer.empty() &&
+                !playback.decoderFailed)
+            {
+                if (!playback.streamEnded)
+                {
+                    playback.streamEnded = true;
+                    flushDecoderIfEnded(playback);
+                }
+                selfFedEnded = playback.decodedFrames.empty();
+            }
             // FPWR: games that feed the decoder themselves (no sceCdSt* stream) register a "no data"
             // callback. The real library calls it from inside sceMpegGetPicture whenever the
             // bitstream runs dry; it reads more from disc and calls sceMpegDemuxPssRing. Parking
@@ -2481,6 +2501,10 @@ namespace ps2_stubs
                 *reinterpret_cast<uint32_t *>(inner + 0xe4) = getRegU32(ctx, 6);
                 *reinterpret_cast<uint32_t *>(inner + 0xdc) = 0;
                 *reinterpret_cast<uint32_t *>(inner + 0xe0) = 0;
+                if (selfFedEnded)
+                {
+                    *reinterpret_cast<uint32_t *>(inner + 0x00) = 1; // sys->isEnd
+                }
             }
         }
 
@@ -2585,7 +2609,9 @@ namespace ps2_stubs
             std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
             MpegPlaybackState &playback = getPlaybackState(param_1);
             MpegPlaybackState resetState = makeFreshPlaybackStatePreservingConfig(playback);
-            if (playback.streamEnded || playback.decoderFailed)
+            // FPWR: only a finished CD stream stays finished. A game that feeds the decoder
+            // itself resets and re-adds the data to loop a movie (FPR's menu background).
+            if ((playback.streamEnded || playback.decoderFailed) && g_mpeg_stub_state.cdStreamGeneration != 0u)
             {
                 resetState.sawInput = true;
                 resetState.streamEnded = true;
