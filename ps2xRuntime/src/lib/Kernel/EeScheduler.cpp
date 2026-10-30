@@ -215,6 +215,11 @@ void EeScheduler::run()
             }
         }
         R5900Context &context = running->activeContext();
+        // VU0's vf0 is hard-wired to (0, 0, 0, 1). R5900Context() zeroes it, and thread and
+        // interrupt contexts are created that way, so games that divide by vf0.w (Q = 1/w for
+        // perspective) got Q = 0 on every thread but the boot one. FPR's wrestler sprites
+        // collapsed to a point because of it.
+        context.vu0_vf[0] = _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f);
         if (m_debugPublishCountdown == 0u)
         {
             copyMainContextToRuntime();
