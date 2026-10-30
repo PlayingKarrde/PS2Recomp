@@ -563,6 +563,11 @@ namespace GSMem
 
 	void WriteNull(u8* data, u32 bp, u32 bw, u32 x, u32 y, u32 value);
 
+	// FPWR: writes `count` consecutive pixels of one row from packed host-to-GS transfer data
+	// (4/3/2/1 bytes per pixel, or two 4-bit pixels per byte, low nibble first, starting at a
+	// byte boundary). Returns false for formats it does not handle.
+	bool WriteSpan(u8* data, u32 psm, u32 bp, u32 bw, u32 x, u32 y, const u8* src, u32 count);
+
 	u32 ReadCT32(u8* data, u32 bp, u32 bw, u32 x, u32 y);
 	u32 ReadZ32(u8* data, u32 bp, u32 bw, u32 x, u32 y);
 

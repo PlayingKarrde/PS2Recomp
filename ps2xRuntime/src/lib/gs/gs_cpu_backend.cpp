@@ -2200,8 +2200,60 @@ void GSCpuBackend::UploadImageUnlocked(const uint8_t *data, uint32_t sizeBytes)
         m_transferState.y = m_transfer.trxpos.dsay + (m_transferState.copiedPixels / rrw);
     };
 
+    // Fast path: write the rest of the current row (or as much of it as the data covers) in one
+    // span. 4-bit formats need the span to start on a byte, i.e. an even pixel count so far in a
+    // transfer whose rows hold whole bytes; anything else falls through to the per-pixel code.
+    uint32_t bytesPerPixel = 0u;
+    switch (dpsm)
+    {
+    case GS_PSM_CT32:
+    case GS_PSM_Z32:
+        bytesPerPixel = 4u;
+        break;
+    case GS_PSM_CT24:
+    case GS_PSM_Z24:
+        bytesPerPixel = 3u;
+        break;
+    case GS_PSM_CT16:
+    case GS_PSM_CT16S:
+    case GS_PSM_Z16:
+    case GS_PSM_Z16S:
+        bytesPerPixel = 2u;
+        break;
+    case GS_PSM_T8:
+    case GS_PSM_T8H:
+        bytesPerPixel = 1u;
+        break;
+    default:
+        break;
+    }
+    const bool fourBit = dpsm == GS_PSM_T4 || dpsm == GS_PSM_T4HL || dpsm == GS_PSM_T4HH;
+
     while (offset < sizeBytes && m_transferState.direction == 0u)
     {
+        const uint32_t copied = m_transferState.copiedPixels;
+        const uint32_t column = copied % rrw;
+        const uint32_t rowLeft = std::min(rrw - column, m_transferState.totalPixels - copied);
+        uint32_t count = 0u;
+        uint32_t bytes = 0u;
+        if (bytesPerPixel != 0u)
+        {
+            count = std::min(rowLeft, (sizeBytes - offset) / bytesPerPixel);
+            bytes = count * bytesPerPixel;
+        }
+        else if (fourBit && (rrw & 1u) == 0u && (copied & 1u) == 0u)
+        {
+            count = std::min(rowLeft, (sizeBytes - offset) * 2u);
+            bytes = (count + 1u) / 2u;
+        }
+        if (count != 0u &&
+            GSMem::WriteSpan(m_vram, dpsm, dbp, dbw, dsax + column, m_transfer.trxpos.dsay + copied / rrw, data + offset, count))
+        {
+            offset += bytes;
+            advancePixel(count);
+            continue;
+        }
+
         switch (dpsm)
         {
         case GS_PSM_CT32:

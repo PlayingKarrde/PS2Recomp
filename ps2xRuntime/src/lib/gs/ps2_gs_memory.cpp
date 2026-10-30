@@ -324,6 +324,44 @@ namespace GSMem
     {
     }
 
+    namespace
+    {
+        template <PixelStorageMode psm, typename Table, typename Load>
+        void WriteSpanT(const Table& table, u8* data, u32 bp, u32 bw, u32 x, u32 y, u32 count, Load load)
+        {
+            using PackedT = typename PixelStorageTraits<psm>::PackedT;
+            for (u32 i = 0; i < count; ++i)
+                PixelStorageTraits<psm>::Write(table, data, bp, bw, x + i, y, static_cast<PackedT>(load(i)));
+        }
+    }
+
+    bool WriteSpan(u8* data, u32 psm, u32 bp, u32 bw, u32 x, u32 y, const u8* src, u32 count)
+    {
+        auto load32 = [src](u32 i) { u32 v; std::memcpy(&v, src + i * 4u, 4u); return v; };
+        auto load24 = [src](u32 i) { const u8* p = src + i * 3u; return u32(p[0]) | (u32(p[1]) << 8) | (u32(p[2]) << 16); };
+        auto load16 = [src](u32 i) { u16 v; std::memcpy(&v, src + i * 2u, 2u); return u32(v); };
+        auto load8 = [src](u32 i) { return u32(src[i]); };
+        auto load4 = [src](u32 i) { return u32(src[i >> 1] >> ((i & 1u) * 4u)) & 0x0Fu; };
+
+        switch (static_cast<PixelStorageMode>(psm & 0x3Fu))
+        {
+        case C32: WriteSpanT<C32>(PageTableC32, data, bp, bw, x, y, count, load32); return true;
+        case Z32: WriteSpanT<Z32>(PageTableZ32, data, bp, bw, x, y, count, load32); return true;
+        case C24: WriteSpanT<C24>(PageTableC32, data, bp, bw, x, y, count, load24); return true;
+        case Z24: WriteSpanT<Z24>(PageTableZ32, data, bp, bw, x, y, count, load24); return true;
+        case C16: WriteSpanT<C16>(PageTableC16, data, bp, bw, x, y, count, load16); return true;
+        case C16S: WriteSpanT<C16S>(PageTableC16S, data, bp, bw, x, y, count, load16); return true;
+        case Z16: WriteSpanT<Z16>(PageTableZ16, data, bp, bw, x, y, count, load16); return true;
+        case Z16S: WriteSpanT<Z16S>(PageTableZ16S, data, bp, bw, x, y, count, load16); return true;
+        case P8: WriteSpanT<P8>(PageTableP8, data, bp, bw, x, y, count, load8); return true;
+        case P8H: WriteSpanT<P8H>(PageTableC32, data, bp, bw, x, y, count, load8); return true;
+        case P4: WriteSpanT<P4>(PageTableP4, data, bp, bw, x, y, count, load4); return true;
+        case P4HL: WriteSpanT<P4HL>(PageTableC32, data, bp, bw, x, y, count, load4); return true;
+        case P4HH: WriteSpanT<P4HH>(PageTableC32, data, bp, bw, x, y, count, load4); return true;
+        default: return false;
+        }
+    }
+
     u32 ReadCT32(u8* data, u32 bp, u32 bw, u32 x, u32 y)
     {
         return PixelStorageTraits<C32>::Read(PageTableC32, data, bp, bw, x, y);
