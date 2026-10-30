@@ -853,7 +853,16 @@ inline __m128i ps2_u64_to_epi64_pair(uint64_t value)
 #define FPU_FLOOR_W_S(a) ((int32_t)floorf((float)(a)))
 #define FPU_CVT_S_W(a) ((float)(int32_t)(a))
 #define FPU_CVT_S_L(a) ((float)(int64_t)(a))
-#define FPU_CVT_W_S(a) ((int32_t)nearbyintf((float)(a)))
+// The EE's CVT.W.S always truncates toward zero and saturates when |x| >= 2^31 (exponent 255
+// included: the EE has no Inf or NaN). It ignores the rounding mode.
+inline int32_t ps2_cvt_w_s(float x)
+{
+    const uint32_t b = std::bit_cast<uint32_t>(x);
+    if ((b & PS2_FLOAT_EXP_MASK) >= (158u << 23))
+        return (b & PS2_FLOAT_SIGN_MASK) ? INT32_MIN : INT32_MAX;
+    return static_cast<int32_t>(x);
+}
+#define FPU_CVT_W_S(a) ps2_cvt_w_s((float)(a))
 #define FPU_CVT_L_S(a) ((int64_t)(float)(a))
 #define FPU_C_F_S(a, b) (0)
 #define FPU_C_UN_S(a, b) (isnan((float)(a)) || isnan((float)(b)))
