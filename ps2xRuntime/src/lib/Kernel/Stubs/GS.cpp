@@ -943,10 +943,10 @@ namespace ps2_stubs
         uint32_t psm = getRegU32(ctx, 5);
         uint32_t w = getRegU32(ctx, 6);
         uint32_t h = getRegU32(ctx, 7);
-        const uint32_t ztest = readStackU32(rdram, ctx, 16);
-        const uint32_t zpsm = readStackU32(rdram, ctx, 20);
-        const uint32_t clear = readStackU32(rdram, ctx, 24);
-        (void)clear;
+        const GsTrailingArgs3 trailing = decodeGsTrailingArgs3(rdram, ctx);
+        const uint32_t ztest = trailing.arg0;
+        const uint32_t zpsm = trailing.arg1;
+        const uint32_t clear = trailing.arg2;
 
         if (w == 0u)
         {
@@ -975,6 +975,11 @@ namespace ps2_stubs
             zbufAddr = getRegU32(&temp, 2);
         }
 
+        // Field or progressive modes flip between two buffers, the second one
+        // half way to the Z buffer: buffer 0 shows FBP 0 and draws to the other.
+        const bool twoBuffers = g_gparam.interlace == 0u || g_gparam.ffmode == 1u;
+        const uint32_t fbp1 = twoBuffers ? (zbufAddr >> 1) : 0u;
+
         GsDBuffMem db{};
         db.disp[0].pmode = pmode;
         db.disp[0].smode2 = smode2;
@@ -982,11 +987,18 @@ namespace ps2_stubs
         db.disp[0].display = display;
         db.disp[0].bgcolor = 0u;
         db.disp[1] = db.disp[0];
+        db.disp[1].dispfb = makeDispFb(fbp1, fbw, psm, 0u, 0u);
 
-        db.giftag0 = {makeGiftagAplusD(14u), 0x0E0E0E0E0E0E0E0EULL};
-        seedGsDrawEnv1(db.draw0, drawWidth, drawHeight, 0u, fbw, psm, zbufAddr, zpsm, ztest, false);
+        const bool seedClear = clear != 0u;
+        db.giftag0 = {makeGiftagAplusD(seedClear ? 14u : 8u), 0xEULL};
+        seedGsDrawEnv1(db.draw0, drawWidth, drawHeight, fbp1, fbw, psm, zbufAddr, zpsm, ztest, false);
         db.giftag1 = db.giftag0;
         seedGsDrawEnv1(db.draw1, drawWidth, drawHeight, 0u, fbw, psm, zbufAddr, zpsm, ztest, false);
+        if (seedClear)
+        {
+            seedGsClearPacket(db.clear0, drawWidth, drawHeight, 0u, ztest, false);
+            seedGsClearPacket(db.clear1, drawWidth, drawHeight, 0u, ztest, false);
+        }
 
         if (!writeGsDBuff(rdram, envAddr, db))
         {
@@ -1202,10 +1214,12 @@ namespace ps2_stubs
         if (which == 0u)
         {
             applyGsRegPairs(runtime, reinterpret_cast<const GsRegPairMem *>(&db.draw0), 8u);
+            applyGsClearPacket(runtime, db.clear0);
         }
         else
         {
             applyGsRegPairs(runtime, reinterpret_cast<const GsRegPairMem *>(&db.draw1), 8u);
+            applyGsClearPacket(runtime, db.clear1);
         }
 
         setReturnS32(ctx, static_cast<int32_t>(which ^ 1u));
