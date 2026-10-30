@@ -2058,15 +2058,20 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
     const GSVertex &v2 = batch.vertices[2];
     const auto &ctx = state.context;
 
-    int ofx = ctx.xyoffset.ofx >> 4;
-    int ofy = ctx.xyoffset.ofy >> 4;
+    // Window coordinates in the GS's own 12.4 fixed point.
+    const int64_t ix0 = std::lround(v0.x * 16.0f) - ctx.xyoffset.ofx;
+    const int64_t iy0 = std::lround(v0.y * 16.0f) - ctx.xyoffset.ofy;
+    const int64_t ix1 = std::lround(v1.x * 16.0f) - ctx.xyoffset.ofx;
+    const int64_t iy1 = std::lround(v1.y * 16.0f) - ctx.xyoffset.ofy;
+    const int64_t ix2 = std::lround(v2.x * 16.0f) - ctx.xyoffset.ofx;
+    const int64_t iy2 = std::lround(v2.y * 16.0f) - ctx.xyoffset.ofy;
 
-    float fx0 = v0.x - static_cast<float>(ofx);
-    float fy0 = v0.y - static_cast<float>(ofy);
-    float fx1 = v1.x - static_cast<float>(ofx);
-    float fy1 = v1.y - static_cast<float>(ofy);
-    float fx2 = v2.x - static_cast<float>(ofx);
-    float fy2 = v2.y - static_cast<float>(ofy);
+    float fx0 = static_cast<float>(ix0) / 16.0f;
+    float fy0 = static_cast<float>(iy0) / 16.0f;
+    float fx1 = static_cast<float>(ix1) / 16.0f;
+    float fy1 = static_cast<float>(iy1) / 16.0f;
+    float fx2 = static_cast<float>(ix2) / 16.0f;
+    float fy2 = static_cast<float>(iy2) / 16.0f;
 
     int minX = static_cast<int>(std::floor(std::min({fx0, fx1, fx2})));
     int maxX = static_cast<int>(std::ceil(std::max({fx0, fx1, fx2})));
@@ -2078,13 +2083,27 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
     minY = clampInt(minY, ctx.scissor.y0, ctx.scissor.y1);
     maxY = clampInt(maxY, ctx.scissor.y0, ctx.scissor.y1);
 
-    float denom = (fy1 - fy2) * (fx0 - fx2) + (fx2 - fx1) * (fy0 - fy2);
-    if (std::fabs(denom) < 0.001f)
+    const int64_t idenom = (iy1 - iy2) * (ix0 - ix2) + (ix2 - ix1) * (iy0 - iy2);
+    if (idenom == 0)
         return;
 
-    const float winding = (denom < 0.0f) ? -1.0f : 1.0f;
+    float denom = (fy1 - fy2) * (fx0 - fx2) + (fx2 - fx1) * (fy0 - fy2);
+    const float winding = (idenom < 0) ? -1.0f : 1.0f;
     const float invAbsDenom = 1.0f / std::fabs(denom);
     constexpr float kEdgeEpsilon = 1.0e-4f;
+
+    // Coverage is decided exactly, in integers, with the top-left fill rule: a pixel exactly on an
+    // edge shared by two triangles belongs to just one of them. Otherwise it is drawn twice, which
+    // shows wherever the triangles blend. Each edge value is a*X + b*Y + c, positive inside.
+    const int64_t iwinding = (idenom < 0) ? -1 : 1;
+    const int64_t a0 = (iy1 - iy2) * iwinding, b0 = (ix2 - ix1) * iwinding;
+    const int64_t a1 = (iy2 - iy0) * iwinding, b1 = (ix0 - ix2) * iwinding;
+    const int64_t a2 = (iy0 - iy1) * iwinding, b2 = (ix1 - ix0) * iwinding;
+    // A zero value counts as inside only on a left edge (a > 0) or a top edge (a == 0, b > 0).
+    const int64_t bias0 = (a0 > 0 || (a0 == 0 && b0 > 0)) ? 0 : -1;
+    const int64_t bias1 = (a1 > 0 || (a1 == 0 && b1 > 0)) ? 0 : -1;
+    const int64_t bias2 = (a2 > 0 || (a2 == 0 && b2 > 0)) ? 0 : -1;
+    const int64_t absDenom = idenom * iwinding;
 
     // Bounding box area overestimates the triangle; it only decides whether to use threads.
     const uint64_t area = (maxX >= minX && maxY >= minY)
@@ -2125,9 +2144,9 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
         }
         if (!(lo <= hi + 2.0f) || lo > static_cast<float>(maxX) + 2.0f || hi < static_cast<float>(minX) - 2.0f)
             return false;
-        // px = x + 0.5; the padding absorbs rounding differences against the per-pixel test.
-        spanX0 = lo > static_cast<float>(minX) ? static_cast<int>(std::floor(lo - 0.5f)) - 1 : minX;
-        spanX1 = hi < static_cast<float>(maxX) ? static_cast<int>(std::ceil(hi - 0.5f)) + 1 : maxX;
+        // The padding absorbs rounding differences against the per-pixel test.
+        spanX0 = lo > static_cast<float>(minX) ? static_cast<int>(std::floor(lo)) - 1 : minX;
+        spanX1 = hi < static_cast<float>(maxX) ? static_cast<int>(std::ceil(hi)) + 1 : maxX;
         spanX0 = std::max(spanX0, minX);
         spanX1 = std::min(spanX1, maxX);
         return spanX0 <= spanX1;
@@ -2137,21 +2156,25 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
     {
         for (int y = firstRow; y <= lastRow; ++y)
         {
-            float py = static_cast<float>(y) + 0.5f;
+            // The GS samples at the integer pixel position, not at a pixel centre.
+            float py = static_cast<float>(y);
             int spanX0, spanX1;
             const bool rowHit = rowSpan(py, spanX0, spanX1);
             if (!rowHit)
                 continue;
+            const int64_t iy = static_cast<int64_t>(y) * 16;
             for (int x = spanX0; x <= spanX1; ++x)
             {
-                float px = static_cast<float>(x) + 0.5f;
-
-                float w0 = (((fy1 - fy2) * (px - fx2) + (fx2 - fx1) * (py - fy2)) * winding) * invAbsDenom;
-                float w1 = (((fy2 - fy0) * (px - fx2) + (fx0 - fx2) * (py - fy2)) * winding) * invAbsDenom;
-                float w2 = 1.0f - w0 - w1;
-
-                if (w0 < -kEdgeEpsilon || w1 < -kEdgeEpsilon || w2 < -kEdgeEpsilon)
+                const int64_t ipx = static_cast<int64_t>(x) * 16;
+                const int64_t e0 = a0 * (ipx - ix2) + b0 * (iy - iy2);
+                const int64_t e1 = a1 * (ipx - ix2) + b1 * (iy - iy2);
+                const int64_t e2 = a2 * (ipx - ix0) + b2 * (iy - iy0);
+                if (e0 + bias0 < 0 || e1 + bias1 < 0 || e2 + bias2 < 0)
                     continue;
+
+                float w0 = static_cast<float>(static_cast<double>(e0) / static_cast<double>(absDenom));
+                float w1 = static_cast<float>(static_cast<double>(e1) / static_cast<double>(absDenom));
+                float w2 = 1.0f - w0 - w1;
 
                 double z = v0.z * w0 + v1.z * w1 + v2.z * w2;
 
