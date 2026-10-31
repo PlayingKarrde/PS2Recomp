@@ -15,6 +15,11 @@
 #include <algorithm>
 #include <cstdlib>
 
+#if defined(__linux__) && !defined(__ANDROID__)
+#include <pthread.h>
+#include <sys/resource.h>
+#endif
+
 #if defined(__ANDROID__)
 #include <android/log.h>
 #include <unistd.h>
@@ -25,6 +30,32 @@
 
 namespace
 {
+#if defined(__linux__) && !defined(__ANDROID__)
+    // Linux counterpart of the /STACK option in CMakeLists.txt: huge generated functions can
+    // need multi-megabyte frames. Covers this thread and every thread started from now on.
+    void raiseStackLimit()
+    {
+        constexpr rlim_t kStackSize = 64u * 1024u * 1024u;
+        rlimit limit{};
+        if (getrlimit(RLIMIT_STACK, &limit) == 0 && limit.rlim_cur != RLIM_INFINITY && limit.rlim_cur < kStackSize &&
+            (limit.rlim_max == RLIM_INFINITY || limit.rlim_max >= kStackSize))
+        {
+            limit.rlim_cur = kStackSize;
+            setrlimit(RLIMIT_STACK, &limit);
+        }
+
+        pthread_attr_t attr;
+        if (pthread_attr_init(&attr) == 0)
+        {
+            if (pthread_attr_setstacksize(&attr, kStackSize) == 0)
+            {
+                pthread_setattr_default_np(&attr);
+            }
+            pthread_attr_destroy(&attr);
+        }
+    }
+#endif
+
 #if defined(__ANDROID__)
     int g_logcatPipeFds[2]{-1, -1};
     std::thread g_logcatThread;
@@ -168,6 +199,9 @@ int main(int argc, char *argv[])
 {
 #if defined(__ANDROID__)
     redirectStdioToLogcat();
+#endif
+#if defined(__linux__) && !defined(__ANDROID__)
+    raiseStackLimit();
 #endif
     setupTerminateLogger();
 
