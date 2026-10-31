@@ -2183,6 +2183,9 @@ void PS2DebugPanel::initialize()
     {
         rlImGuiSetup(true);
         m_initialized = true;
+        // Hidden until F1. It covers the picture and takes keyboard input from the game.
+        const char *env = std::getenv("PS2X_DEBUG_PANEL");
+        setVisible(env && env[0] == '1');
     }
 #endif
 }

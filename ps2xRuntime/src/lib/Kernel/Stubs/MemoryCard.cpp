@@ -1,6 +1,15 @@
 #include "Common.h"
 #include "MemoryCard.h"
 
+#include <chrono>
+#include <thread>
+
+#if defined(_WIN32)
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
+
 namespace ps2_stubs
 {
     namespace
@@ -36,6 +45,7 @@ namespace ps2_stubs
         constexpr int32_t kMcFreeClusters = 0x2000;
         constexpr size_t kMcMaxPathLen = 1024;
         constexpr size_t kMcMaxOpenFiles = 32;
+        constexpr const char *kMcTempSuffix = ".mctmp";
 
         constexpr uint16_t kMcAttrReadable = 0x0001;
         constexpr uint16_t kMcAttrWriteable = 0x0002;
@@ -74,6 +84,7 @@ namespace ps2_stubs
             FILE *file = nullptr;
             int32_t port = 0;
             std::filesystem::path hostPath;
+            std::filesystem::path tempPath; // set while writing: the copy swapped in on close
         };
 
         struct McPortState
@@ -367,6 +378,56 @@ namespace ps2_stubs
             g_mcCommandPending = true;
         }
 
+        void discardMcTempFile(const McOpenFile &openFile)
+        {
+            if (!openFile.tempPath.empty())
+            {
+                std::error_code ec;
+                std::filesystem::remove(openFile.tempPath, ec);
+            }
+        }
+
+        // Closes the file. A file opened for writing replaces the real one only now, so a crash
+        // or a full disk during a save leaves the previous save whole.
+        bool commitMcFile(McOpenFile &openFile)
+        {
+            bool ok = true;
+            if (openFile.file)
+            {
+                if (!openFile.tempPath.empty())
+                {
+                    ok = std::fflush(openFile.file) == 0;
+#if defined(_WIN32)
+                    ok = ok && _commit(_fileno(openFile.file)) == 0;
+#else
+                    ok = ok && fsync(fileno(openFile.file)) == 0;
+#endif
+                }
+                ok = (std::fclose(openFile.file) == 0) && ok;
+                openFile.file = nullptr;
+            }
+            if (openFile.tempPath.empty())
+            {
+                return ok;
+            }
+            if (ok)
+            {
+                // On Windows a virus scanner can hold the target open for a moment.
+                std::error_code ec;
+                for (int attempt = 0; attempt < 10; ++attempt)
+                {
+                    std::filesystem::rename(openFile.tempPath, openFile.hostPath, ec);
+                    if (!ec)
+                    {
+                        return true;
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                }
+            }
+            discardMcTempFile(openFile);
+            return false;
+        }
+
         void closeMcFilesLocked()
         {
             for (auto &[fd, openFile] : g_mcFiles)
@@ -376,6 +437,7 @@ namespace ps2_stubs
                     std::fclose(openFile.file);
                     openFile.file = nullptr;
                 }
+                discardMcTempFile(openFile);
             }
             g_mcFiles.clear();
         }
@@ -390,6 +452,7 @@ namespace ps2_stubs
                     {
                         std::fclose(it->second.file);
                     }
+                    discardMcTempFile(it->second);
                     it = g_mcFiles.erase(it);
                 }
                 else
@@ -399,7 +462,8 @@ namespace ps2_stubs
             }
         }
 
-        int32_t allocateMcFdLocked(FILE *file, int32_t port, const std::filesystem::path &hostPath)
+        int32_t allocateMcFdLocked(FILE *file, int32_t port, const std::filesystem::path &hostPath,
+                                   const std::filesystem::path &tempPath)
         {
             if (!file)
             {
@@ -423,7 +487,7 @@ namespace ps2_stubs
                     continue;
                 }
 
-                g_mcFiles.emplace(fd, McOpenFile{file, port, hostPath});
+                g_mcFiles.emplace(fd, McOpenFile{file, port, hostPath, tempPath});
                 return fd;
             }
 
@@ -475,6 +539,36 @@ namespace ps2_stubs
             }
 
             return std::fopen(hostPath.string().c_str(), mode);
+        }
+
+        bool mcFlagsWrite(uint32_t flags)
+        {
+            const uint32_t access = flags & PS2_FIO_O_RDWR;
+            return access == PS2_FIO_O_WRONLY || access == PS2_FIO_O_RDWR;
+        }
+
+        // Opens a working copy beside the file, which commitMcFile swaps in.
+        FILE *openMcTempFile(const std::filesystem::path &hostPath, uint32_t flags, std::filesystem::path &tempPath)
+        {
+            tempPath = hostPath;
+            tempPath += kMcTempSuffix;
+
+            std::error_code ec;
+            std::filesystem::remove(tempPath, ec); // left by an earlier crash
+            if ((flags & PS2_FIO_O_TRUNC) == 0u && std::filesystem::exists(hostPath, ec) && !ec)
+            {
+                std::filesystem::copy_file(hostPath, tempPath, ec);
+                if (ec)
+                {
+                    return nullptr;
+                }
+            }
+            FILE *file = openMcHostFile(tempPath, flags);
+            if (!file)
+            {
+                std::filesystem::remove(tempPath, ec);
+            }
+            return file;
         }
     }
 
@@ -570,7 +664,7 @@ namespace ps2_stubs
             auto it = g_mcFiles.find(fd);
             if (it != g_mcFiles.end())
             {
-                if (!it->second.file || std::fclose(it->second.file) == 0)
+                if (commitMcFile(it->second))
                 {
                     result = kMcResultSucceed;
                 }
@@ -786,6 +880,10 @@ namespace ps2_stubs
                             if (ec)
                             {
                                 break;
+                            }
+                            if (entry.path().extension() == kMcTempSuffix)
+                            {
+                                continue;
                             }
                             dirEntries.push_back(entry);
                         }
@@ -1022,17 +1120,20 @@ namespace ps2_stubs
                     }
                     else
                     {
-                        FILE *file = openMcHostFile(hostPath, flags);
+                        std::filesystem::path tempPath;
+                        FILE *file = mcFlagsWrite(flags) ? openMcTempFile(hostPath, flags, tempPath)
+                                                         : openMcHostFile(hostPath, flags);
                         if (!file)
                         {
                             result = exists ? kMcResultDeniedPermit : kMcResultNoEntry;
                         }
                         else
                         {
-                            result = allocateMcFdLocked(file, port, hostPath);
+                            result = allocateMcFdLocked(file, port, hostPath, tempPath);
                             if (result < 0)
                             {
                                 std::fclose(file);
+                                std::filesystem::remove(tempPath, ec);
                             }
                         }
                     }
