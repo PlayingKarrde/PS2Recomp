@@ -23,6 +23,14 @@ void reset_ps2_test_function_table();
 
 int main()
 {
+    // The GS tests read VRAM straight after drawing, so they need primitives drawn immediately
+    // instead of queued for the drawer thread.
+#ifdef _WIN32
+    _putenv_s("PS2X_GS_DEFER", "0");
+#else
+    setenv("PS2X_GS_DEFER", "0", 1);
+#endif
+
     MiniTest::BeforeEach(reset_ps2_test_function_table);
 
     register_code_generator_tests();

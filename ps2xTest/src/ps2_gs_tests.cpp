@@ -3524,14 +3524,15 @@ void register_ps2_gs_tests()
                 gs.writeRegister(GS_REG_TEX1_1, tex1Reg);
                 gs.writeRegister(GS_REG_PRIM, kPrim);
                 gs.writeRegister(GS_REG_RGBAQ, kRgbaq);
+                // The GS samples at integer pixel positions, so (2,2) is 1.5 from the first vertex.
                 gs.writeRegister(GS_REG_ST, packSt(0.0f, 0.0f));
-                gs.writeRegister(GS_REG_XYZ2, 0ull);
+                gs.writeRegister(GS_REG_XYZ2, (8ull << 0) | (8ull << 16));
                 gs.writeRegister(GS_REG_ST, packSt(1.0f, 0.0f));
-                gs.writeRegister(GS_REG_XYZ2, (64ull << 0) | (0ull << 16));
+                gs.writeRegister(GS_REG_XYZ2, (72ull << 0) | (8ull << 16));
                 gs.writeRegister(GS_REG_ST, packSt(0.0f, 0.0f));
-                gs.writeRegister(GS_REG_XYZ2, (0ull << 0) | (64ull << 16));
+                gs.writeRegister(GS_REG_XYZ2, (8ull << 0) | (72ull << 16));
 
-                return readReferencePSMCT32Pixel(vram, 0u, 1u, 1u, 1u);
+                return readReferencePSMCT32Pixel(vram, 0u, 1u, 2u, 2u);
             };
 
             constexpr uint64_t kTex1Linear =
@@ -3690,18 +3691,20 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_CLAMP_1, 1ull);
             gs.writeRegister(GS_REG_PRIM, kPrim);
 
+            // The GS samples at integer pixel positions. Vertices at 0.5 and 4.5 put pixel (2,2) 1.5
+            // from the first vertex on both axes, where S and Q are not whole numbers.
             gs.writeRegister(GS_REG_ST, packSt(0.0f, 0.0f));
             gs.writeRegister(GS_REG_RGBAQ, packRgbaq(1.0f));
-            gs.writeRegister(GS_REG_XYZ2, 0ull);
+            gs.writeRegister(GS_REG_XYZ2, 8ull | (8ull << 16));
             gs.writeRegister(GS_REG_ST, packSt(2.0f, 0.0f));
             gs.writeRegister(GS_REG_RGBAQ, packRgbaq(2.0f));
-            gs.writeRegister(GS_REG_XYZ2, 64ull);
+            gs.writeRegister(GS_REG_XYZ2, 72ull | (8ull << 16));
             gs.writeRegister(GS_REG_ST, packSt(0.0f, 0.0f));
             gs.writeRegister(GS_REG_RGBAQ, packRgbaq(1.0f));
-            gs.writeRegister(GS_REG_XYZ2, (64ull << 16));
+            gs.writeRegister(GS_REG_XYZ2, 8ull | (72ull << 16));
 
             const uint32_t pixel =
-                readReferencePSMCT32Pixel(vram, 0u, 1u, 1u, 1u);
+                readReferencePSMCT32Pixel(vram, 0u, 1u, 2u, 2u);
             t.Equals(pixel, kHomogeneousTexel,
                      "the DDA should interpolate S=0.75 and Q=1.375, selecting texel 2 after S/Q");
         });
@@ -3909,9 +3912,7 @@ void register_ps2_gs_tests()
                 int last = -1;
                 for (uint32_t x = 6u; x <= 26u; ++x)
                 {
-                    const size_t offset = (static_cast<size_t>(y) * 64u + static_cast<size_t>(x)) * 4u;
-                    uint32_t pixel = 0u;
-                    std::memcpy(&pixel, vram.data() + offset, sizeof(pixel));
+                    const uint32_t pixel = readReferencePSMCT32Pixel(vram, 0u, 1u, x, y);
                     if ((pixel & 0x00FFFFFFu) != 0u)
                     {
                         if (first < 0)
@@ -3928,11 +3929,9 @@ void register_ps2_gs_tests()
                 }
 
                 sawFilledRow = true;
-                for (int x = first; x <= last; ++x)
+                for (uint32_t x = static_cast<uint32_t>(first); x <= static_cast<uint32_t>(last); ++x)
                 {
-                    const size_t offset = (static_cast<size_t>(y) * 64u + static_cast<size_t>(x)) * 4u;
-                    uint32_t pixel = 0u;
-                    std::memcpy(&pixel, vram.data() + offset, sizeof(pixel));
+                    const uint32_t pixel = readReferencePSMCT32Pixel(vram, 0u, 1u, x, y);
                     if ((pixel & 0x00FFFFFFu) == 0u)
                     {
                         t.Fail("triangle fan quad should not leave interior holes within a covered row");
@@ -4194,7 +4193,9 @@ void register_ps2_gs_tests()
                      "VSync callback should receive a positive tick value");
             t.Equals(g_gsSyncCallbackGp.load(std::memory_order_acquire), kGsCallbackGp,
                      "callback invocation should preserve the registered GP");
-            t.IsTrue(g_gsSyncCallbackSp.load(std::memory_order_acquire) >= 0x01F00000u,
+            // FPWR: the pool is in low RAM, below the ELF (see kAsyncCallbackStackFloor).
+            const uint32_t callbackSp = g_gsSyncCallbackSp.load(std::memory_order_acquire);
+            t.IsTrue(callbackSp >= 0x000C1000u && callbackSp <= 0x00100000u,
                      "callback invocation should use the reserved async stack pool");
             t.IsTrue(g_gsSyncCallbackSp.load(std::memory_order_acquire) != kGsCallbackCallerSp,
                      "callback invocation must not reuse the caller stack");
