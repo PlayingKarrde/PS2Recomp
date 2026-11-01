@@ -224,5 +224,30 @@ void register_ps2_float_semantics_tests()
             t.IsTrue(rsqrt.find("ctx->f[2] = FPU_RSQRT_S(ctx->f[3], ctx->f[4])") != std::string::npos,
                      "RSQRT.S should compute fs / sqrt(ft) but got: " + rsqrt);
         });
+        tc.Run("PMFHL reads the HI and LO words as the EE Core manual lays them out", [](TestCase &t)
+        {
+            alignas(16) uint32_t w[4];
+            const uint64_t hi = 0x1111111122222222ull, lo = 0x3333333344444444ull;
+            const uint64_t hi1 = 0x5555555566666666ull, lo1 = 0x7777777788888888ull;
+
+            // libgcc's soft-float multiply builds a 64-bit product from MULTU and PMFHL.LW.
+            _mm_store_si128(reinterpret_cast<__m128i *>(w), PS2_PMFHL_LW(hi, lo, hi1, lo1));
+            t.IsTrue(w[0] == 0x44444444u && w[1] == 0x22222222u && w[2] == 0x88888888u && w[3] == 0x66666666u, "PMFHL.LW words");
+
+            _mm_store_si128(reinterpret_cast<__m128i *>(w), PS2_PMFHL_UW(hi, lo, hi1, lo1));
+            t.IsTrue(w[0] == 0x33333333u && w[1] == 0x11111111u && w[2] == 0x77777777u && w[3] == 0x55555555u, "PMFHL.UW words");
+
+            _mm_store_si128(reinterpret_cast<__m128i *>(w), PS2_PMFHL_LH(hi, lo, hi1, lo1));
+            t.IsTrue(w[0] == 0x33334444u && w[1] == 0x11112222u && w[2] == 0x77778888u && w[3] == 0x55556666u, "PMFHL.LH halfwords");
+
+            // HI:LO = 1:0 is above the signed 32-bit range; -1:0 is below it; 0:5 fits.
+            _mm_store_si128(reinterpret_cast<__m128i *>(w), PS2_PMFHL_SLW(1ull, 0ull, ~0ull, 0ull));
+            t.IsTrue(w[0] == 0x7FFFFFFFu && w[1] == 0u && w[2] == 0x80000000u && w[3] == 0xFFFFFFFFu, "PMFHL.SLW clamps");
+            _mm_store_si128(reinterpret_cast<__m128i *>(w), PS2_PMFHL_SLW(0ull, 5ull, 0ull, 0ull));
+            t.IsTrue(w[0] == 5u && w[1] == 0u, "PMFHL.SLW keeps a value in range");
+
+            _mm_store_si128(reinterpret_cast<__m128i *>(w), PS2_PMFHL_SH(0x0000000500010000ull, 0xFFFF000000007FFFull, 0ull, 0ull));
+            t.IsTrue(w[0] == 0x80007FFFu && w[1] == 0x00057FFFu, "PMFHL.SH clamps each word");
+        });
     });
 }

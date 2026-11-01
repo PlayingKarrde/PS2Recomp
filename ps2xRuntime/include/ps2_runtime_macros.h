@@ -821,16 +821,72 @@ inline __m128i _mm_custom_srav_epi32(__m128i a, __m128i count)
 }
 
 // PMFHL function implementations
-inline __m128i ps2_u64_to_epi64_pair(uint64_t value)
+// The 128-bit LO and HI registers are modelled as lo/hi (bits 63..0) and lo1/hi1 (bits 127..64).
+inline __m128i ps2_pmfhl_words(uint32_t w0, uint32_t w1, uint32_t w2, uint32_t w3)
 {
-    return _mm_set1_epi64x(static_cast<long long>(value));
+    return _mm_set_epi32(static_cast<int>(w3), static_cast<int>(w2), static_cast<int>(w1), static_cast<int>(w0));
 }
 
-#define PS2_PMFHL_LW(hi, lo) _mm_unpacklo_epi64(ps2_u64_to_epi64_pair(lo), ps2_u64_to_epi64_pair(hi))
-#define PS2_PMFHL_UW(hi, lo) _mm_unpackhi_epi64(ps2_u64_to_epi64_pair(lo), ps2_u64_to_epi64_pair(hi))
-#define PS2_PMFHL_SLW(hi, lo) _mm_packs_epi32(ps2_u64_to_epi64_pair(lo), ps2_u64_to_epi64_pair(hi))
-#define PS2_PMFHL_LH(hi, lo) _mm_shuffle_epi32(_mm_packs_epi32(ps2_u64_to_epi64_pair(lo), ps2_u64_to_epi64_pair(hi)), _MM_SHUFFLE(3, 1, 2, 0))
-#define PS2_PMFHL_SH(hi, lo) _mm_shufflehi_epi16(_mm_shufflelo_epi16(_mm_packs_epi32(ps2_u64_to_epi64_pair(lo), ps2_u64_to_epi64_pair(hi)), _MM_SHUFFLE(3, 1, 2, 0)), _MM_SHUFFLE(3, 1, 2, 0))
+inline __m128i ps2_pmfhl_lw(uint64_t hi, uint64_t lo, uint64_t hi1, uint64_t lo1)
+{
+    return ps2_pmfhl_words(static_cast<uint32_t>(lo), static_cast<uint32_t>(hi),
+                           static_cast<uint32_t>(lo1), static_cast<uint32_t>(hi1));
+}
+
+inline __m128i ps2_pmfhl_uw(uint64_t hi, uint64_t lo, uint64_t hi1, uint64_t lo1)
+{
+    return ps2_pmfhl_words(static_cast<uint32_t>(lo >> 32), static_cast<uint32_t>(hi >> 32),
+                           static_cast<uint32_t>(lo1 >> 32), static_cast<uint32_t>(hi1 >> 32));
+}
+
+inline int64_t ps2_pmfhl_clamp_word(uint64_t hi, uint64_t lo)
+{
+    const int64_t value = static_cast<int64_t>((hi << 32) | (lo & 0xFFFFFFFFull));
+    if (value > 0x7FFFFFFFll)
+        return 0x7FFFFFFFll;
+    if (value < -0x80000000ll)
+        return -0x80000000ll;
+    return value;
+}
+
+inline __m128i ps2_pmfhl_slw(uint64_t hi, uint64_t lo, uint64_t hi1, uint64_t lo1)
+{
+    return _mm_set_epi64x(ps2_pmfhl_clamp_word(hi1, lo1), ps2_pmfhl_clamp_word(hi, lo));
+}
+
+inline uint32_t ps2_pmfhl_halves(uint64_t value)
+{
+    return static_cast<uint32_t>(value & 0xFFFFu) | static_cast<uint32_t>((value >> 16) & 0xFFFF0000u);
+}
+
+inline __m128i ps2_pmfhl_lh(uint64_t hi, uint64_t lo, uint64_t hi1, uint64_t lo1)
+{
+    return ps2_pmfhl_words(ps2_pmfhl_halves(lo), ps2_pmfhl_halves(hi), ps2_pmfhl_halves(lo1), ps2_pmfhl_halves(hi1));
+}
+
+inline uint32_t ps2_pmfhl_clamp_half(uint32_t word)
+{
+    const int32_t value = static_cast<int32_t>(word);
+    const int32_t clamped = value > 0x7FFF ? 0x7FFF : (value < -0x8000 ? -0x8000 : value);
+    return static_cast<uint32_t>(clamped) & 0xFFFFu;
+}
+
+inline uint32_t ps2_pmfhl_clamped_halves(uint64_t value)
+{
+    return ps2_pmfhl_clamp_half(static_cast<uint32_t>(value)) | (ps2_pmfhl_clamp_half(static_cast<uint32_t>(value >> 32)) << 16);
+}
+
+inline __m128i ps2_pmfhl_sh(uint64_t hi, uint64_t lo, uint64_t hi1, uint64_t lo1)
+{
+    return ps2_pmfhl_words(ps2_pmfhl_clamped_halves(lo), ps2_pmfhl_clamped_halves(hi),
+                           ps2_pmfhl_clamped_halves(lo1), ps2_pmfhl_clamped_halves(hi1));
+}
+
+#define PS2_PMFHL_LW(hi, lo, hi1, lo1) ps2_pmfhl_lw((hi), (lo), (hi1), (lo1))
+#define PS2_PMFHL_UW(hi, lo, hi1, lo1) ps2_pmfhl_uw((hi), (lo), (hi1), (lo1))
+#define PS2_PMFHL_SLW(hi, lo, hi1, lo1) ps2_pmfhl_slw((hi), (lo), (hi1), (lo1))
+#define PS2_PMFHL_LH(hi, lo, hi1, lo1) ps2_pmfhl_lh((hi), (lo), (hi1), (lo1))
+#define PS2_PMFHL_SH(hi, lo, hi1, lo1) ps2_pmfhl_sh((hi), (lo), (hi1), (lo1))
 
 // FPU (COP1) operations
 #define FPU_SET_ACC(ctx, res) (ctx->f_acc = res)
