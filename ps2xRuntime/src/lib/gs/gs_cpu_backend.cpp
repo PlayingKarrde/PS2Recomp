@@ -8,6 +8,8 @@
 #include "ps2_log.h"
 #include <atomic>
 #include <algorithm>
+#include <bit>
+#include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <cstdio>
@@ -16,7 +18,11 @@
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
+#include <string>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 using namespace GSInternal;
 
@@ -559,6 +565,1315 @@ namespace
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// FPWR: GS census. Opt-in: does nothing unless PS2X_GS_CENSUS=<file path> is set (one cached
+// check per call site). It lists which GS features the game really uses, so a GPU renderer
+// can be scoped: every primitive, transfer, CLUT load, clear, VRAM peek and presentation that
+// reaches this backend is counted on the calling thread, in submission order, under the
+// backend's own mutex. About every 5 s (PS2X_GS_CENSUS_INTERVAL=<s> changes that) one JSON line is
+// appended to the file with the counts since the previous line (see tools/gs_census.py, which decodes
+// the keys). The runner leaves through std::_Exit, so the destructor and atexit hooks below never run
+// in the game: the last line written is the last full interval.
+//
+// Besides feature counts it keeps, for each 8 KiB VRAM page, what wrote it last (host upload,
+// local-to-local copy, draw to frame, draw to Z, clear, direct write). That finds the things a
+// GPU renderer cannot do cheaply: textures or CLUTs read from pages a draw or clear wrote
+// (render to texture), reads of the primitive's own target (feedback), a frame that overlaps
+// its Z buffer, and a buffer drawn in a different pixel format than it was last written in.
+// Page sets come from bounding boxes, so overlaps are page-level and can over-report.
+namespace
+{
+    bool gsCensusEnabled()
+    {
+        static const bool enabled = []
+        {
+            const char *env = std::getenv("PS2X_GS_CENSUS");
+            return env && env[0] != '\0';
+        }();
+        return enabled;
+    }
+
+    constexpr uint64_t kCensusNoKey = ~0ull;
+    constexpr uint32_t kCensusPages = 512u; // 4 MiB of GS local memory in 8 KiB pages
+    constexpr double kCensusDefaultInterval = 5.0; // seconds between lines (PS2X_GS_CENSUS_INTERVAL overrides)
+    constexpr uint8_t kCensusExamplesPerKey = 2u;
+    constexpr uint32_t kCensusExamplesPerCategory = 600u;
+
+    struct CensusCount
+    {
+        uint64_t n = 0;
+        uint64_t area = 0;
+    };
+    using CensusTable = std::unordered_map<uint64_t, CensusCount>;
+
+    // What wrote a page last. The writer mask in the tables has bit (1 << kind) set per kind.
+    enum CensusWriter : uint8_t
+    {
+        kWriterNone = 0,   // never written since start
+        kWriterUpload = 1, // host to local transfer
+        kWriterCopy = 2,   // local to local transfer (destination)
+        kWriterDraw = 3,   // draw into the frame buffer
+        kWriterDrawZ = 4,  // draw into the Z buffer
+        kWriterClear = 5,  // ClearFramebuffer
+        kWriterDirect = 6, // WriteVram
+    };
+    constexpr uint32_t kCensusDrawnMask = (1u << kWriterDraw) | (1u << kWriterDrawZ) | (1u << kWriterClear);
+
+    // Tables. The first kCensusStateTables are filled from one key per primitive (kCensusNoKey
+    // when not applicable) and also make up the pipeline-state hashes; the rest are events.
+    // Every table holds key -> {count, area}; the key layouts are documented in
+    // tools/gs_census.py, which must match.
+    enum CensusTableId : unsigned
+    {
+        kTabPrim,
+        kTabFrame,
+        kTabFbmsk,
+        kTabZbuf,
+        kTabTest,
+        kTabAlpha,
+        kTabFba,
+        kTabColclamp,
+        kTabDither,
+        kTabScanmsk,
+        kTabFog,
+        kTabTex0,
+        kTabTex1,
+        kTabClamp,
+        kTabTexa,
+        kTabFilter,
+        kTabPersp,
+        kTabScissor,
+        kTabOffset,
+        kTabRtFrame,
+        kTabRtZ,
+        kCensusStateTables,
+        kTabTexSrc = kCensusStateTables,
+        kTabRttTex,
+        kTabFeedback,
+        kTabFzOverlap,
+        kTabReinterp,
+        kTabUpload,
+        kTabUploadBytes,
+        kTabL2L,
+        kTabL2H,
+        kTabClutCalls,
+        kTabClutLoads,
+        kTabClutSrc,
+        kTabDirect,
+        kTabClear,
+        kTabClearColor,
+        kTabTexFmt,
+        kTabUploadRect,
+        kTabAreaHist,
+        kTabClobber,
+        kTabPrimsPerMark,
+        kTabStatesFull,
+        kTabStatesCoarse,
+        kCensusTables
+    };
+    const char *const kCensusTableNames[] = {
+        "prim", "frame", "fbmsk", "zbuf", "test", "alpha", "fba", "colclamp", "dither", "scanmsk", "fog",
+        "tex0", "tex1", "clamp", "texa", "filter", "persp", "scissor", "offset", "rt_frame", "rt_z",
+        "tex_src", "rtt_tex", "feedback", "fz_overlap", "reinterp", "upload", "upload_bytes", "l2l", "l2h",
+        "clut_calls", "clut_loads", "clut_src", "direct", "clear", "clear_color", "tex_fmt", "upload_rect", "area_hist", "clobber", "prims_per_mark",
+        "states_full", "states_coarse"};
+    static_assert(sizeof(kCensusTableNames) / sizeof(kCensusTableNames[0]) == kCensusTables,
+                  "one name per census table");
+
+    struct CensusPageSet
+    {
+        uint64_t w[kCensusPages / 64u] = {};
+        void set(uint32_t page) { page &= kCensusPages - 1u; w[page >> 6u] |= 1ull << (page & 63u); }
+        bool empty() const
+        {
+            uint64_t any = 0;
+            for (uint64_t v : w)
+                any |= v;
+            return any == 0;
+        }
+        bool intersects(const CensusPageSet &o) const
+        {
+            uint64_t any = 0;
+            for (unsigned i = 0; i < kCensusPages / 64u; ++i)
+                any |= w[i] & o.w[i];
+            return any != 0;
+        }
+        uint32_t count() const
+        {
+            uint32_t n = 0;
+            for (uint64_t v : w)
+                n += static_cast<uint32_t>(std::popcount(v));
+            return n;
+        }
+        template <typename F>
+        void forEach(F &&f) const
+        {
+            for (unsigned i = 0; i < kCensusPages / 64u; ++i)
+                for (uint64_t bits = w[i]; bits != 0; bits &= bits - 1)
+                    f(i * 64u + static_cast<uint32_t>(std::countr_zero(bits)));
+        }
+    };
+
+    struct CensusPage
+    {
+        uint8_t kind = kWriterNone;
+        uint8_t psm = 0;
+        uint8_t fbw = 0;
+        uint16_t base = 0; // fbp / zbp for draws, destination page for transfers
+        uint32_t seq = 0;  // census sequence number of the write
+    };
+
+    // Page size in pixels for a pixel storage format (8 KiB pages).
+    void censusPageDims(uint32_t psm, uint32_t &w, uint32_t &h)
+    {
+        switch (psm)
+        {
+        case GS_PSM_CT16:
+        case GS_PSM_CT16S:
+        case GS_PSM_Z16:
+        case GS_PSM_Z16S:
+            w = 64u;
+            h = 64u;
+            return;
+        case GS_PSM_T8:
+            w = 128u;
+            h = 64u;
+            return;
+        case GS_PSM_T4:
+            w = 128u;
+            h = 128u;
+            return;
+        default: // 32-bit layouts, including T8H/T4HL/T4HH
+            w = 64u;
+            h = 32u;
+            return;
+        }
+    }
+
+    // Pages with the same number share an address layout and swizzle.
+    uint32_t censusLayout(uint32_t psm)
+    {
+        switch (psm)
+        {
+        case GS_PSM_CT16:
+        case GS_PSM_Z16:
+            return 1u;
+        case GS_PSM_CT16S:
+        case GS_PSM_Z16S:
+            return 2u;
+        case GS_PSM_T8:
+            return 3u;
+        case GS_PSM_T4:
+            return 4u;
+        default:
+            return 0u; // CT32, CT24, Z32, Z24 and the 32-bit sub-field formats
+        }
+    }
+
+    bool censusIndexed(uint32_t psm)
+    {
+        return psm == GS_PSM_T8 || psm == GS_PSM_T4 || psm == GS_PSM_T8H || psm == GS_PSM_T4HL || psm == GS_PSM_T4HH;
+    }
+
+    // Pages touched by the pixel rectangle [x0,x1) x [y0,y1) of a buffer at `baseBlock` (256 byte
+    // units) that is `widthPx` wide. A base that is not page aligned also touches one page more.
+    void censusRectPages(CensusPageSet &out, uint32_t baseBlock, uint32_t widthPx, uint32_t psm,
+                         int x0, int y0, int x1, int y1)
+    {
+        x0 = std::max(x0, 0);
+        y0 = std::max(y0, 0);
+        if (x1 <= x0 || y1 <= y0)
+            return;
+        uint32_t pw, ph;
+        censusPageDims(psm, pw, ph);
+        const uint32_t perRow = std::max(1u, (widthPx + pw - 1u) / pw);
+        const uint32_t basePage = baseBlock >> 5u;
+        const uint32_t px0 = static_cast<uint32_t>(x0) / pw, px1 = static_cast<uint32_t>(x1 - 1) / pw;
+        const uint32_t py0 = static_cast<uint32_t>(y0) / ph, py1 = static_cast<uint32_t>(y1 - 1) / ph;
+        uint32_t highest = 0;
+        for (uint32_t py = py0; py <= py1; ++py)
+            for (uint32_t px = px0; px <= px1; ++px)
+            {
+                const uint32_t page = basePage + py * perRow + px;
+                out.set(page);
+                highest = std::max(highest, page);
+            }
+        if ((baseBlock & 31u) != 0u)
+            out.set(highest + 1u);
+    }
+
+    uint64_t censusMix(uint64_t h, uint64_t v)
+    {
+        h ^= v + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
+        h *= 0xFF51AFD7ED558CCDull;
+        h ^= h >> 32;
+        return h;
+    }
+
+    // The same state with the constants a GPU shader would take as uniforms removed: what is
+    // left decides which pipeline variant is needed.
+    uint64_t censusCoarseWord(unsigned table, uint64_t key)
+    {
+        if (key == kCensusNoKey)
+            return key;
+        switch (table)
+        {
+        case kTabPrim:
+            return key & ~(1ull << 9); // CTXT only picks a register set
+        case kTabFrame:
+            return key & (63ull | (1ull << 12)); // psm and "any mask", not the width
+        case kTabFbmsk:
+        case kTabFog:
+        case kTabScissor:
+        case kTabOffset:
+        case kTabRtFrame:
+        case kTabRtZ:
+            return kCensusNoKey;
+        case kTabTest:
+            return key & ~0xFF0ull; // AREF is a constant
+        case kTabAlpha:
+            return key & 0xFFull; // FIX is a constant
+        case kTabDither:
+            return key & 1ull;
+        case kTabTex0: // psm, tcc, tfx, cpsm, csm; not size, width or CSA
+            return key & (63ull | (1ull << 14) | (3ull << 15) | (0xFull << 17) | (1ull << 21));
+        case kTabTex1:
+            return key & 0x1FFull;
+        case kTabClamp:
+            return key & 0xFull;
+        case kTabTexa:
+            return (key >> 8) & 1ull; // AEM
+        default:
+            return key;
+        }
+    }
+
+    std::atomic<uint64_t> s_censusDrawnInBatches{0}; // primitives the drawer thread drew from batches
+
+    class GsCensus
+    {
+    public:
+        static GsCensus &instance()
+        {
+            static GsCensus *census = new GsCensus(); // never destroyed: used from atexit and other threads
+            return *census;
+        }
+
+        // ---- hooks, called by GSCpuBackend. `who` is the calling backend; only the first one
+        // counts (Present makes a scratch backend on the presenter thread). ----
+
+        void primitive(const void *who, const GSPrimitiveBatch &b)
+        {
+            std::lock_guard<std::mutex> lock(m_lock);
+            if (!accept(who))
+                return;
+            const auto begin = std::chrono::steady_clock::now();
+            countPrimitive(b);
+            m_iv.nanos += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - begin).count());
+        }
+
+        // Called after the primitive was queued (dropped ones included) or before it is drawn
+        // directly. `pending` is the backend's own count of primitives in its unkicked queue,
+        // read under the backend mutex; lines are only written from hooks that hold that mutex,
+        // so each line can check the census against the backend's own queue accounting.
+        void path(const void *who, bool queued, size_t pending)
+        {
+            std::lock_guard<std::mutex> lock(m_lock);
+            if (!accept(who))
+                return;
+            if (queued)
+                ++m_iv.queued;
+            else
+            {
+                ++m_iv.direct;
+                ++m_cum.direct;
+            }
+            if ((++m_tickCounter & 255u) == 0u)
+                tick(false, false, static_cast<int64_t>(pending));
+        }
+
+        void dropped(const void *who)
+        {
+            std::lock_guard<std::mutex> lock(m_lock);
+            if (!accept(who))
+                return;
+            ++m_iv.dropped;
+            ++m_cum.dropped;
+        }
+
+        void kick(const void *who, size_t prims)
+        {
+            std::lock_guard<std::mutex> lock(m_lock);
+            if (!accept(who))
+                return;
+            ++m_iv.kicks;
+            m_cum.kickedPrims += prims;
+        }
+
+        void transfer(const void *who, const GSTransferCommand &cmd)
+        {
+            std::lock_guard<std::mutex> lock(m_lock);
+            if (!accept(who))
+                return;
+            ++m_seq;
+            const GSBitBltBuf &bb = cmd.bitbltbuf;
+            const uint32_t rrw = cmd.trxreg.rrw, rrh = cmd.trxreg.rrh;
+            const uint64_t pixels = static_cast<uint64_t>(rrw) * rrh;
+            if (cmd.direction == 0u)
+            {
+                m_uploadKey = bb.dpsm | (static_cast<uint64_t>(bb.dbw) << 6);
+                add(kTabUpload, m_uploadKey, 1, pixels);
+                add(kTabUploadRect, bb.dpsm | (static_cast<uint64_t>(rrw & 0xFFF) << 6) | (static_cast<uint64_t>(rrh & 0xFFF) << 18), 1, pixels);
+                CensusPageSet dst;
+                censusRectPages(dst, bb.dbp, std::max<uint32_t>(bb.dbw, 1u) * 64u, bb.dpsm,
+                                cmd.trxpos.dsax, cmd.trxpos.dsay, cmd.trxpos.dsax + rrw, cmd.trxpos.dsay + rrh);
+                clobberCheck(dst, bb.dpsm, false, bb, rrw, rrh, pixels);
+                markPages(dst, kWriterUpload, bb.dpsm, bb.dbw, bb.dbp >> 5u);
+            }
+            else if (cmd.direction == 2u)
+            {
+                CensusPageSet src, dst;
+                censusRectPages(src, bb.sbp, std::max<uint32_t>(bb.sbw, 1u) * 64u, bb.spsm,
+                                cmd.trxpos.ssax, cmd.trxpos.ssay, cmd.trxpos.ssax + rrw, cmd.trxpos.ssay + rrh);
+                const uint32_t mask = writerMask(src);
+                const uint64_t key = bb.spsm | (static_cast<uint64_t>(bb.dpsm) << 6) | (static_cast<uint64_t>(mask) << 12) |
+                                     (static_cast<uint64_t>(rrw) << 19) | (static_cast<uint64_t>(rrh) << 31);
+                add(kTabL2L, key, 1, pixels);
+                if ((mask & kCensusDrawnMask) != 0u && exampleOk(kTabL2L, key))
+                {
+                    char buf[512];
+                    std::snprintf(buf, sizeof(buf),
+                                  "{\"cat\":\"l2l\",\"t\":%.2f,\"spsm\":%u,\"dpsm\":%u,\"sbp\":%u,\"sbw\":%u,\"dbp\":%u,\"dbw\":%u,"
+                                  "\"w\":%u,\"h\":%u,\"src_pages\":[%u,%u],%s}",
+                                  elapsed(), bb.spsm, bb.dpsm, bb.sbp, bb.sbw, bb.dbp, bb.dbw, rrw, rrh,
+                                  firstPage(src), src.count(), writerInfo(src).c_str());
+                    pushExample(kTabL2L, key, buf);
+                }
+                censusRectPages(dst, bb.dbp, std::max<uint32_t>(bb.dbw, 1u) * 64u, bb.dpsm,
+                                cmd.trxpos.dsax, cmd.trxpos.dsay, cmd.trxpos.dsax + rrw, cmd.trxpos.dsay + rrh);
+                clobberCheck(dst, bb.dpsm, true, bb, rrw, rrh, pixels);
+                markPages(dst, kWriterCopy, bb.dpsm, bb.dbw, bb.dbp >> 5u);
+            }
+            else if (cmd.direction == 1u)
+            {
+                CensusPageSet src;
+                censusRectPages(src, bb.sbp, std::max<uint32_t>(bb.sbw, 1u) * 64u, bb.spsm,
+                                cmd.trxpos.ssax, cmd.trxpos.ssay, cmd.trxpos.ssax + rrw, cmd.trxpos.ssay + rrh);
+                const uint32_t mask = writerMask(src);
+                const uint64_t key = bb.spsm | (static_cast<uint64_t>(mask) << 6) | (static_cast<uint64_t>(rrw) << 13) |
+                                     (static_cast<uint64_t>(rrh) << 25);
+                add(kTabL2H, key, 1, pixels);
+                if ((mask & kCensusDrawnMask) != 0u && exampleOk(kTabL2H, key))
+                {
+                    char buf[512];
+                    std::snprintf(buf, sizeof(buf),
+                                  "{\"cat\":\"l2h\",\"t\":%.2f,\"spsm\":%u,\"sbp\":%u,\"sbw\":%u,\"w\":%u,\"h\":%u,"
+                                  "\"src_pages\":[%u,%u],%s}",
+                                  elapsed(), bb.spsm, bb.sbp, bb.sbw, rrw, rrh, firstPage(src), src.count(),
+                                  writerInfo(src).c_str());
+                    pushExample(kTabL2H, key, buf);
+                }
+            }
+        }
+
+        void uploadChunk(const void *who, uint32_t sizeBytes)
+        {
+            std::lock_guard<std::mutex> lock(m_lock);
+            if (accept(who))
+                add(kTabUploadBytes, m_uploadKey, 1, sizeBytes);
+        }
+
+        void clutCall(const void *who, const GSTex0Reg &t)
+        {
+            std::lock_guard<std::mutex> lock(m_lock);
+            if (!accept(who))
+                return;
+            const uint64_t key = t.cld | (static_cast<uint64_t>(t.psm == GS_PSM_T4 || t.psm == GS_PSM_T4HL || t.psm == GS_PSM_T4HH) << 3) |
+                                 (static_cast<uint64_t>(t.cpsm & 0xF) << 4) | (static_cast<uint64_t>(t.csm & 1) << 8);
+            add(kTabClutCalls, key, 1, 0);
+        }
+
+        void clutLoad(const void *who, const GSTex0Reg &t, const GSTexClutReg &tc)
+        {
+            std::lock_guard<std::mutex> lock(m_lock);
+            if (!accept(who))
+                return;
+            ++m_seq;
+            const bool four = t.psm == GS_PSM_T4 || t.psm == GS_PSM_T4HL || t.psm == GS_PSM_T4HH;
+            const uint32_t entries = four ? 16u : 256u;
+            const bool sixteen = t.cpsm == GS_PSM_CT16 || t.cpsm == GS_PSM_CT16S;
+            add(kTabClutLoads,
+                (t.cpsm & 0xF) | (static_cast<uint64_t>(t.csm & 1) << 4) | (static_cast<uint64_t>(t.cld & 7) << 5) |
+                    (static_cast<uint64_t>(four) << 8),
+                1, entries);
+            // The pages the load reads.
+            CensusPageSet src;
+            if (t.csm == 0u)
+            {
+                const uint32_t bytes = entries * (sixteen ? 2u : 4u);
+                const uint32_t first = (t.cbp * 256u) >> 13u, last = (t.cbp * 256u + bytes - 1u) >> 13u;
+                for (uint32_t p = first; p <= last; ++p)
+                    src.set(p);
+            }
+            else
+            {
+                const uint32_t cou = static_cast<uint32_t>(tc.cou) * 16u;
+                censusRectPages(src, t.cbp, std::max<uint32_t>(tc.cbw, 1u) * 64u, t.cpsm,
+                                static_cast<int>(cou), tc.cov, static_cast<int>(cou + entries), tc.cov + 1);
+            }
+            const uint32_t mask = writerMask(src);
+            uint32_t writerPsm = 0, writerSeq = 0;
+            src.forEach([&](uint32_t p) {
+                if (m_pages[p].kind != kWriterNone && m_pages[p].seq >= writerSeq)
+                {
+                    writerSeq = m_pages[p].seq;
+                    writerPsm = m_pages[p].psm;
+                }
+            });
+            const uint64_t key = mask | (static_cast<uint64_t>(t.cpsm & 0xF) << 8) | (static_cast<uint64_t>(t.csm & 1) << 12) |
+                                 (static_cast<uint64_t>(writerPsm & 63) << 13);
+            add(kTabClutSrc, key, 1, entries);
+            if ((mask & kCensusDrawnMask) != 0u && exampleOk(kTabClutSrc, key))
+            {
+                char buf[512];
+                std::snprintf(buf, sizeof(buf),
+                              "{\"cat\":\"rtt_clut\",\"t\":%.2f,\"cbp\":%u,\"cpsm\":%u,\"csm\":%u,\"csa\":%u,\"cld\":%u,"
+                              "\"tex_psm\":%u,\"cbw\":%u,\"cou\":%u,\"cov\":%u,\"pages\":[%u,%u],%s}",
+                              elapsed(), t.cbp, t.cpsm, t.csm, t.csa, t.cld, t.psm, tc.cbw, tc.cou, tc.cov,
+                              firstPage(src), src.count(), writerInfo(src).c_str());
+                pushExample(kTabClutSrc, key, buf);
+            }
+        }
+
+        void clear(const void *who, const GSContext &ctx, uint32_t rgba)
+        {
+            std::lock_guard<std::mutex> lock(m_lock);
+            if (!accept(who))
+                return;
+            ++m_seq;
+            const uint32_t x0 = ctx.scissor.x0, x1 = std::max<uint32_t>(x0, ctx.scissor.x1);
+            const uint32_t y0 = ctx.scissor.y0, y1 = std::max<uint32_t>(y0, ctx.scissor.y1);
+            const uint64_t area = static_cast<uint64_t>(x1 - x0 + 1u) * (y1 - y0 + 1u);
+            add(kTabClear,
+                ctx.frame.fbp | (static_cast<uint64_t>(ctx.frame.fbw) << 9) | (static_cast<uint64_t>(ctx.frame.psm & 63) << 15) |
+                    (static_cast<uint64_t>(ctx.frame.fbmsk != 0u) << 21),
+                1, area);
+            add(kTabClearColor, rgba, 1, area);
+            if (ctx.frame.fbw != 0u)
+            {
+                CensusPageSet dst;
+                censusRectPages(dst, ctx.frame.fbp << 5u, ctx.frame.fbw * 64u, ctx.frame.psm,
+                                static_cast<int>(x0), static_cast<int>(y0), static_cast<int>(x1 + 1u), static_cast<int>(y1 + 1u));
+                markPages(dst, kWriterClear, ctx.frame.psm, ctx.frame.fbw, ctx.frame.fbp);
+            }
+        }
+
+        void direct(const void *who, bool write, uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y)
+        {
+            std::lock_guard<std::mutex> lock(m_lock);
+            if (!accept(who))
+                return;
+            add(kTabDirect, (write ? 1u : 0u) | (static_cast<uint64_t>(psm & 63u) << 1), 1, 1);
+            if (write)
+            {
+                ++m_seq;
+                CensusPageSet dst;
+                censusRectPages(dst, base, std::max<uint32_t>(bw, 1u) * 64u, psm, static_cast<int>(x), static_cast<int>(y),
+                                static_cast<int>(x + 1u), static_cast<int>(y + 1u));
+                markPages(dst, kWriterDirect, psm, bw, base >> 5u);
+            }
+        }
+
+        // `mark` is a guest VBlank marker (called under the backend mutex, `pending` valid); otherwise
+        // the host presenter showed a frame (no mutex held, `pending` unused).
+        void present(const void *who, const GSPresentationRequest &r, bool mark, size_t pending)
+        {
+            std::lock_guard<std::mutex> lock(m_lock);
+            if (!accept(who))
+                return;
+            uint64_t h = 0x1234567ull;
+            const uint64_t regs[6] = {r.pmode, r.smode2, r.dispfb1, r.display1, r.dispfb2, r.display2};
+            for (uint64_t v : regs)
+                h = censusMix(h, v);
+            PresentEntry &e = m_present[h];
+            std::memcpy(e.regs, regs, sizeof(regs));
+            if (mark)
+            {
+                ++e.marks;
+                ++m_iv.marks;
+                add(kTabPrimsPerMark, std::min<uint64_t>(m_primsSinceMark, 0xFFFFFu), 1, 0);
+                m_primsSinceMark = 0;
+                tick(false, false, static_cast<int64_t>(pending));
+            }
+            else
+            {
+                ++e.presents;
+                ++m_iv.presents;
+            }
+        }
+
+        // At shutdown: after the drawer has drained, so drawn counts are complete.
+        void finalize(const void *who)
+        {
+            std::lock_guard<std::mutex> lock(m_lock);
+            if (accept(who))
+                tick(true, true, -1);
+        }
+
+        void finalizeAtExit()
+        {
+            std::lock_guard<std::mutex> lock(m_lock);
+            if (m_file && !m_finalDone)
+                tick(true, true, -1);
+        }
+
+    private:
+        struct PresentEntry
+        {
+            uint64_t regs[6] = {};
+            uint64_t marks = 0;
+            uint64_t presents = 0;
+        };
+        struct Interval
+        {
+            uint64_t submit = 0, queued = 0, direct = 0, dropped = 0, empty = 0, area = 0, nanos = 0;
+            uint64_t marks = 0, presents = 0, kicks = 0;
+        };
+        struct Cumulative
+        {
+            uint64_t submitted = 0, direct = 0, dropped = 0, kickedPrims = 0;
+        };
+
+        bool accept(const void *who)
+        {
+            if (!m_owner)
+            {
+                m_owner = who;
+                start();
+            }
+            return who == m_owner && m_file != nullptr;
+        }
+
+        void start()
+        {
+            const char *path = std::getenv("PS2X_GS_CENSUS");
+            m_file = path ? std::fopen(path, "ab") : nullptr;
+            if (!m_file)
+            {
+                std::fprintf(stderr, "[gs:census] cannot open PS2X_GS_CENSUS file\n");
+                return;
+            }
+            if (const char *env = std::getenv("PS2X_GS_CENSUS_INTERVAL"))
+                m_interval = std::max(0.2, std::atof(env));
+            m_t0 = std::chrono::steady_clock::now();
+            m_last = m_t0;
+            m_unix0 = unixNow();
+            std::atexit([] { GsCensus::instance().finalizeAtExit(); });
+        }
+
+        static double unixNow()
+        {
+            return std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
+        }
+        double elapsed() const
+        {
+            return std::chrono::duration<double>(std::chrono::steady_clock::now() - m_t0).count();
+        }
+
+        void add(unsigned table, uint64_t key, uint64_t n, uint64_t area)
+        {
+            CensusCount &c = m_tables[table][key];
+            c.n += n;
+            c.area += area;
+        }
+
+        // Writer kinds present in a page set, as a bit mask over CensusWriter.
+        uint32_t writerMask(const CensusPageSet &set) const
+        {
+            uint32_t mask = 0;
+            set.forEach([&](uint32_t p) { mask |= 1u << m_pages[p].kind; });
+            return mask;
+        }
+
+        static uint32_t firstPage(const CensusPageSet &set)
+        {
+            uint32_t first = 0;
+            bool found = false;
+            set.forEach([&](uint32_t p) {
+                if (!found)
+                {
+                    first = p;
+                    found = true;
+                }
+            });
+            return first;
+        }
+
+        // JSON members describing the most recent drawn-to writer in the set.
+        std::string writerInfo(const CensusPageSet &set) const
+        {
+            const CensusPage *best = nullptr;
+            uint32_t bestPage = 0;
+            set.forEach([&](uint32_t p) {
+                const CensusPage &pg = m_pages[p];
+                if (((1u << pg.kind) & kCensusDrawnMask) != 0u && (!best || pg.seq > best->seq))
+                {
+                    best = &pg;
+                    bestPage = p;
+                }
+            });
+            char buf[200];
+            if (!best)
+                return "\"writer\":null";
+            std::snprintf(buf, sizeof(buf), "\"writer\":{\"kind\":%u,\"psm\":%u,\"base\":%u,\"fbw\":%u,\"page\":%u,\"age\":%u}",
+                          best->kind, best->psm, best->base, best->fbw, bestPage, m_seq - best->seq);
+            return buf;
+        }
+
+        void markPages(const CensusPageSet &set, uint8_t kind, uint32_t psm, uint32_t fbw, uint32_t base)
+        {
+            set.forEach([&](uint32_t p) {
+                CensusPage &pg = m_pages[p];
+                pg.kind = kind;
+                pg.psm = static_cast<uint8_t>(psm);
+                pg.fbw = static_cast<uint8_t>(fbw);
+                pg.base = static_cast<uint16_t>(base);
+                pg.seq = m_seq;
+            });
+        }
+
+        // At most a few examples per key in each 15 s of the run, so every scene can show its own.
+        bool exampleOk(unsigned table, uint64_t key)
+        {
+            const uint32_t bucket = static_cast<uint32_t>(elapsed() / 15.0);
+            if (bucket != m_exampleBucket)
+            {
+                m_exampleBucket = bucket;
+                m_exampleCounts.clear();
+            }
+            uint8_t &n = m_exampleCounts[censusMix(table, key)];
+            if (n >= kCensusExamplesPerKey || m_categoryExamples[table] >= kCensusExamplesPerCategory)
+                return false;
+            ++n;
+            ++m_categoryExamples[table];
+            return true;
+        }
+
+        // Adds the table name and key so the summary tool can match an example to its table row.
+        void pushExample(unsigned table, uint64_t key, const char *json)
+        {
+            std::string s = json;
+            s.insert(1, std::string("\"table\":\"") + kCensusTableNames[table] + "\",\"key\":" + std::to_string(key) + ",");
+            m_examples.push_back(std::move(s));
+        }
+
+        void countPrimitive(const GSPrimitiveBatch &b)
+        {
+            const GSDrawState &s = b.state;
+            const GSContext &c = s.context;
+            const GSPrimReg &p = s.prim;
+            const GSTex0Reg &t = c.tex0;
+            ++m_seq;
+            ++m_primsSinceMark;
+            ++m_iv.submit;
+            ++m_cum.submitted;
+
+            // Bounding box in window pixels, clipped to the scissor. A triangle's box is larger
+            // than its coverage; the area column is the box, as asked.
+            const int ofx = c.xyoffset.ofx >> 4, ofy = c.xyoffset.ofy >> 4;
+            const unsigned vc = std::min<unsigned>(b.vertexCount, 3u);
+            float minX = b.vertices[0].x, maxX = minX, minY = b.vertices[0].y, maxY = minY;
+            for (unsigned i = 1; i < vc; ++i)
+            {
+                minX = std::min(minX, b.vertices[i].x);
+                maxX = std::max(maxX, b.vertices[i].x);
+                minY = std::min(minY, b.vertices[i].y);
+                maxY = std::max(maxY, b.vertices[i].y);
+            }
+            int bx0 = 0, by0 = 0, bx1 = 0, by1 = 0;
+            uint64_t area = 0;
+            if (std::isfinite(minX) && std::isfinite(maxX) && std::isfinite(minY) && std::isfinite(maxY) &&
+                std::fabs(minX) < 1.0e6f && std::fabs(maxX) < 1.0e6f && std::fabs(minY) < 1.0e6f && std::fabs(maxY) < 1.0e6f)
+            {
+                bx0 = static_cast<int>(std::floor(minX)) - ofx;
+                by0 = static_cast<int>(std::floor(minY)) - ofy;
+                bx1 = static_cast<int>(std::ceil(maxX)) - ofx;
+                by1 = static_cast<int>(std::ceil(maxY)) - ofy;
+                if (bx1 <= bx0)
+                    bx1 = bx0 + 1;
+                if (by1 <= by0)
+                    by1 = by0 + 1;
+                bx0 = std::max(bx0, static_cast<int>(c.scissor.x0));
+                by0 = std::max(by0, static_cast<int>(c.scissor.y0));
+                bx1 = std::min(bx1, static_cast<int>(c.scissor.x1) + 1);
+                by1 = std::min(by1, static_cast<int>(c.scissor.y1) + 1);
+                if (bx1 > bx0 && by1 > by0)
+                    area = static_cast<uint64_t>(bx1 - bx0) * static_cast<uint64_t>(by1 - by0);
+                else
+                    bx1 = bx0, by1 = by0;
+            }
+            m_iv.area += area;
+            if (area == 0)
+                ++m_iv.empty;
+            add(kTabAreaHist, static_cast<uint64_t>(p.type & 7) | (static_cast<uint64_t>(std::bit_width(area)) << 3), 1, area);
+
+            // Keys.
+            uint64_t k[kCensusStateTables];
+            for (uint64_t &v : k)
+                v = kCensusNoKey;
+            const bool zmask = c.zbuf.zmask;
+            const bool zte = ((c.test >> 16) & 1u) != 0u;
+            k[kTabPrim] = static_cast<uint64_t>(p.type & 7) | (static_cast<uint64_t>(p.iip) << 3) | (static_cast<uint64_t>(p.tme) << 4) |
+                          (static_cast<uint64_t>(p.fge) << 5) | (static_cast<uint64_t>(p.abe) << 6) | (static_cast<uint64_t>(p.aa1) << 7) |
+                          (static_cast<uint64_t>(p.fst) << 8) | (static_cast<uint64_t>(p.ctxt) << 9) | (static_cast<uint64_t>(p.fix) << 10) |
+                          (static_cast<uint64_t>(s.pabe) << 11);
+            k[kTabFrame] = static_cast<uint64_t>(c.frame.psm & 63) | (static_cast<uint64_t>(c.frame.fbw & 63) << 6) |
+                           (static_cast<uint64_t>(c.frame.fbmsk != 0u) << 12);
+            if (c.frame.fbmsk != 0u)
+                k[kTabFbmsk] = c.frame.fbmsk;
+            k[kTabZbuf] = static_cast<uint64_t>(c.zbuf.psm & 63) | (static_cast<uint64_t>(zmask) << 6);
+            k[kTabTest] = c.test & 0x7FFFFull;
+            if (p.abe)
+                k[kTabAlpha] = (c.alpha & 0xFFull) | (((c.alpha >> 32) & 0xFFull) << 8);
+            k[kTabFba] = c.fba & 1ull;
+            k[kTabColclamp] = s.colclamp & 1ull;
+            k[kTabDither] = (s.dthe & 1ull) != 0u ? (1ull | ((s.dimx & 0xFFFFFFFFFFFFull) << 1)) : 0ull;
+            k[kTabScanmsk] = s.scanmsk & 3ull;
+            if (p.fge)
+                k[kTabFog] = static_cast<uint64_t>(s.fogR) | (static_cast<uint64_t>(s.fogG) << 8) | (static_cast<uint64_t>(s.fogB) << 16);
+            k[kTabScissor] = static_cast<uint64_t>(c.scissor.x0 & 0x7FF) | (static_cast<uint64_t>(c.scissor.x1 & 0x7FF) << 11) |
+                             (static_cast<uint64_t>(c.scissor.y0 & 0x7FF) << 22) | (static_cast<uint64_t>(c.scissor.y1 & 0x7FF) << 33);
+            k[kTabOffset] = static_cast<uint64_t>(c.xyoffset.ofx) | (static_cast<uint64_t>(c.xyoffset.ofy) << 16);
+            k[kTabRtFrame] = static_cast<uint64_t>(c.frame.fbp & 0x1FF) | (static_cast<uint64_t>(c.frame.fbw & 63) << 9) |
+                             (static_cast<uint64_t>(c.frame.psm & 63) << 15);
+            k[kTabRtZ] = static_cast<uint64_t>(c.zbuf.zbp & 0x1FF) | (static_cast<uint64_t>(c.zbuf.psm & 63) << 9) |
+                         (static_cast<uint64_t>(zmask) << 15) | (static_cast<uint64_t>(zte) << 16);
+
+            const bool indexed = censusIndexed(t.psm);
+            if (p.tme)
+            {
+                k[kTabTex0] = static_cast<uint64_t>(t.psm & 63) | (static_cast<uint64_t>(t.tw & 15) << 6) | (static_cast<uint64_t>(t.th & 15) << 10) |
+                              (static_cast<uint64_t>(t.tcc & 1) << 14) | (static_cast<uint64_t>(t.tfx & 3) << 15) |
+                              (indexed ? (static_cast<uint64_t>(t.cpsm & 15) << 17) | (static_cast<uint64_t>(t.csm & 1) << 21) |
+                                             (static_cast<uint64_t>(t.csa & 31) << 22)
+                                       : 0ull) |
+                              (static_cast<uint64_t>(t.tbw & 63) << 27);
+                const uint64_t t1 = c.tex1;
+                k[kTabTex1] = (t1 & 0x1FFull) | (((t1 >> 19) & 3ull) << 9) | (((t1 >> 32) & 0xFFFull) << 11) |
+                              (static_cast<uint64_t>(c.miptbp1 != 0u) << 23) | (static_cast<uint64_t>(c.miptbp2 != 0u) << 24);
+                const uint64_t cl = c.clamp;
+                const uint64_t wms = cl & 3ull, wmt = (cl >> 2) & 3ull;
+                uint64_t ck = wms | (wmt << 2);
+                if (wms >= 2u)
+                    ck |= (((cl >> 4) & 0x3FFull) << 4) | (((cl >> 14) & 0x3FFull) << 14);
+                if (wmt >= 2u)
+                    ck |= (((cl >> 24) & 0x3FFull) << 24) | (((cl >> 34) & 0x3FFull) << 34);
+                k[kTabClamp] = ck;
+                const bool texaUsed = t.psm == GS_PSM_CT24 || t.psm == GS_PSM_CT16 || t.psm == GS_PSM_CT16S ||
+                                      (indexed && (t.cpsm == GS_PSM_CT24 || t.cpsm == GS_PSM_CT16 || t.cpsm == GS_PSM_CT16S));
+                if (texaUsed)
+                    k[kTabTexa] = static_cast<uint64_t>(s.texa.ta0) | (static_cast<uint64_t>(s.texa.aem) << 8) |
+                                  (static_cast<uint64_t>(s.texa.ta1) << 9);
+                const uint64_t mmag = (t1 >> 5) & 1ull, mmin = (t1 >> 6) & 7ull;
+                k[kTabFilter] = static_cast<uint64_t>(s.linearFilter) | (mmag << 1) | (mmin << 2);
+                bool qVaries = false;
+                if (!p.fst)
+                {
+                    const float q0 = b.vertices[0].q;
+                    qVaries = std::fabs(q0 - 1.0f) > 1.0e-6f;
+                    for (unsigned i = 1; i < vc; ++i)
+                        qVaries |= std::fabs(b.vertices[i].q - q0) > 1.0e-4f * std::fabs(q0);
+                }
+                k[kTabPersp] = static_cast<uint64_t>(!p.fst) | (static_cast<uint64_t>(qVaries) << 1);
+            }
+
+            // Pages this primitive reads and writes.
+            const uint32_t fbw = std::max<uint32_t>(c.frame.fbw, 1u);
+            CensusPageSet frameSet, zSet;
+            const bool writesFrame = c.frame.fbmsk != 0xFFFFFFFFu && area != 0;
+            const bool writesZ = !zmask && area != 0;
+            if (writesFrame)
+                censusRectPages(frameSet, c.frame.fbp << 5u, fbw * 64u, c.frame.psm, bx0, by0, bx1, by1);
+            if (writesZ)
+                censusRectPages(zSet, c.zbuf.zbp << 5u, fbw * 64u, c.zbuf.psm, bx0, by0, bx1, by1);
+
+            if (p.tme && area != 0)
+                textureHazards(b, bx0, by0, bx1, by1, area, frameSet, zSet);
+
+            // A frame drawn in another pixel format than its pages were last written in.
+            if (writesFrame)
+                reinterpretCheck(frameSet, c.frame.psm, false, area, c.frame.fbp, c.frame.fbw, bx0, by0, bx1, by1);
+            if (writesZ)
+                reinterpretCheck(zSet, c.zbuf.psm, true, area, c.zbuf.zbp, c.frame.fbw, bx0, by0, bx1, by1);
+
+            // A frame buffer that overlaps its Z buffer, when depth is in use.
+            if (!zmask || zte)
+            {
+                const int rows = std::max<int>(c.scissor.y1 + 1, 1);
+                const uint64_t ck = static_cast<uint64_t>(c.frame.fbp & 0x1FF) | (static_cast<uint64_t>(fbw & 63) << 9) |
+                                    (static_cast<uint64_t>(c.frame.psm & 63) << 15) | (static_cast<uint64_t>(c.zbuf.zbp & 0x1FF) << 21) |
+                                    (static_cast<uint64_t>(c.zbuf.psm & 63) << 30) | (static_cast<uint64_t>(rows & 0x7FF) << 36);
+                auto found = m_fzCache.find(ck);
+                if (found == m_fzCache.end())
+                {
+                    CensusPageSet fs, zs;
+                    censusRectPages(fs, c.frame.fbp << 5u, fbw * 64u, c.frame.psm, 0, 0, static_cast<int>(fbw * 64u), rows);
+                    censusRectPages(zs, c.zbuf.zbp << 5u, fbw * 64u, c.zbuf.psm, 0, 0, static_cast<int>(fbw * 64u), rows);
+                    found = m_fzCache.emplace(ck, fs.intersects(zs)).first;
+                }
+                if (found->second)
+                    add(kTabFzOverlap, ck | (static_cast<uint64_t>(zmask) << 47) | (static_cast<uint64_t>(zte) << 48), 1, area);
+            }
+
+            if (writesFrame)
+                markPages(frameSet, kWriterDraw, c.frame.psm, c.frame.fbw, c.frame.fbp);
+            if (writesZ)
+                markPages(zSet, kWriterDrawZ, c.zbuf.psm, c.frame.fbw, c.zbuf.zbp);
+
+            // Count into the state tables, one run of identical states at a time.
+            if (m_hasPending && std::memcmp(k, m_pendKeys, sizeof(k)) == 0)
+            {
+                ++m_pendN;
+                m_pendArea += area;
+            }
+            else
+            {
+                commitPending();
+                std::memcpy(m_pendKeys, k, sizeof(k));
+                m_pendN = 1;
+                m_pendArea = area;
+                m_hasPending = true;
+            }
+        }
+
+        // The texels a primitive can sample, as a rectangle [u0,u1) x [v0,v1): the box of its vertex
+        // coordinates plus a texel of margin for the filter, then cut down by the wrap mode (clamping
+        // limits it to the texture or the clamp region; repeating keeps it only if it does not wrap).
+        // Whole texture when the coordinates cannot be worked out.
+        void textureFootprint(const GSPrimitiveBatch &b, int &u0, int &v0, int &u1, int &v1) const
+        {
+            const GSContext &c = b.state.context;
+            const GSTex0Reg &t = c.tex0;
+            const int texW = 1 << std::min<uint32_t>(t.tw, 10u), texH = 1 << std::min<uint32_t>(t.th, 10u);
+            u0 = 0;
+            v0 = 0;
+            u1 = texW;
+            v1 = texH;
+            const unsigned vc = std::min<unsigned>(b.vertexCount, 3u);
+            float minU = 1.0e30f, maxU = -1.0e30f, minV = 1.0e30f, maxV = -1.0e30f;
+            for (unsigned i = 0; i < vc; ++i)
+            {
+                const GSVertex &v = b.vertices[i];
+                float u, w;
+                if (b.state.prim.fst)
+                {
+                    u = static_cast<float>(v.u) / 16.0f;
+                    w = static_cast<float>(v.v) / 16.0f;
+                }
+                else
+                {
+                    if (std::fabs(v.q) < 1.0e-8f)
+                        return;
+                    u = v.s / v.q * static_cast<float>(texW);
+                    w = v.t / v.q * static_cast<float>(texH);
+                }
+                if (!std::isfinite(u) || !std::isfinite(w) || std::fabs(u) > 1.0e6f || std::fabs(w) > 1.0e6f)
+                    return;
+                minU = std::min(minU, u);
+                maxU = std::max(maxU, u);
+                minV = std::min(minV, w);
+                maxV = std::max(maxV, w);
+            }
+            const uint64_t cl = c.clamp;
+            auto narrow = [](float lo, float hi, int size, uint64_t mode, int regionMin, int regionMax, int &out0, int &out1)
+            {
+                int a = static_cast<int>(std::floor(lo)) - 1;
+                int e = static_cast<int>(std::ceil(hi)) + 1; // exclusive
+                switch (mode & 3u)
+                {
+                case 1: // CLAMP
+                    a = std::clamp(a, 0, size - 1);
+                    e = std::clamp(e, a + 1, size);
+                    break;
+                case 2: // REGION_CLAMP
+                    regionMax = std::min(regionMax, size - 1);
+                    regionMin = std::min(regionMin, regionMax);
+                    a = std::clamp(a, regionMin, regionMax);
+                    e = std::clamp(e, a + 1, regionMax + 1);
+                    break;
+                case 0: // REPEAT: narrow only when no wrap happens
+                    if (a >= 0 && e <= size)
+                        break;
+                    [[fallthrough]];
+                default: // REGION_REPEAT, or a repeat that wraps: the whole texture
+                    a = 0;
+                    e = size;
+                    break;
+                }
+                out0 = a;
+                out1 = e;
+            };
+            narrow(minU, maxU, texW, cl & 3u, static_cast<int>((cl >> 4) & 0x3FFu), static_cast<int>((cl >> 14) & 0x3FFu), u0, u1);
+            narrow(minV, maxV, texH, (cl >> 2) & 3u, static_cast<int>((cl >> 24) & 0x3FFu), static_cast<int>((cl >> 34) & 0x3FFu), v0, v1);
+        }
+
+        // Texture reads: where the pages came from, render to texture, feedback.
+        void textureHazards(const GSPrimitiveBatch &b, int bx0, int by0, int bx1, int by1, uint64_t area,
+                            const CensusPageSet &frameSet, const CensusPageSet &zSet)
+        {
+            const GSContext &c = b.state.context;
+            const GSTex0Reg &t = c.tex0;
+            const uint32_t texW = 1u << std::min<uint32_t>(t.tw, 10u);
+            int fu0, fv0, fu1, fv1;
+            textureFootprint(b, fu0, fv0, fu1, fv1);
+            CensusPageSet texSet;
+            // The row stride is TBW (TW only wraps coordinates), so a 1024 wide texture with TBW 10 lies on a 640 wide grid.
+            censusRectPages(texSet, t.tbp0, t.tbw != 0u ? t.tbw * 64u : texW, t.psm, fu0, fv0, fu1, fv1);
+            const uint32_t mask = writerMask(texSet);
+            add(kTabTexSrc, mask | (static_cast<uint64_t>(t.psm & 63) << 8), 1, area);
+
+            // Pages written by a transfer in another pixel format than the texture is read in.
+            {
+                uint32_t seen[4], seenPage[4];
+                unsigned seenCount = 0;
+                texSet.forEach([&](uint32_t p) {
+                    const CensusPage &pg = m_pages[p];
+                    if ((pg.kind != kWriterUpload && pg.kind != kWriterCopy && pg.kind != kWriterDirect) || pg.psm == t.psm)
+                        return;
+                    const uint32_t combo = pg.kind | (static_cast<uint32_t>(pg.psm) << 3);
+                    for (unsigned i = 0; i < seenCount; ++i)
+                        if (seen[i] == combo)
+                            return;
+                    if (seenCount < 4u)
+                    {
+                        seenPage[seenCount] = p;
+                        seen[seenCount++] = combo;
+                    }
+                });
+                for (unsigned i = 0; i < seenCount; ++i)
+                {
+                    const uint32_t writerKind = seen[i] & 7u, writerPsm = seen[i] >> 3;
+                    const uint64_t key = static_cast<uint64_t>(t.psm & 63) | (static_cast<uint64_t>(writerPsm & 63) << 6) |
+                                         (static_cast<uint64_t>(writerKind) << 12) |
+                                         (static_cast<uint64_t>(censusLayout(t.psm) != censusLayout(writerPsm)) << 15);
+                    add(kTabTexFmt, key, 1, area);
+                    if (exampleOk(kTabTexFmt, key))
+                    {
+                        const CensusPage &pg = m_pages[seenPage[i]];
+                        char buf[700];
+                        std::snprintf(buf, sizeof(buf),
+                                      "{\"cat\":\"tex_fmt\",\"t\":%.2f,\"prim\":{\"type\":%u,\"fst\":%u},"
+                                      "\"tex\":{\"tbp0\":%u,\"tbw\":%u,\"psm\":%u,\"tw\":%u,\"th\":%u,\"cbp\":%u,\"cpsm\":%u},"
+                                      "\"footprint\":[%d,%d,%d,%d],\"pages\":{\"total\":%u,\"first\":%u},"
+                                      "\"writer\":{\"kind\":%u,\"psm\":%u,\"base\":%u,\"fbw\":%u,\"page\":%u,\"age\":%u}}",
+                                      elapsed(), b.state.prim.type, b.state.prim.fst, t.tbp0, t.tbw, t.psm, t.tw, t.th, t.cbp, t.cpsm,
+                                      fu0, fv0, fu1, fv1, texSet.count(), firstPage(texSet), pg.kind, pg.psm, pg.base, pg.fbw,
+                                      seenPage[i], m_seq - pg.seq);
+                        pushExample(kTabTexFmt, key, buf);
+                    }
+                }
+            }
+
+            if ((mask & kCensusDrawnMask) != 0u)
+            {
+                // Render to texture: report the most recently drawn page.
+                const CensusPage *best = nullptr;
+                uint32_t bestPage = 0, drawnPages = 0;
+                texSet.forEach([&](uint32_t p) {
+                    const CensusPage &pg = m_pages[p];
+                    if (((1u << pg.kind) & kCensusDrawnMask) == 0u)
+                        return;
+                    ++drawnPages;
+                    if (!best || pg.seq > best->seq)
+                    {
+                        best = &pg;
+                        bestPage = p;
+                    }
+                });
+                const uint64_t key = static_cast<uint64_t>(t.psm & 63) | (static_cast<uint64_t>(best->psm & 63) << 6) |
+                                     (static_cast<uint64_t>(best->kind) << 12) |
+                                     (static_cast<uint64_t>(censusLayout(t.psm) != censusLayout(best->psm)) << 15);
+                add(kTabRttTex, key, 1, area);
+                if (exampleOk(kTabRttTex, key))
+                {
+                    char buf[1000];
+                    std::snprintf(buf, sizeof(buf),
+                                  "{\"cat\":\"rtt_tex\",\"t\":%.2f,\"prim\":{\"type\":%u,\"abe\":%u,\"fst\":%u,\"ctxt\":%u},"
+                                  "\"tex\":{\"tbp0\":%u,\"tbw\":%u,\"psm\":%u,\"tw\":%u,\"th\":%u,\"cbp\":%u,\"cpsm\":%u,\"csm\":%u},"
+                                  "\"footprint\":[%d,%d,%d,%d],"
+                                  "\"pages\":{\"total\":%u,\"drawn\":%u,\"first\":%u},"
+                                  "\"writer\":{\"kind\":%u,\"psm\":%u,\"base\":%u,\"fbw\":%u,\"page\":%u,\"age\":%u},"
+                                  "\"frame\":{\"fbp\":%u,\"fbw\":%u,\"psm\":%u},\"bbox\":[%d,%d,%d,%d]}",
+                                  elapsed(), b.state.prim.type, b.state.prim.abe, b.state.prim.fst, b.state.prim.ctxt, t.tbp0, t.tbw,
+                                  t.psm, t.tw, t.th, t.cbp, t.cpsm, t.csm, fu0, fv0, fu1, fv1, texSet.count(), drawnPages,
+                                  firstPage(texSet), best->kind, best->psm, best->base, best->fbw, bestPage, m_seq - best->seq,
+                                  c.frame.fbp, c.frame.fbw, c.frame.psm, bx0, by0, bx1, by1);
+                    pushExample(kTabRttTex, key, buf);
+                }
+            }
+
+            // Feedback: the texture shares pages with what this primitive writes.
+            const bool fbFeedback = texSet.intersects(frameSet);
+            const bool zFeedback = texSet.intersects(zSet);
+            if (fbFeedback || zFeedback)
+            {
+                const uint64_t key = (fbFeedback ? 1ull : 0ull) | (zFeedback ? 2ull : 0ull) | (static_cast<uint64_t>(t.psm & 63) << 2) |
+                                     (static_cast<uint64_t>(c.frame.psm & 63) << 8);
+                add(kTabFeedback, key, 1, area);
+                if (exampleOk(kTabFeedback, key))
+                {
+                    char buf[800];
+                    std::snprintf(buf, sizeof(buf),
+                                  "{\"cat\":\"feedback\",\"t\":%.2f,\"prim\":{\"type\":%u,\"abe\":%u,\"fst\":%u},"
+                                  "\"tex\":{\"tbp0\":%u,\"tbw\":%u,\"psm\":%u,\"tw\":%u,\"th\":%u},\"footprint\":[%d,%d,%d,%d],"
+                                  "\"tex_pages\":[%u,%u],"
+                                  "\"frame\":{\"fbp\":%u,\"fbw\":%u,\"psm\":%u},\"z\":{\"zbp\":%u,\"psm\":%u,\"zmsk\":%u},"
+                                  "\"bbox\":[%d,%d,%d,%d],\"with_frame\":%u,\"with_z\":%u}",
+                                  elapsed(), b.state.prim.type, b.state.prim.abe, b.state.prim.fst, t.tbp0, t.tbw, t.psm, t.tw, t.th,
+                                  fu0, fv0, fu1, fv1, firstPage(texSet), texSet.count(), c.frame.fbp, c.frame.fbw, c.frame.psm,
+                                  c.zbuf.zbp, c.zbuf.psm, static_cast<unsigned>(c.zbuf.zmask), bx0, by0, bx1, by1, fbFeedback, zFeedback);
+                    pushExample(kTabFeedback, key, buf);
+                }
+            }
+        }
+
+        void reinterpretCheck(const CensusPageSet &set, uint32_t newPsm, bool isZ, uint64_t area, uint32_t base, uint32_t fbw,
+                              int bx0, int by0, int bx1, int by1)
+        {
+            uint32_t seen[8], seenPage[8];
+            unsigned seenCount = 0;
+            set.forEach([&](uint32_t p) {
+                const CensusPage &pg = m_pages[p];
+                if (pg.kind == kWriterNone || pg.psm == newPsm)
+                    return;
+                const uint32_t combo = pg.kind | (static_cast<uint32_t>(pg.psm) << 3);
+                for (unsigned i = 0; i < seenCount; ++i)
+                    if (seen[i] == combo)
+                        return;
+                if (seenCount < 8u)
+                {
+                    seenPage[seenCount] = p;
+                    seen[seenCount++] = combo;
+                }
+            });
+            for (unsigned i = 0; i < seenCount; ++i)
+            {
+                const uint32_t oldKind = seen[i] & 7u, oldPsm = seen[i] >> 3;
+                const uint64_t key = oldKind | (static_cast<uint64_t>(oldPsm) << 3) | (static_cast<uint64_t>(newPsm & 63) << 9) |
+                                     (static_cast<uint64_t>(isZ) << 15) |
+                                     (static_cast<uint64_t>(censusLayout(oldPsm) != censusLayout(newPsm)) << 16);
+                add(kTabReinterp, key, 1, area);
+                if (exampleOk(kTabReinterp, key))
+                {
+                    const CensusPage &pg = m_pages[seenPage[i]];
+                    char buf[600];
+                    std::snprintf(buf, sizeof(buf),
+                                  "{\"cat\":\"reinterp\",\"t\":%.2f,\"new\":{\"is_z\":%u,\"psm\":%u,\"base\":%u,\"fbw\":%u},"
+                                  "\"bbox\":[%d,%d,%d,%d],\"pages\":{\"total\":%u,\"first\":%u},"
+                                  "\"old\":{\"kind\":%u,\"psm\":%u,\"base\":%u,\"fbw\":%u,\"page\":%u,\"age\":%u}}",
+                                  elapsed(), isZ, newPsm, base, fbw, bx0, by0, bx1, by1, set.count(), firstPage(set), pg.kind, pg.psm,
+                                  pg.base, pg.fbw, seenPage[i], m_seq - pg.seq);
+                    pushExample(kTabReinterp, key, buf);
+                }
+            }
+        }
+
+        // A transfer into pages a draw or clear wrote last (a texture upload into a render target's memory).
+        void clobberCheck(const CensusPageSet &dst, uint32_t dpsm, bool isCopy, const GSBitBltBuf &bb, uint32_t rrw, uint32_t rrh,
+                          uint64_t pixels)
+        {
+            uint32_t seen[4], seenPage[4];
+            unsigned seenCount = 0;
+            dst.forEach([&](uint32_t p) {
+                const CensusPage &pg = m_pages[p];
+                if (((1u << pg.kind) & kCensusDrawnMask) == 0u)
+                    return;
+                const uint32_t combo = pg.kind | (static_cast<uint32_t>(pg.psm) << 3);
+                for (unsigned i = 0; i < seenCount; ++i)
+                    if (seen[i] == combo)
+                        return;
+                if (seenCount < 4u)
+                {
+                    seenPage[seenCount] = p;
+                    seen[seenCount++] = combo;
+                }
+            });
+            for (unsigned i = 0; i < seenCount; ++i)
+            {
+                const uint32_t oldKind = seen[i] & 7u, oldPsm = seen[i] >> 3;
+                const uint64_t key = static_cast<uint64_t>(dpsm & 63) | (static_cast<uint64_t>(oldKind) << 6) |
+                                     (static_cast<uint64_t>(oldPsm & 63) << 9) |
+                                     (static_cast<uint64_t>(censusLayout(oldPsm) != censusLayout(dpsm)) << 15) |
+                                     (static_cast<uint64_t>(isCopy) << 16);
+                add(kTabClobber, key, 1, pixels);
+                if (exampleOk(kTabClobber, key))
+                {
+                    const CensusPage &pg = m_pages[seenPage[i]];
+                    char buf[600];
+                    std::snprintf(buf, sizeof(buf),
+                                  "{\"cat\":\"clobber\",\"t\":%.2f,\"copy\":%u,\"dpsm\":%u,\"dbp\":%u,\"dbw\":%u,\"w\":%u,\"h\":%u,"
+                                  "\"pages\":{\"total\":%u,\"first\":%u},"
+                                  "\"old\":{\"kind\":%u,\"psm\":%u,\"base\":%u,\"fbw\":%u,\"page\":%u,\"age\":%u}}",
+                                  elapsed(), isCopy, dpsm, bb.dbp, bb.dbw, rrw, rrh, dst.count(), firstPage(dst), pg.kind, pg.psm,
+                                  pg.base, pg.fbw, seenPage[i], m_seq - pg.seq);
+                    pushExample(kTabClobber, key, buf);
+                }
+            }
+        }
+
+        void commitPending()
+        {
+            if (!m_hasPending)
+                return;
+            uint64_t full = 0x9E3779B97F4A7C15ull, coarse = 0x243F6A8885A308D3ull;
+            for (unsigned i = 0; i < kCensusStateTables; ++i)
+            {
+                if (m_pendKeys[i] == kCensusNoKey)
+                    continue;
+                add(i, m_pendKeys[i], m_pendN, m_pendArea);
+                // The target and scissor tables are bindings, not pipeline state.
+                if (i != kTabScissor && i != kTabOffset && i != kTabRtFrame && i != kTabRtZ)
+                    full = censusMix(censusMix(full, i), m_pendKeys[i]);
+                const uint64_t cw = censusCoarseWord(i, m_pendKeys[i]);
+                if (cw != kCensusNoKey)
+                    coarse = censusMix(censusMix(coarse, i), cw);
+            }
+            add(kTabStatesFull, full, m_pendN, m_pendArea);
+            add(kTabStatesCoarse, coarse, m_pendN, m_pendArea);
+            if (m_seenFull.insert(full).second || m_seenCoarse.insert(coarse).second)
+            {
+                // Describe each state the first time it is seen, so the summary tool can decode it.
+                std::string s = "[" + std::to_string(full) + "," + std::to_string(coarse);
+                for (unsigned i = 0; i < kCensusStateTables; ++i)
+                    s += "," + (m_pendKeys[i] == kCensusNoKey ? std::string("-1") : std::to_string(m_pendKeys[i]));
+                m_newStates.push_back(s + "]");
+            }
+            m_hasPending = false;
+            m_pendN = 0;
+            m_pendArea = 0;
+        }
+
+        void tick(bool force, bool final, int64_t pending)
+        {
+            const auto now = std::chrono::steady_clock::now();
+            if (!force && std::chrono::duration<double>(now - m_last).count() < m_interval)
+                return;
+            commitPending();
+            std::string out;
+            out.reserve(1u << 16);
+            char buf[512];
+            const double t = std::chrono::duration<double>(now - m_t0).count();
+            const double dt = std::chrono::duration<double>(now - m_last).count();
+            const uint64_t drawn = s_censusDrawnInBatches.load(std::memory_order_relaxed);
+            std::snprintf(buf, sizeof(buf),
+                          "{\"v\":1,\"t\":%.3f,\"dt\":%.3f,\"unix\":%.3f,\"t0\":%.3f,\"final\":%s,"
+                          "\"cum\":{\"submitted\":%llu,\"drawn_batches\":%llu,\"direct\":%llu,\"dropped\":%llu,"
+                          "\"kicked_prims\":%llu,\"pending\":%lld},"
+                          "\"n\":{\"submit\":%llu,\"area\":%llu,\"queued\":%llu,\"direct\":%llu,\"dropped\":%llu,\"empty\":%llu,"
+                          "\"drawn_batches\":%llu,\"marks\":%llu,\"presents\":%llu,\"kicks\":%llu,\"census_ns\":%llu}",
+                          t, dt, unixNow(), m_unix0, final ? "true" : "false",
+                          static_cast<unsigned long long>(m_cum.submitted), static_cast<unsigned long long>(drawn),
+                          static_cast<unsigned long long>(m_cum.direct), static_cast<unsigned long long>(m_cum.dropped),
+                          static_cast<unsigned long long>(m_cum.kickedPrims), static_cast<long long>(pending),
+                          static_cast<unsigned long long>(m_iv.submit), static_cast<unsigned long long>(m_iv.area),
+                          static_cast<unsigned long long>(m_iv.queued), static_cast<unsigned long long>(m_iv.direct),
+                          static_cast<unsigned long long>(m_iv.dropped), static_cast<unsigned long long>(m_iv.empty),
+                          static_cast<unsigned long long>(drawn - m_drawnAtLast), static_cast<unsigned long long>(m_iv.marks),
+                          static_cast<unsigned long long>(m_iv.presents), static_cast<unsigned long long>(m_iv.kicks),
+                          static_cast<unsigned long long>(m_iv.nanos));
+            out += buf;
+            out += ",\"tab\":{";
+            bool firstTable = true;
+            for (unsigned i = 0; i < kCensusTables; ++i)
+            {
+                if (m_tables[i].empty())
+                    continue;
+                out += firstTable ? "\"" : ",\"";
+                firstTable = false;
+                out += kCensusTableNames[i];
+                out += "\":[";
+                bool firstRow = true;
+                for (const auto &row : m_tables[i])
+                {
+                    std::snprintf(buf, sizeof(buf), "%s[%llu,%llu,%llu]", firstRow ? "" : ",",
+                                  static_cast<unsigned long long>(row.first), static_cast<unsigned long long>(row.second.n),
+                                  static_cast<unsigned long long>(row.second.area));
+                    firstRow = false;
+                    out += buf;
+                }
+                out += "]";
+                m_tables[i].clear();
+            }
+            out += "},\"present\":[";
+            bool firstPresent = true;
+            for (const auto &row : m_present)
+            {
+                const PresentEntry &e = row.second;
+                std::snprintf(buf, sizeof(buf), "%s[%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu]", firstPresent ? "" : ",",
+                              static_cast<unsigned long long>(e.regs[0]), static_cast<unsigned long long>(e.regs[1]),
+                              static_cast<unsigned long long>(e.regs[2]), static_cast<unsigned long long>(e.regs[3]),
+                              static_cast<unsigned long long>(e.regs[4]), static_cast<unsigned long long>(e.regs[5]),
+                              static_cast<unsigned long long>(e.marks), static_cast<unsigned long long>(e.presents));
+                firstPresent = false;
+                out += buf;
+            }
+            m_present.clear();
+            out += "],\"new_states\":[";
+            for (size_t i = 0; i < m_newStates.size(); ++i)
+            {
+                if (i != 0)
+                    out += ",";
+                out += m_newStates[i];
+            }
+            m_newStates.clear();
+            out += "],\"ex\":[";
+            for (size_t i = 0; i < m_examples.size(); ++i)
+            {
+                if (i != 0)
+                    out += ",";
+                out += m_examples[i];
+            }
+            m_examples.clear();
+            out += "]}\n";
+            std::fwrite(out.data(), 1, out.size(), m_file);
+            std::fflush(m_file);
+            m_iv = Interval{};
+            m_drawnAtLast = drawn;
+            m_last = now;
+            if (final)
+                m_finalDone = true;
+        }
+
+        std::mutex m_lock;
+        std::FILE *m_file = nullptr;
+        const void *m_owner = nullptr;
+        std::chrono::steady_clock::time_point m_t0{}, m_last{};
+        double m_unix0 = 0.0;
+        double m_interval = kCensusDefaultInterval;
+        bool m_finalDone = false;
+        uint32_t m_tickCounter = 0;
+        uint32_t m_seq = 0;
+        uint64_t m_primsSinceMark = 0;
+        uint64_t m_uploadKey = 0;
+        uint64_t m_drawnAtLast = 0;
+        Interval m_iv{};
+        Cumulative m_cum{};
+        CensusTable m_tables[kCensusTables];
+        bool m_hasPending = false;
+        uint64_t m_pendKeys[kCensusStateTables] = {};
+        uint64_t m_pendN = 0, m_pendArea = 0;
+        std::unordered_set<uint64_t> m_seenFull, m_seenCoarse;
+        std::vector<std::string> m_newStates, m_examples;
+        std::unordered_map<uint64_t, uint8_t> m_exampleCounts;
+        uint32_t m_categoryExamples[kCensusTables] = {};
+        uint32_t m_exampleBucket = 0;
+        std::unordered_map<uint64_t, PresentEntry> m_present;
+        std::unordered_map<uint64_t, bool> m_fzCache;
+        CensusPage m_pages[kCensusPages];
+    };
+}
+
 GSCpuBackend::GSCpuBackend()
 {
     using namespace GSMem;
@@ -672,12 +1987,19 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
     std::lock_guard<std::mutex> lock(m_mutex);
     if (!m_vram || batch.vertexCount == 0u)
         return;
+    const bool census = gsCensusEnabled();
+    if (census)
+        GsCensus::instance().primitive(this, batch);
     if (QueuePrimitive(batch))
     {
+        if (census)
+            GsCensus::instance().path(this, true, m_pending.prims.size());
         if (m_pending.prims.size() >= kMaxQueuedPrimitives)
             KickQueueUnlocked();
         return;
     }
+    if (census)
+        GsCensus::instance().path(this, false, m_pending.prims.size());
     FlushQueueUnlocked();
     DrawPrimitive(batch);
 }
@@ -782,7 +2104,11 @@ bool GSCpuBackend::QueuePrimitive(const GSPrimitiveBatch &batch)
     const int minY = std::max(static_cast<int>(std::floor(minYf - ofy)) - 1, static_cast<int>(ctx.scissor.y0));
     const int maxY = std::min(static_cast<int>(std::ceil(maxYf - ofy)) + 1, static_cast<int>(ctx.scissor.y1));
     if (minY > maxY)
+    {
+        if (gsCensusEnabled())
+            GsCensus::instance().dropped(this);
         return true; // outside the scissor rows: draws nothing
+    }
 
     // VRAM this primitive writes (frame, depth) and reads (texture).
     thread_local std::vector<VramRange> writes, reads;
@@ -853,6 +2179,8 @@ void GSCpuBackend::KickQueueUnlocked()
 {
     if (m_pending.prims.empty())
         return;
+    if (gsCensusEnabled())
+        GsCensus::instance().kick(this, m_pending.prims.size());
 
     // Give the batch its own copy of every page it reads, so uploads after this point need not
     // wait for it. Pages that batches in flight still write (render to texture) are copied once
@@ -887,6 +2215,8 @@ void GSCpuBackend::MarkPresentation(const GSPresentationRequest &request)
     std::lock_guard<std::mutex> lock(m_mutex);
     if (!m_vram)
         return;
+    if (gsCensusEnabled())
+        GsCensus::instance().present(this, request, true, m_pending.prims.size());
     KickQueueUnlocked();
     auto marker = std::make_unique<Batch>();
     marker->present = true;
@@ -989,6 +2319,8 @@ GSCpuBackend::~GSCpuBackend()
         KickQueueUnlocked();
     }
     WaitForBatches(KickedBatches());
+    if (gsCensusEnabled())
+        GsCensus::instance().finalize(this);
     {
         std::lock_guard<std::mutex> lock(m_drawMutex);
         m_drawerStop = true;
@@ -1000,6 +2332,8 @@ GSCpuBackend::~GSCpuBackend()
 
 void GSCpuBackend::DrawBatch(const Batch &batch)
 {
+    if (gsCensusEnabled())
+        s_censusDrawnInBatches.fetch_add(batch.prims.size(), std::memory_order_relaxed);
     RasterPool &pool = RasterPool::instance();
     const size_t slots = pool.workerCount() + 1u;
     if (m_workerPageCaches.size() < slots)
@@ -1109,6 +2443,8 @@ void GSCpuBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
     std::lock_guard<std::mutex> lock(m_mutex);
     if (!m_vram || (!isFourBitIndexedPsm(tex0.psm) && !isEightBitIndexedPsm(tex0.psm)))
         return;
+    if (gsCensusEnabled())
+        GsCensus::instance().clutCall(this, tex0);
 
     switch (tex0.cld)
     {
@@ -1153,6 +2489,8 @@ void GSCpuBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
         if (overlap)
             FlushQueueUnlocked();
     }
+    if (gsCensusEnabled())
+        GsCensus::instance().clutLoad(this, tex0, texclut);
     LoadClutUnlocked(tex0, texclut);
     m_clutChanged = true;
 }
@@ -1237,6 +2575,8 @@ void GSCpuBackend::Sync(GSSyncReason reason)
 uint32_t GSCpuBackend::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const
 {
     std::lock_guard<std::mutex> lock(m_mutex);
+    if (gsCensusEnabled())
+        GsCensus::instance().direct(this, false, psm, base, bw, x, y);
     const_cast<GSCpuBackend *>(this)->FlushQueueUnlocked();
     return ReadVramUnlocked(psm, base, bw, x, y);
 }
@@ -1259,6 +2599,8 @@ uint32_t GSCpuBackend::ReadTextureVramUnlocked(uint32_t psm, uint32_t base, uint
 void GSCpuBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
+    if (gsCensusEnabled())
+        GsCensus::instance().direct(this, true, psm, base, bw, x, y);
     FlushQueueUnlocked();
     WriteVramUnlocked(psm, base, bw, x, y, value);
 }
@@ -2315,6 +3657,8 @@ void GSCpuBackend::DrawLine(const GSPrimitiveBatch &batch)
 void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
+    if (gsCensusEnabled())
+        GsCensus::instance().transfer(this, command);
     if (command.direction != 0u)
         FlushQueueUnlocked();
     else
@@ -2336,6 +3680,8 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
 void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
+    if (gsCensusEnabled())
+        GsCensus::instance().uploadChunk(this, sizeBytes);
     if (m_pending.prims.size() != m_queueSizeAtTransfer)
     {
         PrepareUpload(m_transfer); // primitives were queued since the transfer started
@@ -2634,6 +3980,8 @@ uint32_t GSCpuBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
 bool GSCpuBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
+    if (gsCensusEnabled())
+        GsCensus::instance().clear(this, context, rgba);
     FlushQueueUnlocked();
     if (!m_vram || context.frame.fbw == 0u)
         return false;
@@ -2779,11 +4127,15 @@ PresentationFrame GSCpuBackend::Present(const GSPresentationRequest &request)
         std::lock_guard<std::mutex> lock(m_presentMutex);
         if (m_hasPresentVram)
         {
+            if (gsCensusEnabled())
+                GsCensus::instance().present(this, m_presentRequest, false, 0);
             snapshotBackend.Initialize(m_presentVram.data(), static_cast<uint32_t>(m_presentVram.size()));
             return snapshotBackend.PresentFromLocalMemory(m_presentRequest);
         }
     }
 
+    if (gsCensusEnabled())
+        GsCensus::instance().present(this, request, false, 0);
     thread_local std::vector<uint8_t> snapshot;
     SnapshotVram(snapshot);
     if (snapshot.empty())
