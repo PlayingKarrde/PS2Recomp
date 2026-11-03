@@ -17,6 +17,24 @@ namespace GSMem
             m_pageBase = UINT32_MAX;
         }
 
+        // FPWR: the cache holds one copy of one page and is not refreshed when VRAM changes (only
+        // Invalidate() and a miss refresh it), so what a read returns can depend on its history. A GS
+        // recording (gs_recording.h) therefore saves and restores it with the rest of the backend state.
+        uint32_t CachedPageBase() const noexcept { return m_pageBase; } // UINT32_MAX when empty
+        const uint8_t *CachedPageBytes() const noexcept { return m_bytes.data(); }
+        void RestoreCachedPage(uint32_t pageBase, const uint8_t *bytes) noexcept
+        {
+            m_source = nullptr;
+            m_sourceContext = nullptr;
+            if (pageBase == UINT32_MAX || !bytes)
+            {
+                m_pageBase = UINT32_MAX;
+                return;
+            }
+            std::memcpy(m_bytes.data(), bytes, kPageSize);
+            m_pageBase = pageBase;
+        }
+
         // FPWR: an optional source that can supply an older copy of a page (nullptr = use VRAM).
         using PageSource = const uint8_t *(*)(const void *context, uint32_t pageBase);
         void SetSource(PageSource source, const void *context) noexcept

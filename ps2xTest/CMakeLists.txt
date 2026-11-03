@@ -38,6 +38,7 @@ add_library(ps2_test_lib STATIC
     src/ps2_recompiler_tests.cpp
     src/ps2_runtime_expansion_tests.cpp
     src/ps2_float_semantics_tests.cpp
+    src/gs_recording_tests.cpp
 )
 
 target_include_directories(ps2_test_lib PRIVATE
@@ -99,6 +100,30 @@ if(COMMAND ps2x_stage_ffmpeg_runtime_dlls)
 endif()
 
 include("${CMAKE_SOURCE_DIR}/ps2xRuntime/cmake/ReleaseMode.cmake")
+
+# ps2x_gs_replay plays back a GS recording (PS2X_GS_RECORD, see ps2xRuntime/include/runtime/gs/gs_recording.h)
+# through the CPU renderer, without the game. It links the runtime library but no generated game code,
+# and nothing in the game's build refers to it (the game is configured with PS2X_BUILD_TEST=OFF).
+option(PS2X_BUILD_GS_REPLAY "Build ps2x_gs_replay, the standalone GS recording player" ON)
+if(PS2X_BUILD_GS_REPLAY)
+    add_executable(ps2x_gs_replay
+        gs_replay/gs_replay_main.cpp
+        $<TARGET_OBJECTS:ps2_test_function_table>
+    )
+    target_include_directories(ps2x_gs_replay PRIVATE
+        ${CMAKE_SOURCE_DIR}/ps2xRuntime/include
+    )
+    target_link_libraries(ps2x_gs_replay PRIVATE ps2_runtime)
+    if(UNIX AND NOT APPLE)
+        target_link_libraries(ps2x_gs_replay PRIVATE ${CMAKE_DL_LIBS})
+    endif()
+    if(COMMAND ps2x_stage_ffmpeg_runtime_dlls)
+        ps2x_stage_ffmpeg_runtime_dlls(ps2x_gs_replay)
+    endif()
+    if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
+        EnableFastReleaseMode(ps2x_gs_replay)
+    endif()
+endif()
 
 if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
     EnableFastReleaseMode(ps2_test_lib)

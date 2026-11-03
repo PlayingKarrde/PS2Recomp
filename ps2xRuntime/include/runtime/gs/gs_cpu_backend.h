@@ -4,6 +4,7 @@
 #include "runtime/gs/gs_texture_page_cache.h"
 
 #include <array>
+#include <atomic>
 #include <condition_variable>
 #include <deque>
 #include <functional>
@@ -12,6 +13,12 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+
+namespace GSRec
+{
+    class Writer;
+    struct BackendState;
+}
 
 class GSCpuBackend final : public GSRasterBackend
 {
@@ -46,6 +53,17 @@ public:
     // queue behind everything submitted so far, the drawer copies VRAM when it reaches it, and
     // Present() shows that copy.
     void MarkPresentation(const GSPresentationRequest &request);
+
+    // FPWR: GS recording (gs_recording.h). With PS2X_GS_RECORD=<file> set, the calls above are written
+    // to a file from a presentation marker on, and ps2x_gs_replay plays them back. These let a replay
+    // set up the state a recording starts from, and compute the same check values the recorder took.
+    void ExportRecordingState(GSRec::BackendState &out) const; // everything outside GS memory that calls depend on
+    void ImportRecordingState(const GSRec::BackendState &state);
+    // Hash of the VRAM pages of the buffers a presentation request displays (the ones the drawer
+    // protects until it has copied them), taken from a copy of VRAM.
+    static uint64_t HashPresentedPages(const uint8_t *vram, const GSPresentationRequest &request);
+    // Row stride, in pixels, of the pictures Present() returns.
+    static constexpr uint32_t kPresentationStride = 640u;
 
 private:
     void ResetUnlocked();
@@ -155,6 +173,7 @@ private:
         std::vector<VramRange> writes;
         bool present = false; // a presentation marker (no primitives): copy VRAM when reached
         GSPresentationRequest request{};
+        uint64_t recMarker = ~0ull; // index of this marker in the GS recording, if it is part of one
     };
     struct BandContext
     {
@@ -167,6 +186,7 @@ private:
     };
     bool QueuePrimitive(const GSPrimitiveBatch &batch);
     void CollectUploadRange(const GSTransferCommand &command, std::vector<VramRange> &out) const;
+    static void CollectPresentedRanges(const GSPresentationRequest &request, std::vector<VramRange> &out);
     bool PrepareUpload(const GSTransferCommand &command);
     void KickQueueUnlocked();                        // hand the queue to the drawer
     uint64_t KickedBatches() const;                  // batches kicked so far
@@ -204,4 +224,25 @@ private:
     GSTransferSnapshot m_transferState{};
     std::vector<uint8_t> m_localToHostBuffer;
     size_t m_localToHostReadPos = 0;
+
+    // GS recording. m_recActive and the fields after it belong to whoever holds m_mutex; m_recLive
+    // (the same object) is for the drawer and presenter threads, which only report check values.
+    // The writer is kept until the backend is destroyed, closed once the clip is complete.
+    enum class RecState : uint8_t { Armed, Recording, Draining, Done };
+    void ExportRecordingStateUnlocked(GSRec::BackendState &out) const;
+    bool ClearFramebufferUnlocked(const GSContext &context, uint32_t rgba);
+    uint64_t RecordMarkerUnlocked(const GSPresentationRequest &request); // returns the marker's index, or ~0
+    bool StartRecordingUnlocked();
+    void FinishRecordingUnlocked();
+    GSRec::Writer *m_recActive = nullptr;
+    std::atomic<GSRec::Writer *> m_recLive{nullptr};
+    RecState m_recState = RecState::Armed;
+    uint64_t m_recSeen = 0;      // markers seen while waiting for the start
+    uint64_t m_recCount = 0;     // markers written
+    uint64_t m_recDrain = 0;     // markers seen since the last one was written
+    uint64_t m_recLastBatch = 0; // batch count once the last written marker has been kicked
+    int64_t m_recStartNs = 0;
+    uint64_t m_recHookNs = 0;    // time spent in recorder hooks (PS2X_GS_RECORD_TIMING=1)
+    uint64_t m_recHooks = 0;
+    uint64_t m_presentMarker = ~0ull; // recording index of the marker m_presentVram came from
 };

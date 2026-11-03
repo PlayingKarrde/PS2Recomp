@@ -5,6 +5,7 @@
 #include "runtime/gs/ps2_gs_psmt4.h"
 #include "runtime/gs/ps2_gs_psmt8.h"
 #include "runtime/gs/ps2_gs_memory.h"
+#include "runtime/gs/gs_recording.h"
 #include "ps2_log.h"
 #include <atomic>
 #include <algorithm>
@@ -429,6 +430,7 @@ namespace
     static constexpr uint32_t kDefaultDisplayHeight = 448u;
     static constexpr uint32_t kHostFrameWidth = 640u;
     static constexpr uint32_t kHostFrameHeight = 512u;
+    static_assert(kHostFrameWidth == GSCpuBackend::kPresentationStride, "recordings hash pictures with this stride");
 
     uint16_t encodeFramePixelPSMCT16(uint8_t r, uint8_t g, uint8_t b, uint8_t a)
     {
@@ -1874,6 +1876,107 @@ namespace
     };
 }
 
+// ---------------------------------------------------------------------------------------------
+// FPWR: GS recording. Opt-in: does nothing unless PS2X_GS_RECORD=<file> is set. From a chosen
+// presentation marker on, every call the game makes into this backend is written to the file
+// (see gs_recording.h for the format, docs/formats/gs-recording.md), so the clip can be replayed
+// without the game by ps2x_gs_replay. All hooks run under m_mutex, in the order the calls are made.
+//   PS2X_GS_RECORD=<file>        output file (absolute path; the game runs from another folder)
+//   PS2X_GS_RECORD_START=<n>     start at the n-th marker (0 = the first; default 0). "file" means
+//                                only the trigger file starts it. The file <file>.start starts it
+//                                too, whenever it appears; the game deletes it when it starts.
+//   PS2X_GS_RECORD_FRAMES=<n>    stop after n markers (default 600, about 10 s)
+//   PS2X_GS_RECORD_TIMING=1      measure the time spent in the hooks (adds some cost itself)
+namespace
+{
+    struct RecordConfig
+    {
+        bool enabled = false;
+        std::string path;
+        int64_t startMarker = 0; // -1: only the trigger file starts the recording
+        uint32_t frames = 600;
+        bool timing = false;
+    };
+
+    const RecordConfig &recordConfig()
+    {
+        static const RecordConfig config = []
+        {
+            RecordConfig c;
+            const char *path = std::getenv("PS2X_GS_RECORD");
+            if (!path || path[0] == '\0')
+                return c;
+            c.enabled = true;
+            c.path = path;
+            if (const char *start = std::getenv("PS2X_GS_RECORD_START"))
+            {
+                if (start[0] >= '0' && start[0] <= '9')
+                    c.startMarker = std::strtoll(start, nullptr, 10);
+                else if (start[0] != '\0')
+                    c.startMarker = -1;
+            }
+            if (const char *frames = std::getenv("PS2X_GS_RECORD_FRAMES"))
+                if (frames[0] >= '0' && frames[0] <= '9')
+                    c.frames = static_cast<uint32_t>(std::max<long long>(1, std::strtoll(frames, nullptr, 10)));
+            const char *timing = std::getenv("PS2X_GS_RECORD_TIMING");
+            c.timing = timing && timing[0] == '1';
+            return c;
+        }();
+        return config;
+    }
+
+    inline bool gsRecordEnabled()
+    {
+        return recordConfig().enabled;
+    }
+
+    std::atomic<bool> s_recClaimed{false}; // one backend (the game's) takes the recording
+
+    int64_t recNowNs()
+    {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+
+    // Accumulates the time of one hook call when PS2X_GS_RECORD_TIMING=1.
+    struct RecTimer
+    {
+        RecTimer(bool on, uint64_t &totalNs, uint64_t &calls) : m_total(totalNs), m_calls(calls), m_start(on ? recNowNs() : 0) {}
+        ~RecTimer()
+        {
+            if (m_start != 0)
+            {
+                m_total += static_cast<uint64_t>(recNowNs() - m_start);
+                ++m_calls;
+            }
+        }
+        uint64_t &m_total;
+        uint64_t &m_calls;
+        int64_t m_start;
+    };
+
+    // True (and the file removed) when the trigger file exists.
+    bool recTriggerFile(const std::string &path)
+    {
+        if (FILE *f = std::fopen(path.c_str(), "rb"))
+        {
+            std::fclose(f);
+            std::remove(path.c_str());
+            return true;
+        }
+        return false;
+    }
+}
+
+#define GSREC(call)                                                            \
+    do                                                                         \
+    {                                                                          \
+        if (m_recActive)                                                       \
+        {                                                                      \
+            RecTimer recTimer(recordConfig().timing, m_recHookNs, m_recHooks); \
+            m_recActive->call;                                                 \
+        }                                                                      \
+    } while (0)
+
 GSCpuBackend::GSCpuBackend()
 {
     using namespace GSMem;
@@ -1951,6 +2054,7 @@ void GSCpuBackend::Initialize(uint8_t *vram, uint32_t vramSize)
         throw std::invalid_argument("GS CPU backend requires at least 4 MiB of VRAM");
 
     std::lock_guard<std::mutex> lock(m_mutex);
+    GSREC(reset());
     FlushQueueUnlocked();
     m_vram = vram;
     m_vramSize = vramSize;
@@ -1960,6 +2064,7 @@ void GSCpuBackend::Initialize(uint8_t *vram, uint32_t vramSize)
 void GSCpuBackend::Reset()
 {
     std::lock_guard<std::mutex> lock(m_mutex);
+    GSREC(reset());
     FlushQueueUnlocked();
     ResetUnlocked();
 }
@@ -1987,6 +2092,7 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
     std::lock_guard<std::mutex> lock(m_mutex);
     if (!m_vram || batch.vertexCount == 0u)
         return;
+    GSREC(submit(batch));
     const bool census = gsCensusEnabled();
     if (census)
         GsCensus::instance().primitive(this, batch);
@@ -2210,6 +2316,31 @@ void GSCpuBackend::KickQueueUnlocked()
     m_drawWake.notify_one();
 }
 
+// The VRAM pages of the buffers a presentation shows.
+void GSCpuBackend::CollectPresentedRanges(const GSPresentationRequest &request, std::vector<VramRange> &out)
+{
+    const auto addDisplay = [&](uint64_t dispfb, uint64_t display)
+    {
+        const uint32_t fbp = static_cast<uint32_t>(dispfb & 0x1FFu);
+        const uint32_t fbw = static_cast<uint32_t>((dispfb >> 9) & 0x3Fu);
+        const uint32_t psm = static_cast<uint32_t>((dispfb >> 15) & 0x1Fu);
+        const uint32_t height = static_cast<uint32_t>((display >> 44) & 0x7FFu) + 1u;
+        addBufferRange(out, fbp * 8192u, std::max(fbw, 1u) * 64u, height, psm, 0u);
+    };
+    addDisplay(request.dispfb1, request.display1);
+    addDisplay(request.dispfb2, request.display2);
+}
+
+uint64_t GSCpuBackend::HashPresentedPages(const uint8_t *vram, const GSPresentationRequest &request)
+{
+    std::vector<VramRange> ranges;
+    CollectPresentedRanges(request, ranges);
+    uint64_t hash = 0;
+    for (const VramRange &range : ranges)
+        hash = GSRec::Hash64(vram + range.begin, range.end - range.begin, hash);
+    return hash;
+}
+
 void GSCpuBackend::MarkPresentation(const GSPresentationRequest &request)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
@@ -2217,29 +2348,147 @@ void GSCpuBackend::MarkPresentation(const GSPresentationRequest &request)
         return;
     if (gsCensusEnabled())
         GsCensus::instance().present(this, request, true, m_pending.prims.size());
+    const uint64_t recMarker = gsRecordEnabled() ? RecordMarkerUnlocked(request) : GSRec::kNoMarker;
     KickQueueUnlocked();
     auto marker = std::make_unique<Batch>();
     marker->present = true;
     marker->request = request;
+    marker->recMarker = recMarker;
     // The displayed buffers count as read until the copy is taken, so an upload into them waits.
-    const auto addDisplay = [&](uint64_t dispfb, uint64_t display)
-    {
-        const uint32_t fbp = static_cast<uint32_t>(dispfb & 0x1FFu);
-        const uint32_t fbw = static_cast<uint32_t>((dispfb >> 9) & 0x3Fu);
-        const uint32_t psm = static_cast<uint32_t>((dispfb >> 15) & 0x1Fu);
-        const uint32_t height = static_cast<uint32_t>((display >> 44) & 0x7FFu) + 1u;
-        addBufferRange(marker->reads, fbp * 8192u, std::max(fbw, 1u) * 64u, height, psm, 0u);
-    };
-    addDisplay(request.dispfb1, request.display1);
-    addDisplay(request.dispfb2, request.display2);
+    CollectPresentedRanges(request, marker->reads);
     {
         std::lock_guard<std::mutex> drawLock(m_drawMutex);
         if (!m_drawer.joinable())
             m_drawer = std::thread([this] { DrawerMain(); });
         m_inFlight.push_back(std::move(marker));
         ++m_batchesKicked;
+        if (recMarker != GSRec::kNoMarker)
+            m_recLastBatch = m_batchesKicked;
     }
     m_drawWake.notify_one();
+}
+
+// Called for every marker while PS2X_GS_RECORD is set, with m_mutex held. Starts, writes and
+// ends the recording. Returns the marker's index in the recording, or kNoMarker if it is not in it.
+uint64_t GSCpuBackend::RecordMarkerUnlocked(const GSPresentationRequest &request)
+{
+    const RecordConfig &config = recordConfig();
+    if (m_recState == RecState::Done)
+        return GSRec::kNoMarker;
+    if (m_recState == RecState::Armed)
+    {
+        const uint64_t seen = m_recSeen++;
+        bool start = config.startMarker >= 0 && seen >= static_cast<uint64_t>(config.startMarker);
+        if (!start && (seen & 3u) == 0u && recTriggerFile(config.path + ".start"))
+            start = true;
+        if (!start)
+            return GSRec::kNoMarker;
+        if (s_recClaimed.exchange(true) || !StartRecordingUnlocked())
+        {
+            m_recState = RecState::Done;
+            return GSRec::kNoMarker;
+        }
+        m_recState = RecState::Recording;
+    }
+    if (m_recState == RecState::Recording)
+    {
+        const uint64_t index = m_recCount++;
+        {
+            RecTimer timer(config.timing, m_recHookNs, m_recHooks);
+            m_recActive->marker(static_cast<uint32_t>(index), request, static_cast<uint64_t>(recNowNs() - m_recStartNs));
+        }
+        if (m_recCount >= config.frames)
+        {
+            m_recState = RecState::Draining;
+            m_recDrain = 0;
+        }
+        return index;
+    }
+    // Draining: the last marker is on its way. Finish once the drawer has reached it and the
+    // presenter has had a few frames to report what it showed.
+    ++m_recDrain;
+    m_recActive->drainLive();
+    uint64_t drawn;
+    {
+        std::lock_guard<std::mutex> drawLock(m_drawMutex);
+        drawn = m_batchesDrawn;
+    }
+    if (m_recDrain >= 6 && drawn >= m_recLastBatch)
+        FinishRecordingUnlocked();
+    return GSRec::kNoMarker;
+}
+
+bool GSCpuBackend::StartRecordingUnlocked()
+{
+    const RecordConfig &config = recordConfig();
+    FlushQueueUnlocked(); // everything drawn: VRAM is the state the clip starts from
+    auto writer = std::make_unique<GSRec::Writer>();
+    if (!writer->open(config.path))
+    {
+        std::fprintf(stderr, "[gs:rec] cannot open %s for writing\n", config.path.c_str());
+        return false;
+    }
+    GSRec::BackendState state;
+    ExportRecordingStateUnlocked(state);
+    writer->writeStart(m_vram, m_vramSize, state);
+    m_recStartNs = recNowNs();
+    m_recActive = writer.get();
+    m_recLive.store(writer.release(), std::memory_order_release);
+    std::fprintf(stderr, "[gs:rec] recording %u markers to %s\n", config.frames, config.path.c_str());
+    return true;
+}
+
+void GSCpuBackend::FinishRecordingUnlocked()
+{
+    GSRec::Writer *writer = m_recActive;
+    if (!writer)
+        return;
+    m_recActive = nullptr;
+    m_recState = RecState::Done;
+    writer->finish(static_cast<uint32_t>(m_recCount));
+    std::fprintf(stderr, "[gs:rec] finished %s", recordConfig().path.c_str());
+    if (recordConfig().timing)
+        std::fprintf(stderr, "; hooks: %llu calls, %.1f ms in all (%.0f ns each, timer cost included)",
+                     static_cast<unsigned long long>(m_recHooks), static_cast<double>(m_recHookNs) / 1.0e6,
+                     m_recHooks ? static_cast<double>(m_recHookNs) / static_cast<double>(m_recHooks) : 0.0);
+    std::fprintf(stderr, "\n%s", writer->summary().c_str());
+}
+
+void GSCpuBackend::ExportRecordingStateUnlocked(GSRec::BackendState &out) const
+{
+    out.clut = m_clut;
+    out.clutCbp = m_clutCbp;
+    out.pageCacheBase = m_texturePageCache.CachedPageBase();
+    out.pageCacheBytes.clear();
+    if (out.pageCacheBase != UINT32_MAX)
+        out.pageCacheBytes.assign(m_texturePageCache.CachedPageBytes(),
+                                  m_texturePageCache.CachedPageBytes() + GSMem::TexturePageCache::kPageSize);
+    out.transfer = m_transfer;
+    out.transferState = m_transferState;
+    out.localToHost = m_localToHostBuffer;
+    out.localToHostReadPos = m_localToHostReadPos;
+}
+
+void GSCpuBackend::ExportRecordingState(GSRec::BackendState &out) const
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    const_cast<GSCpuBackend *>(this)->FlushQueueUnlocked();
+    ExportRecordingStateUnlocked(out);
+}
+
+void GSCpuBackend::ImportRecordingState(const GSRec::BackendState &state)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    FlushQueueUnlocked();
+    m_clut = state.clut;
+    m_clutCbp = state.clutCbp;
+    m_texturePageCache.RestoreCachedPage(state.pageCacheBase,
+                                         state.pageCacheBytes.size() >= GSMem::TexturePageCache::kPageSize ? state.pageCacheBytes.data() : nullptr);
+    m_transfer = state.transfer;
+    m_transferState = state.transferState;
+    m_localToHostBuffer = state.localToHost;
+    m_localToHostReadPos = static_cast<size_t>(state.localToHostReadPos);
+    m_clutChanged = true;
 }
 
 uint64_t GSCpuBackend::KickedBatches() const
@@ -2294,9 +2543,13 @@ void GSCpuBackend::DrawerMain()
         if (batch->present)
         {
             m_presentScratch.assign(m_vram, m_vram + m_vramSize);
+            if (batch->recMarker != GSRec::kNoMarker)
+                if (GSRec::Writer *recorder = m_recLive.load(std::memory_order_acquire))
+                    recorder->liveDisplay(batch->recMarker, HashPresentedPages(m_presentScratch.data(), batch->request));
             std::lock_guard<std::mutex> lock(m_presentMutex);
             m_presentVram.swap(m_presentScratch);
             m_presentRequest = batch->request;
+            m_presentMarker = batch->recMarker;
             m_hasPresentVram = true;
         }
         else
@@ -2328,6 +2581,9 @@ GSCpuBackend::~GSCpuBackend()
     m_drawWake.notify_all();
     if (m_drawer.joinable())
         m_drawer.join();
+    if (m_recActive)
+        FinishRecordingUnlocked(); // a recording cut short (the game normally ends with _Exit)
+    delete m_recLive.exchange(nullptr);
 }
 
 void GSCpuBackend::DrawBatch(const Batch &batch)
@@ -2443,6 +2699,7 @@ void GSCpuBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
     std::lock_guard<std::mutex> lock(m_mutex);
     if (!m_vram || (!isFourBitIndexedPsm(tex0.psm) && !isEightBitIndexedPsm(tex0.psm)))
         return;
+    GSREC(loadClut(tex0, texclut));
     if (gsCensusEnabled())
         GsCensus::instance().clutCall(this, tex0);
 
@@ -2546,6 +2803,7 @@ void GSCpuBackend::LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &t
 void GSCpuBackend::Flush()
 {
     std::lock_guard<std::mutex> lock(m_mutex);
+    GSREC(flush());
     KickQueueUnlocked();
 }
 
@@ -2554,6 +2812,7 @@ void GSCpuBackend::TextureFlush()
     // Queued primitives need no flush here: their texture reads are already ordered against
     // writes by the overlap checks, and raster threads start each flush with empty page caches.
     std::lock_guard<std::mutex> lock(m_mutex);
+    GSREC(textureFlush());
     m_texturePageCache.Invalidate();
 }
 
@@ -2564,6 +2823,7 @@ void GSCpuBackend::Sync(GSSyncReason reason)
     uint64_t kicked;
     {
         std::lock_guard<std::mutex> lock(m_mutex);
+        GSREC(sync(reason));
         KickQueueUnlocked();
         if (reason == GSSyncReason::Finish)
             return;
@@ -2578,7 +2838,10 @@ uint32_t GSCpuBackend::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32
     if (gsCensusEnabled())
         GsCensus::instance().direct(this, false, psm, base, bw, x, y);
     const_cast<GSCpuBackend *>(this)->FlushQueueUnlocked();
-    return ReadVramUnlocked(psm, base, bw, x, y);
+    const uint32_t value = ReadVramUnlocked(psm, base, bw, x, y);
+    if (m_recActive)
+        m_recActive->readVram(psm, base, bw, x, y, value);
+    return value;
 }
 
 uint32_t GSCpuBackend::ReadVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const
@@ -2601,6 +2864,7 @@ void GSCpuBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t 
     std::lock_guard<std::mutex> lock(m_mutex);
     if (gsCensusEnabled())
         GsCensus::instance().direct(this, true, psm, base, bw, x, y);
+    GSREC(writeVram(psm, base, bw, x, y, value));
     FlushQueueUnlocked();
     WriteVramUnlocked(psm, base, bw, x, y, value);
 }
@@ -3657,6 +3921,7 @@ void GSCpuBackend::DrawLine(const GSPrimitiveBatch &batch)
 void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
+    GSREC(beginTransfer(command));
     if (gsCensusEnabled())
         GsCensus::instance().transfer(this, command);
     if (command.direction != 0u)
@@ -3680,6 +3945,8 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
 void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
+    if (data && sizeBytes != 0u)
+        GSREC(uploadImage(data, sizeBytes));
     if (gsCensusEnabled())
         GsCensus::instance().uploadChunk(this, sizeBytes);
     if (m_pending.prims.size() != m_queueSizeAtTransfer)
@@ -3974,6 +4241,7 @@ uint32_t GSCpuBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
     std::memcpy(dst, m_localToHostBuffer.data() + m_localToHostReadPos, count);
     m_localToHostReadPos += count;
     m_transferState.localToHostPendingBytes = m_localToHostBuffer.size() - m_localToHostReadPos;
+    GSREC(consumeLocalToHost(maxBytes, dst, static_cast<uint32_t>(count)));
     return static_cast<uint32_t>(count);
 }
 
@@ -3983,6 +4251,13 @@ bool GSCpuBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
     if (gsCensusEnabled())
         GsCensus::instance().clear(this, context, rgba);
     FlushQueueUnlocked();
+    const bool result = ClearFramebufferUnlocked(context, rgba);
+    GSREC(clearFramebuffer(context, rgba, result));
+    return result;
+}
+
+bool GSCpuBackend::ClearFramebufferUnlocked(const GSContext &context, uint32_t rgba)
+{
     if (!m_vram || context.frame.fbw == 0u)
         return false;
 
@@ -4130,7 +4405,20 @@ PresentationFrame GSCpuBackend::Present(const GSPresentationRequest &request)
             if (gsCensusEnabled())
                 GsCensus::instance().present(this, m_presentRequest, false, 0);
             snapshotBackend.Initialize(m_presentVram.data(), static_cast<uint32_t>(m_presentVram.size()));
-            return snapshotBackend.PresentFromLocalMemory(m_presentRequest);
+            PresentationFrame frame = snapshotBackend.PresentFromLocalMemory(m_presentRequest);
+            // Recording: remember what this marker's picture looked like, for the replay to match.
+            if (GSRec::Writer *recorder = m_recLive.load(std::memory_order_acquire))
+            {
+                if (recorder->wantsFrame(m_presentMarker))
+                {
+                    if (frame)
+                        recorder->liveFrame(m_presentMarker, frame.width, frame.height,
+                                            GSRec::HashFrame(frame.pixels.data(), frame.width, frame.height, kPresentationStride * 4u));
+                    else
+                        recorder->liveFrame(m_presentMarker, 0u, 0u, 0u);
+                }
+            }
+            return frame;
         }
     }
 
