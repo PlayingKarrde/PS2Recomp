@@ -1,0 +1,534 @@
+#include "MiniTest.h"
+#include "runtime/gs/gs_cpu_backend.h"
+#include "runtime/gs/gs_gpu_backend.h"
+#include "runtime/gs/gs_gpu_math.h"
+#include "runtime/gs/gs_texel.h"
+#include "runtime/gs/ps2_gs_memory.h"
+#include "runtime/gs/ps2_gs_transfer.h"
+
+#include <SDL3/SDL.h>
+#include <SDL3/SDL_gpu.h>
+
+#include <cmath>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
+
+// Tests for the GS GPU renderer (gs_gpu_math.h: the pure arithmetic; gs_gpu_backend: a small scene
+// drawn by the CPU and GPU renderers, skipped when no GPU device can be created) and for the code
+// shared by the two renderers (gs_texel.h, ps2_gs_transfer.h).
+
+namespace
+{
+    using namespace GSGpu;
+
+    GSPrimitiveBatch triangleBatch(float x0, float y0, float x1, float y1, float x2, float y2)
+    {
+        GSPrimitiveBatch b;
+        b.vertexCount = 3;
+        b.state.prim.type = GS_PRIM_TRIANGLE;
+        b.state.prim.iip = true;
+        b.state.context.xyoffset = {static_cast<uint16_t>(1728u * 16u), static_cast<uint16_t>(1936u * 16u)};
+        const float xs[3] = {x0, x1, x2}, ys[3] = {y0, y1, y2};
+        for (int i = 0; i < 3; ++i)
+        {
+            b.vertices[static_cast<size_t>(i)].x = 1728.0f + xs[i];
+            b.vertices[static_cast<size_t>(i)].y = 1936.0f + ys[i];
+            b.vertices[static_cast<size_t>(i)].z = 1000.0 * (i + 1);
+            b.vertices[static_cast<size_t>(i)].r = static_cast<uint8_t>(10 * (i + 1));
+            b.vertices[static_cast<size_t>(i)].g = static_cast<uint8_t>(20 * (i + 1));
+            b.vertices[static_cast<size_t>(i)].b = static_cast<uint8_t>(30 * (i + 1));
+            b.vertices[static_cast<size_t>(i)].a = static_cast<uint8_t>(0x80);
+        }
+        return b;
+    }
+
+    GSPrimitiveBatch spriteBatch(float x0, float y0, float x1, float y1)
+    {
+        GSPrimitiveBatch b;
+        b.vertexCount = 2;
+        b.state.prim.type = GS_PRIM_SPRITE;
+        b.state.context.xyoffset = {static_cast<uint16_t>(1728u * 16u), static_cast<uint16_t>(1936u * 16u)};
+        b.vertices[0].x = 1728.0f + x0;
+        b.vertices[0].y = 1936.0f + y0;
+        b.vertices[1].x = 1728.0f + x1;
+        b.vertices[1].y = 1936.0f + y1;
+        b.vertices[1].z = 4096.0;
+        b.vertices[1].r = 1;
+        b.vertices[1].g = 2;
+        b.vertices[1].b = 3;
+        b.vertices[1].a = 4;
+        return b;
+    }
+
+    uint64_t alphaReg(unsigned a, unsigned b, unsigned c, unsigned d, unsigned fix = 0)
+    {
+        return a | (b << 2) | (c << 4) | (d << 6) | (static_cast<uint64_t>(fix) << 32);
+    }
+
+    // ---- a small scene drawn by both renderers
+    struct SceneResult
+    {
+        std::vector<uint8_t> pixels; // 640x224 RGBA
+        bool ok = false;
+    };
+
+    GSPresentationRequest makeRequest(uint32_t fbp)
+    {
+        GSPresentationRequest r{};
+        r.pmode = 0x8007;
+        r.smode2 = 0x3;
+        const uint64_t dispfb = static_cast<uint64_t>(fbp) | (10ull << 9);
+        const uint64_t display = (636ull) | (32ull << 12) | (639ull << 32) | (223ull << 44);
+        r.dispfb1 = r.dispfb2 = dispfb;
+        r.display1 = r.display2 = display;
+        return r;
+    }
+
+    // Uploads a 16x16 CT32 texture at block 8000 (a gradient with an alpha ramp), then draws, in order:
+    // a gouraud triangle with alpha blending over a flat background sprite, a textured sprite with nearest
+    // filtering, a textured sprite with bilinear filtering and an alpha test, and a sprite behind them
+    // that the depth test must reject.
+    void drawScene(GSRasterBackend &b)
+    {
+        GSContext ctx{};
+        ctx.frame = {0, 10, GS_PSM_CT32, 0};
+        ctx.zbuf = {140, GS_PSM_Z24, false};
+        ctx.scissor = {0, 639, 0, 223};
+        ctx.xyoffset = {static_cast<uint16_t>(1728u * 16u), static_cast<uint16_t>(1936u * 16u)};
+        ctx.test = (1ull << 16) | (2ull << 17); // ZTE on, GEQUAL
+
+        // texture data
+        std::vector<uint32_t> tex(16 * 16);
+        for (uint32_t y = 0; y < 16; ++y)
+            for (uint32_t x = 0; x < 16; ++x)
+                tex[y * 16 + x] = (x * 16u) | ((y * 16u) << 8) | ((200u - x * 8u) << 16) | ((0x40u + y * 4u) << 24);
+        GSTransferCommand cmd{};
+        cmd.bitbltbuf.dbp = 8000;
+        cmd.bitbltbuf.dbw = 1;
+        cmd.bitbltbuf.dpsm = GS_PSM_CT32;
+        cmd.trxreg = {16, 16};
+        cmd.direction = 0;
+        b.BeginTransfer(cmd);
+        b.UploadImage(reinterpret_cast<const uint8_t *>(tex.data()), static_cast<uint32_t>(tex.size() * 4));
+        b.TextureFlush();
+
+        auto sprite = [&](GSDrawState state, float x0, float y0, float x1, float y1, double z, uint8_t r, uint8_t g, uint8_t bl, uint8_t a,
+                          uint16_t u0, uint16_t v0, uint16_t u1, uint16_t v1)
+        {
+            GSPrimitiveBatch p;
+            p.vertexCount = 2;
+            p.state = state;
+            p.state.prim.type = GS_PRIM_SPRITE;
+            p.vertices[0].x = 1728.0f + x0;
+            p.vertices[0].y = 1936.0f + y0;
+            p.vertices[0].u = u0;
+            p.vertices[0].v = v0;
+            p.vertices[1].x = 1728.0f + x1;
+            p.vertices[1].y = 1936.0f + y1;
+            p.vertices[1].u = u1;
+            p.vertices[1].v = v1;
+            p.vertices[1].z = z;
+            p.vertices[1].r = r;
+            p.vertices[1].g = g;
+            p.vertices[1].b = bl;
+            p.vertices[1].a = a;
+            b.Submit(p);
+        };
+
+        GSDrawState flat{};
+        flat.context = ctx;
+        flat.context.test = 0;                    // ZTE off: always passes, writes Z
+        sprite(flat, 0, 0, 640, 224, 100.0, 40, 60, 90, 0x80, 0, 0, 0, 0);
+
+        GSDrawState gouraud{};
+        gouraud.context = ctx;
+        gouraud.context.alpha = alphaReg(0, 1, 0, 1); // (Cs-Cd)*As+Cd
+        gouraud.prim.abe = true;
+        gouraud.prim.iip = true;
+        {
+            GSPrimitiveBatch p;
+            p.vertexCount = 3;
+            p.state = gouraud;
+            p.state.prim.type = GS_PRIM_TRIANGLE;
+            const float xs[3] = {20.0f, 220.5f, 60.25f}, ys[3] = {10.0f, 30.75f, 150.0f};
+            const uint8_t rs[3] = {255, 0, 0}, gs[3] = {0, 255, 0}, bs[3] = {0, 0, 255}, as[3] = {0x60, 0x80, 0x40};
+            for (int i = 0; i < 3; ++i)
+            {
+                p.vertices[static_cast<size_t>(i)].x = 1728.0f + xs[i];
+                p.vertices[static_cast<size_t>(i)].y = 1936.0f + ys[i];
+                p.vertices[static_cast<size_t>(i)].z = 2000.0 + 500.0 * i;
+                p.vertices[static_cast<size_t>(i)].r = rs[i];
+                p.vertices[static_cast<size_t>(i)].g = gs[i];
+                p.vertices[static_cast<size_t>(i)].b = bs[i];
+                p.vertices[static_cast<size_t>(i)].a = as[i];
+            }
+            b.Submit(p);
+        }
+
+        GSDrawState textured{};
+        textured.context = ctx;
+        textured.context.tex0 = {8000, 1, GS_PSM_CT32, 4, 4, 1, 0, 0, 0, 0, 0, 0}; // 16x16 CT32, TCC, MODULATE
+        textured.context.clamp = 0;                                                // REPEAT
+        textured.prim.tme = true;
+        textured.prim.fst = true;
+        textured.textureWidth = 16;
+        textured.textureHeight = 16;
+        textured.linearFilter = false;
+        sprite(textured, 300, 20, 364, 84, 5000.0, 0x80, 0x80, 0x80, 0x80, 0, 0, 16 * 16, 16 * 16);
+
+        GSDrawState filtered = textured;
+        filtered.linearFilter = true;
+        filtered.context.alpha = alphaReg(0, 1, 0, 1);
+        filtered.prim.abe = true;
+        filtered.context.test |= 1ull | (5ull << 1) | (0x60ull << 4); // alpha test GEQUAL 0x60, KEEP
+        sprite(filtered, 400, 20, 500, 120, 6000.0, 0x80, 0x80, 0x80, 0x80, 0, 0, 16 * 16, 16 * 16);
+
+        GSDrawState hidden = flat;
+        hidden.context.test = (1ull << 16) | (2ull << 17);
+        sprite(hidden, 320, 40, 340, 60, 10.0, 255, 255, 255, 0x80, 0, 0, 0, 0); // behind the textured sprite: rejected
+        b.Flush();
+    }
+
+    SceneResult runScene(GSRasterBackend &b, std::vector<uint8_t> &vram, GSCpuBackend *cpu, GSGpuBackend *gpu)
+    {
+        b.Initialize(vram.data(), static_cast<uint32_t>(vram.size()));
+        drawScene(b);
+        const GSPresentationRequest request = makeRequest(0);
+        if (cpu)
+            cpu->MarkPresentation(request);
+        else
+            gpu->MarkPresentation(request);
+        b.Sync(GSSyncReason::Presentation);
+        PresentationFrame frame = b.Present(request);
+        SceneResult r;
+        if (frame && frame.width == 640 && frame.height == 224)
+        {
+            r.pixels = std::move(frame.pixels);
+            r.ok = true;
+        }
+        return r;
+    }
+}
+
+void register_gs_gpu_tests()
+{
+    MiniTest::Case("GSGpu", [](TestCase &tc)
+    {
+        tc.Run("a triangle is moved half a pixel and flat shading takes the last vertex", [](TestCase &t)
+        {
+            GSPrimitiveBatch b = triangleBatch(10.0f, 20.0f, 50.0f, 20.0f, 10.0f, 60.0f);
+            b.state.prim.iip = false;
+            Setup s;
+            t.IsTrue(BuildTriangle(b, 1, s), "a triangle with area converts");
+            t.Equals(s.count, 3u, "three vertices");
+            t.Equals(s.v[0].x, 10.5f, "x of vertex 0: GS integer position plus half a pixel");
+            t.Equals(s.v[0].y, 20.5f, "y of vertex 0");
+            t.Equals(s.v[1].x, 50.5f, "x of vertex 1");
+            t.Equals(s.v[2].y, 60.5f, "y of vertex 2");
+            t.Equals(s.minX, 10, "bounding box min x");
+            t.Equals(s.maxX, 50, "bounding box max x");
+            t.Equals(s.minY, 20, "bounding box min y");
+            t.Equals(s.maxY, 60, "bounding box max y");
+            t.Equals(s.v[0].rgba, PackRgba(30, 60, 90, 0x80), "flat shading: every vertex has the last vertex colour");
+            t.Equals(s.v[1].rgba, s.v[0].rgba, "flat shading, vertex 1");
+            t.Equals(s.v[0].z, 1000.0f * kDepthScale, "Z is the 24-bit value over 2^24");
+            // scale 2 doubles the target pixels but keeps the half pixel in GS units
+            Setup s2;
+            t.IsTrue(BuildTriangle(b, 2, s2), "scale 2");
+            t.Equals(s2.v[1].x, 101.0f, "scale 2 x of vertex 1");
+        });
+
+        tc.Run("a fractional 12.4 position is kept and a degenerate triangle is dropped", [](TestCase &t)
+        {
+            GSPrimitiveBatch b = triangleBatch(10.0625f, 20.9375f, 50.5f, 20.0f, 10.0f, 60.0f);
+            Setup s;
+            t.IsTrue(BuildTriangle(b, 1, s), "converts");
+            t.Equals(s.v[0].x, 10.0625f + 0.5f, "1/16 pixel steps survive");
+            t.Equals(s.v[0].y, 20.9375f + 0.5f, "1/16 pixel steps survive in y");
+            GSPrimitiveBatch flat = triangleBatch(10.0f, 10.0f, 20.0f, 20.0f, 30.0f, 30.0f);
+            t.IsFalse(BuildTriangle(flat, 1, s), "three points on a line have no area");
+        });
+
+        tc.Run("UV and STQ texture coordinates", [](TestCase &t)
+        {
+            GSPrimitiveBatch b = triangleBatch(0, 0, 64, 0, 0, 64);
+            b.state.prim.tme = true;
+            b.state.prim.fst = true;
+            b.vertices[1].u = 64 * 16;
+            b.vertices[2].v = 48 * 16 + 8;
+            Setup s;
+            t.IsTrue(BuildTriangle(b, 1, s), "UV triangle");
+            t.IsTrue(s.texelCoords, "UV coordinates are texel coordinates");
+            t.Equals(s.v[1].u, 64.0f, "u in texels (12.4 divided by 16)");
+            t.Equals(s.v[2].v, 48.5f, "v keeps its fraction");
+            t.Equals(s.v[0].q, 1.0f, "q is 1 for UV");
+            b.state.prim.fst = false;
+            b.vertices[1].s = 0.5f;
+            b.vertices[1].q = 0.25f;
+            t.IsTrue(BuildTriangle(b, 1, s), "STQ triangle");
+            t.IsFalse(s.texelCoords, "STQ stays S, T, Q for the shader to divide");
+            t.Equals(s.v[1].u, 0.5f, "s passed through");
+            t.Equals(s.v[1].q, 0.25f, "q passed through");
+        });
+
+        tc.Run("a sprite covers whole pixels, takes colour and Z from its second vertex and keeps its UV order", [](TestCase &t)
+        {
+            GSPrimitiveBatch b = spriteBatch(10.9f, 20.2f, 30.1f, 50.7f);
+            b.state.prim.tme = true;
+            b.state.prim.fst = true;
+            b.vertices[0].u = 3 * 16 + 7;
+            b.vertices[0].v = 5 * 16;
+            b.vertices[1].u = 19 * 16;
+            b.vertices[1].v = 35 * 16;
+            Setup s;
+            t.IsTrue(BuildSprite(b, 1, s), "sprite");
+            t.Equals(s.count, 6u, "two triangles");
+            t.Equals(s.v[0].x, 10.0f, "left edge: the coordinate truncated");
+            t.Equals(s.v[0].y, 20.0f, "top edge");
+            t.Equals(s.v[2].x, 30.0f, "right edge");
+            t.Equals(s.v[2].y, 50.0f, "bottom edge");
+            t.Equals(s.minX, 10, "box min x");
+            t.Equals(s.maxX, 29, "box max x is the last covered pixel");
+            t.Equals(s.maxY, 49, "box max y");
+            t.Equals(s.v[0].u, 3.0f, "left u is the integer part of vertex 0 u");
+            t.Equals(s.v[2].u, 19.0f, "right u is vertex 1 u");
+            t.Equals(s.v[2].v, 35.0f, "bottom v");
+            t.Equals(s.v[0].rgba, PackRgba(1, 2, 3, 4), "colour of the second vertex");
+            t.Equals(s.v[0].z, 4096.0f * kDepthScale, "Z of the second vertex");
+            // corners given the other way round: the rectangle is the same, the UV order is not flipped
+            GSPrimitiveBatch r = spriteBatch(30.9f, 50.2f, 10.1f, 20.7f);
+            r.state.prim.tme = true;
+            r.state.prim.fst = true;
+            r.vertices[0].u = 100 * 16;
+            r.vertices[1].u = 0;
+            t.IsTrue(BuildSprite(r, 1, s), "reversed sprite");
+            t.Equals(s.v[0].x, 10.0f, "reversed: same left edge");
+            t.Equals(s.v[0].u, 100.0f, "reversed: the left edge still gets vertex 0 u (as in the CPU renderer)");
+            t.Equals(s.v[2].u, 0.0f, "reversed: the right edge gets vertex 1 u");
+            // an empty side is one pixel wide
+            GSPrimitiveBatch e = spriteBatch(5.0f, 5.0f, 5.0f, 9.0f);
+            t.IsTrue(BuildSprite(e, 1, s), "zero width sprite");
+            t.Equals(s.v[2].x - s.v[0].x, 1.0f, "one pixel wide");
+            t.Equals(s.maxX, 5, "covers the one pixel");
+        });
+
+        tc.Run("blend equations map to fixed-function blending", [](TestCase &t)
+        {
+            BlendState a = BlendFromAlpha(true, alphaReg(0, 1, 0, 1)); // (Cs-Cd)*As+Cd
+            t.IsTrue(a.enable && a.supported, "alpha blend");
+            t.IsTrue(a.src == BlendFactor::SrcAlpha && a.dst == BlendFactor::OneMinusSrcAlpha && a.op == BlendOp::Add, "Cs*As + Cd*(1-As)");
+            BlendState add = BlendFromAlpha(true, alphaReg(0, 2, 0, 1)); // (Cs-0)*As+Cd
+            t.IsTrue(add.src == BlendFactor::SrcAlpha && add.dst == BlendFactor::One && add.op == BlendOp::Add, "Cs*As + Cd");
+            BlendState fix = BlendFromAlpha(true, alphaReg(0, 2, 2, 1, 0x80)); // (Cs-0)*FIX+Cd
+            t.IsTrue(fix.coefficientFromFix && fix.src == BlendFactor::SrcAlpha && fix.dst == BlendFactor::One, "Cs*FIX + Cd");
+            BlendState sub = BlendFromAlpha(true, alphaReg(0, 1, 0, 2)); // (Cs-Cd)*As+0
+            t.IsTrue(sub.supported && sub.op == BlendOp::Subtract && sub.src == BlendFactor::SrcAlpha && sub.dst == BlendFactor::SrcAlpha,
+                     "Cs*As - Cd*As");
+            BlendState dstAlpha = BlendFromAlpha(true, alphaReg(0, 1, 1, 1)); // (Cs-Cd)*Ad+Cd
+            t.IsTrue(dstAlpha.src == BlendFactor::DstAlpha && dstAlpha.dst == BlendFactor::OneMinusDstAlpha, "destination alpha as the coefficient");
+            BlendState bad = BlendFromAlpha(true, alphaReg(1, 0, 0, 1)); // (Cd-Cs)*As+Cd = Cd*(1+As) - Cs*As
+            t.IsFalse(bad.supported, "a coefficient of 1+C has no fixed-function form");
+            t.IsFalse(BlendFromAlpha(false, alphaReg(0, 1, 0, 1)).enable, "ABE off: no blending");
+        });
+
+        tc.Run("depth test selection and exact Z values", [](TestCase &t)
+        {
+            t.Equals(DepthCompare((1ull << 16) | (2ull << 17)), 2u, "ZTE on, GEQUAL");
+            t.Equals(DepthCompare((1ull << 16) | (3ull << 17)), 3u, "ZTE on, GREATER");
+            t.Equals(DepthCompare((1ull << 16) | (1ull << 17)), 1u, "ZTE on, ALWAYS");
+            t.Equals(DepthCompare(2ull << 17), 1u, "ZTE off: always passes, like the CPU renderer");
+            // Every 24-bit Z value is exact in a float after dividing by 2^24, and equal values stay equal.
+            bool exact = true, ordered = true;
+            for (uint32_t z = 0; z < (1u << 24); z += 4099u)
+            {
+                const float d = static_cast<float>(static_cast<double>(z) * static_cast<double>(kDepthScale));
+                exact = exact && static_cast<uint32_t>(d * 16777216.0f) == z && d < 1.0f;
+                const float next = static_cast<float>(static_cast<double>(z + 1u) * static_cast<double>(kDepthScale));
+                ordered = ordered && next > d;
+            }
+            exact = exact && static_cast<uint32_t>(static_cast<float>(16777215.0 * static_cast<double>(kDepthScale)) * 16777216.0f) == 16777215u;
+            t.IsTrue(exact, "z / 2^24 is exact in a float for every 24-bit Z value tried, and below 1");
+            t.IsTrue(ordered, "neighbouring Z values stay distinct and ordered");
+        });
+
+        tc.Run("the fragment uniform block", [](TestCase &t)
+        {
+            GSDrawState s{};
+            s.prim.tme = true;
+            s.linearFilter = true;
+            s.textureWidth = 256;
+            s.textureHeight = 128;
+            s.context.tex0.tcc = 1;
+            s.context.tex0.tfx = 0;
+            s.context.clamp = 1ull | (2ull << 2) | (5ull << 4) | (47ull << 14) | (7ull << 24) | (55ull << 34);
+            s.context.test = 1ull | (5ull << 1) | (16ull << 4);
+            s.context.alpha = (static_cast<uint64_t>(0x80) << 32);
+            const FragUniforms u = BuildFragUniforms(s, false, true);
+            t.Equals(u.texInfo[0], 256.0f, "width");
+            t.Equals(u.texInfo[3], 1.0f / 128.0f, "1/height");
+            t.IsTrue((u.flags[0] & kFlagTextured) && (u.flags[0] & kFlagBilinear) && (u.flags[0] & kFlagTcc) && !(u.flags[0] & kFlagTexelCoords),
+                     "textured, bilinear, TCC, S/T/Q");
+            t.IsTrue((u.flags[0] & kFlagAlphaTest) != 0, "alpha test on");
+            t.Equals(u.wrap[0], 1u, "WMS CLAMP");
+            t.Equals(u.wrap[1], 2u, "WMT REGION_CLAMP");
+            t.Equals(u.wrap[2], 5u | (47u << 16), "U region");
+            t.Equals(u.wrap[3], 7u | (55u << 16), "V region");
+            t.Equals(u.test[0], 5u, "ATST GEQUAL");
+            t.Equals(u.test[1], 16u, "AREF");
+            t.Equals(u.test[2], 1u, "blend coefficient is FIX");
+            t.Equals(u.test[3], 0x80u, "FIX");
+            s.context.test = 1ull | (1ull << 1); // ATST ALWAYS
+            t.IsFalse((BuildFragUniforms(s, false, false).flags[0] & kFlagAlphaTest) != 0, "ALWAYS needs no test in the shader");
+        });
+
+        tc.Run("texture and transfer page spans follow the GS address rule", [](TestCase &t)
+        {
+            // a 640x224 CT32 frame at page 0: 10 pages per row, 7 rows
+            PageSpan f = BufferPageSpan(GS_PSM_CT32, 0, 10, 0, 0, 640, 224);
+            t.Equals(f.first, 0u, "frame starts at page 0");
+            t.Equals(f.count, 70u, "10 x 7 pages");
+            // the Z buffer at page 140
+            PageSpan z = BufferPageSpan(GS_PSM_Z24, 140u * 32u, 10, 0, 0, 640, 224);
+            t.Equals(z.first, 140u, "Z buffer at page 140");
+            t.Equals(z.count, 70u, "same size");
+            // a texture that does not start at a page boundary reaches one page further
+            PageSpan aligned = BufferPageSpan(GS_PSM_CT32, 64, 1, 0, 0, 64, 32);
+            PageSpan shifted = BufferPageSpan(GS_PSM_CT32, 64 + 4, 1, 0, 0, 64, 32);
+            t.Equals(aligned.first, 2u, "block 64 is page 2");
+            t.Equals(aligned.count, 1u, "one page when aligned");
+            t.Equals(shifted.count, 2u, "one more when the base is inside a page");
+            // T4: 128x128 pages
+            PageSpan t4 = BufferPageSpan(GS_PSM_T4, 100u * 32u, 8, 0, 0, 512, 512);
+            t.Equals(t4.first, 100u, "T4 texture page");
+            t.Equals(t4.count, 16u, "4 x 4 pages of 128 x 128");
+            // the span wraps around the end of GS memory
+            PageSpan w = BufferPageSpan(GS_PSM_CT32, 510u * 32u, 1, 0, 0, 64, 96);
+            t.Equals(w.first, 510u, "wrapping span starts at page 510");
+            t.Equals(w.count, 3u, "three pages");
+        });
+
+        tc.Run("shared texel rules: TEXA, CLUT selection, CLD", [](TestCase &t)
+        {
+            using namespace GSTexel;
+            GSTexaReg texa{127, true, 129};
+            t.Equals(applyTexa(texa, GS_PSM_CT32, 0x11223344u), 0x11223344u, "CT32 keeps its alpha");
+            t.Equals(applyTexa(texa, GS_PSM_CT24, 0x00FFFFFFu), 0x7FFFFFFFu, "CT24 alpha is TA0");
+            t.Equals(applyTexa(texa, GS_PSM_CT24, 0x00000000u), 0x00000000u, "AEM: black is transparent");
+            t.Equals(applyTexa(texa, GS_PSM_CT16, Rgba5551ToRgba8888(0x8000)), 0x81000000u, "CT16 alpha bit set: TA1");
+            t.Equals(Rgba5551ToRgba8888(0x7FFF) & 0x00FFFFFFu, 0x00F8F8F8u, "5551 channels are shifted up");
+            t.Equals(swizzleClutIndexCSM1(0x08), 0x10u, "CSM1 swaps bits 3 and 4");
+            t.Equals(swizzleClutIndexCSM1(0x10), 0x08u, "and back");
+            std::array<uint16_t, 512> clut{};
+            clut[5] = 0x1234;
+            clut[256 + 5] = 0x5678;
+            t.Equals(LookupClutEntry(clut.data(), texa, 5, GS_PSM_CT32, 1, 0, GS_PSM_T8), 0x56781234u, "T8 index 5 of a CT32 CLUT");
+            std::array<uint32_t, 2> cbp{};
+            GSTex0Reg tex0{};
+            tex0.cld = 4;
+            tex0.cbp = 77;
+            t.IsTrue(ClutLoadWanted(tex0, cbp), "CLD 4 loads when the pointer changed");
+            t.Equals(cbp[0], 77u, "and remembers it");
+            t.IsFalse(ClutLoadWanted(tex0, cbp), "CLD 4 does not load again for the same pointer");
+            tex0.cld = 0;
+            t.IsFalse(ClutLoadWanted(tex0, cbp), "CLD 0 never loads");
+        });
+
+        tc.Run("the shared transfer code writes and reads back every format it handles", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            std::vector<uint8_t> vram(GSMem::MEMORY_SIZE, 0);
+            GSTransferCommand cmd{};
+            cmd.bitbltbuf.dbp = 100;
+            cmd.bitbltbuf.dbw = 2;
+            cmd.bitbltbuf.dpsm = GS_PSM_CT32;
+            cmd.trxreg = {70, 3};
+            cmd.direction = 0;
+            GSTransferSnapshot st{};
+            GSTransfer::Begin(cmd, st);
+            t.Equals(st.totalPixels, 210u, "70 x 3 pixels");
+            std::vector<uint32_t> px(210);
+            for (uint32_t i = 0; i < px.size(); ++i)
+                px[i] = 0x01010101u * (i & 0xFFu) + i;
+            // in two chunks that split a row
+            GSTransfer::UploadImage(vram.data(), cmd, st, reinterpret_cast<const uint8_t *>(px.data()), 100 * 4);
+            t.Equals(st.copiedPixels, 100u, "first chunk");
+            GSTransfer::UploadImage(vram.data(), cmd, st, reinterpret_cast<const uint8_t *>(px.data()) + 100 * 4, 110 * 4);
+            t.Equals(st.direction, 3u, "transfer done");
+            bool same = true;
+            for (uint32_t y = 0; y < 3; ++y)
+                for (uint32_t x = 0; x < 70; ++x)
+                    same = same && GSTransfer::ReadPixel(vram.data(), GS_PSM_CT32, 100, 2, x, y) == px[y * 70 + x];
+            t.IsTrue(same, "every pixel reads back");
+            // local to host returns the same bytes
+            GSTransferCommand rd = cmd;
+            rd.direction = 1;
+            rd.bitbltbuf.sbp = 100;
+            rd.bitbltbuf.sbw = 2;
+            rd.bitbltbuf.spsm = GS_PSM_CT32;
+            GSTransferSnapshot rs{};
+            GSTransfer::Begin(rd, rs);
+            std::vector<uint8_t> host;
+            size_t pos = 99;
+            GSTransfer::LocalToHost(vram.data(), rd, rs, host, pos);
+            t.Equals(host.size(), static_cast<size_t>(210 * 4), "bytes read");
+            t.Equals(pos, static_cast<size_t>(0), "read position reset");
+            t.IsTrue(std::memcmp(host.data(), px.data(), host.size()) == 0, "the same bytes come back");
+        });
+
+        tc.Run("the GPU renderer draws a small scene like the CPU renderer", [](TestCase &t)
+        {
+            if (!SDL_Init(SDL_INIT_VIDEO))
+            {
+                SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "offscreen");
+                if (!SDL_Init(SDL_INIT_VIDEO))
+                {
+                    std::cout << "    (skipped: no SDL video driver)" << std::endl;
+                    return;
+                }
+            }
+            const SDL_GPUShaderFormat formats = SDL_GPU_SHADERFORMAT_SPIRV | SDL_GPU_SHADERFORMAT_DXIL | SDL_GPU_SHADERFORMAT_MSL;
+            SDL_GPUDevice *device = SDL_CreateGPUDevice(formats, false, nullptr);
+            if (!device)
+            {
+                std::cout << "    (skipped: no GPU device: " << SDL_GetError() << ")" << std::endl;
+                return;
+            }
+            {
+                GSMem::InitLookupTables();
+                std::vector<uint8_t> vramCpu(GSMem::MEMORY_SIZE, 0), vramGpu(GSMem::MEMORY_SIZE, 0);
+                GSCpuBackend cpu;
+                GSGpuBackend gpu(device, 1);
+                t.IsTrue(gpu.Ready(), "the GPU renderer sets up");
+                if (gpu.Ready())
+                {
+                    const SceneResult a = runScene(cpu, vramCpu, &cpu, nullptr);
+                    const SceneResult b = runScene(gpu, vramGpu, nullptr, &gpu);
+                    t.IsTrue(a.ok && b.ok, "both renderers returned a 640x224 picture");
+                    if (a.ok && b.ok)
+                    {
+                        uint64_t differing = 0;
+                        int maxDiff = 0;
+                        for (uint32_t y = 0; y < 224; ++y)
+                            for (uint32_t x = 0; x < 640; ++x)
+                            {
+                                int worst = 0;
+                                for (int c = 0; c < 3; ++c)
+                                    worst = std::max(worst, std::abs(static_cast<int>(a.pixels[(y * 640 + x) * 4 + c]) - static_cast<int>(b.pixels[(y * 640 + x) * 4 + c])));
+                                maxDiff = std::max(maxDiff, worst);
+                                differing += worst > 2 ? 1u : 0u;
+                            }
+                        // flat parts, the blend, the nearest and bilinear textures and the depth test must agree
+                        t.IsTrue(differing < 640u * 224u / 200u, "fewer than 0.5% of the pixels differ by more than 2 (" + std::to_string(differing) + " do, largest difference " + std::to_string(maxDiff) + ")");
+                        // the background, a covered point, and a point the hidden sprite must not change
+                        auto px = [&](const SceneResult &r, uint32_t x, uint32_t y) { return std::vector<uint8_t>(&r.pixels[(y * 640 + x) * 4], &r.pixels[(y * 640 + x) * 4] + 3); };
+                        t.IsTrue(px(a, 600, 200) == px(b, 600, 200), "the flat background is identical");
+                        t.IsTrue(px(a, 330, 50) == px(b, 330, 50), "the textured sprite shows where the hidden sprite lies behind it");
+                    }
+                }
+            }
+            SDL_DestroyGPUDevice(device);
+        });
+    });
+}

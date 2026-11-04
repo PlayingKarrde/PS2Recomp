@@ -6,6 +6,9 @@
 #include "runtime/gs/ps2_gs_psmt8.h"
 #include "runtime/gs/ps2_gs_memory.h"
 #include "runtime/gs/gs_recording.h"
+#include "runtime/gs/gs_texel.h"
+#include "runtime/gs/ps2_gs_transfer.h"
+#include "runtime/gs/gs_presentation.h"
 #include "ps2_log.h"
 #include <atomic>
 #include <algorithm>
@@ -26,6 +29,7 @@
 #include <vector>
 
 using namespace GSInternal;
+using namespace GSTexel; // applyTexa, Rgba5551ToRgba8888, CLUT helpers shared with GSGpuBackend
 
 namespace
 {
@@ -44,49 +48,9 @@ namespace
         return (r | (g << 5) | (b << 10) | (a << 15));
     }
 
-    u32 Rgba5551ToRgba8888(u16 c)
-    {
-        u32 r = ((c >> 0) & 0x1F) << 3;
-        u32 g = ((c >> 5) & 0x1F) << 3;
-        u32 b = ((c >> 10) & 0x1F) << 3;
-        u32 a = ((c >> 15) & 0x01) << 7;
-
-        return (r | (g << 8) | (b << 16) | (a << 24));
-    }
-
     u32 pack32(u8 r, u8 g, u8 b, u8 a)
     {
         return static_cast<u32>(r) | (g << 8) | (b << 16) | (a << 24);
-    }
-
-    uint32_t applyTexa(const GSTexaReg &texa, uint8_t psm, uint32_t texel)
-    {
-        if (psm == GS_PSM_CT32)
-            return texel;
-
-        const uint8_t r = static_cast<uint8_t>(texel & 0xFFu);
-        const uint8_t g = static_cast<uint8_t>((texel >> 8) & 0xFFu);
-        const uint8_t b = static_cast<uint8_t>((texel >> 16) & 0xFFu);
-        const bool rgbZero = r == 0u && g == 0u && b == 0u;
-        uint8_t a = static_cast<uint8_t>((texel >> 24) & 0xFFu);
-
-        switch (psm)
-        {
-        case GS_PSM_CT24:
-            a = (texa.aem && rgbZero) ? 0u : texa.ta0;
-            break;
-        case GS_PSM_CT16:
-        case GS_PSM_CT16S:
-            if ((a & 0x80u) != 0u)
-                a = texa.ta1;
-            else
-                a = (texa.aem && rgbZero) ? 0u : texa.ta0;
-            break;
-        default:
-            break;
-        }
-
-        return (texel & 0x00FFFFFFu) | (static_cast<uint32_t>(a) << 24);
     }
 
     uint32_t addrPSMCT16Family(uint32_t basePtr, uint32_t width, uint8_t psm, uint32_t x, uint32_t y)
@@ -285,23 +249,6 @@ namespace
         return out;
     }
 
-    uint32_t swizzleClutIndexCSM1(uint32_t index)
-    {
-        // CSM1 swaps address bits 3 and 4. Preserve the remaining bits:
-        // 16-bit CLUTs expose a ninth address bit through CSA[4].
-        return (index & ~0x18u) | ((index & 0x08u) << 1u) | ((index & 0x10u) >> 1u);
-    }
-
-    bool isFourBitIndexedPsm(uint8_t psm)
-    {
-        return psm == GS_PSM_T4 || psm == GS_PSM_T4HL || psm == GS_PSM_T4HH;
-    }
-
-    bool isEightBitIndexedPsm(uint8_t psm)
-    {
-        return psm == GS_PSM_T8 || psm == GS_PSM_T8H;
-    }
-
     // FPWR: integer bilinear filter. Each RGBA8888 texel is spread into four 16-bit lanes of a
     // uint64_t so all channels are weighted at once; weights are 8-bit fractions (0..256).
     uint64_t spreadRgba(uint32_t c)
@@ -424,6 +371,135 @@ namespace
     constexpr uint64_t kParallelMinPixels = 16384u;
 }
 
+// ---------------------------------------------------------------------------------------------
+// FPWR: source alpha above 0x80 (GPU renderer question, docs/gpu-renderer.md). On the GS an alpha of
+// 0x80 means 1.0 and larger values go above 1; a GPU colour target clamps the blend factor to 1.
+// With PS2X_GS_ALPHA_STATS=1 every pixel that goes through the blender is counted by draw state:
+//   blended      pixels that were blended (ABE set, PABE did not skip them, all tests passed)
+//   as_used      of those, pixels whose blend coefficient C is the source alpha As
+//   as>128       of those, pixels with As > 128
+//   as>128 vis   of those, pixels whose colour differs by more than 2 in any channel from the colour
+//                that As clamped to 128 would give (what a GPU backend that clamps would draw wrong)
+//   ad_used      pixels whose coefficient is the destination alpha Ad
+//   fix_used     pixels whose coefficient is FIX
+// The table is printed to stderr when the last backend that drew is destroyed (the replayer does that;
+// the game leaves through _Exit). Pixels are counted per primitive on the drawing thread and merged
+// under a mutex once per primitive, so the cost is paid only when the variable is set.
+namespace
+{
+    bool gsAlphaStatsEnabled()
+    {
+        static const bool enabled = []
+        {
+            const char *env = std::getenv("PS2X_GS_ALPHA_STATS");
+            return env && env[0] == '1';
+        }();
+        return enabled;
+    }
+
+    struct AlphaStatCounts
+    {
+        uint64_t blended = 0, asUsed = 0, asAbove = 0, asAboveVisible = 0, adUsed = 0, fixUsed = 0;
+        uint32_t asMax = 0;
+        uint64_t texPixels = 0; // blended pixels that sampled a texture (tme)
+        void add(const AlphaStatCounts &o)
+        {
+            blended += o.blended;
+            asUsed += o.asUsed;
+            asAbove += o.asAbove;
+            asAboveVisible += o.asAboveVisible;
+            adUsed += o.adUsed;
+            fixUsed += o.fixUsed;
+            asMax = std::max(asMax, o.asMax);
+            texPixels += o.texPixels;
+        }
+    };
+
+    // The part of the draw state that decides how alpha is produced and used.
+    uint64_t alphaStatsKey(const GSDrawState &s)
+    {
+        const auto &c = s.context;
+        uint64_t k = 0;
+        k |= static_cast<uint64_t>(s.prim.type) & 7u;
+        k |= (s.prim.iip ? 1ull : 0ull) << 3;
+        k |= (s.prim.tme ? 1ull : 0ull) << 4;
+        k |= (s.prim.fst ? 1ull : 0ull) << 5;
+        k |= static_cast<uint64_t>(c.tex0.tcc & 1u) << 6;
+        k |= static_cast<uint64_t>(c.tex0.tfx & 3u) << 7;
+        k |= (c.alpha & 0xFFull) << 9;                                   // A, B, C, D
+        k |= (((c.alpha >> 4) & 3u) == 2u ? ((c.alpha >> 32) & 0xFFull) : 0ull) << 17; // FIX, when C is FIX
+        k |= (c.test & 1ull) << 25;                                      // ATE
+        k |= ((c.test >> 1) & 7ull) << 26;                               // ATST
+        k |= ((c.test >> 4) & 0xFFull) << 29;                            // AREF
+        k |= static_cast<uint64_t>(c.tex0.psm & 0x3Fu) << 37;
+        k |= (s.pabe ? 1ull : 0ull) << 43;
+        k |= static_cast<uint64_t>(c.frame.psm & 0x3Fu) << 44;
+        k |= static_cast<uint64_t>(s.texa.ta1) << 50; // TA1 only matters to 16-bit textures
+        return k;
+    }
+
+    std::string alphaStatsKeyText(uint64_t k)
+    {
+        static const char *const kPrim[] = {"POINT", "LINE", "LSTRIP", "TRI", "TRISTRIP", "TRIFAN", "SPRITE", "?"};
+        static const char *const kSrc[] = {"Cs", "Cd", "0", "?"};
+        static const char *const kCoef[] = {"As", "Ad", "FIX", "?"};
+        static const char *const kTfx[] = {"MODULATE", "DECAL", "HIGHLIGHT", "HIGHLIGHT2"};
+        static const char *const kAtst[] = {"NEVER", "ALWAYS", "LESS", "LEQUAL", "EQUAL", "GEQUAL", "GREATER", "NOTEQUAL"};
+        const unsigned alpha = static_cast<unsigned>((k >> 9) & 0xFFu);
+        char buf[256];
+        std::snprintf(buf, sizeof(buf), "%s%s%s%s%s | blend (%s-%s)*%s+%s%s | tcc=%u %s | atest %s%s%s aref=%u | tex psm=0x%02x | frame psm=0x%02x | ta1=%u",
+                      kPrim[k & 7u], (k >> 3) & 1u ? " IIP" : "", (k >> 4) & 1u ? " TME" : "", (k >> 5) & 1u ? " FST" : "",
+                      (k >> 43) & 1u ? " PABE" : "", kSrc[alpha & 3u], kSrc[(alpha >> 2) & 3u], kCoef[(alpha >> 4) & 3u], kSrc[(alpha >> 6) & 3u],
+                      ((alpha >> 4) & 3u) == 2u ? (" FIX=" + std::to_string((k >> 17) & 0xFFu)).c_str() : "",
+                      static_cast<unsigned>((k >> 6) & 1u), kTfx[(k >> 7) & 3u], (k >> 25) & 1u ? "on " : "off", ((k >> 25) & 1u) ? kAtst[(k >> 26) & 7u] : "",
+                      "", static_cast<unsigned>((k >> 29) & 0xFFu), static_cast<unsigned>((k >> 37) & 0x3Fu),
+                      static_cast<unsigned>((k >> 44) & 0x3Fu), static_cast<unsigned>((k >> 50) & 0xFFu));
+        return buf;
+    }
+
+    std::mutex s_alphaStatsMutex;
+    std::unordered_map<uint64_t, AlphaStatCounts> s_alphaStats;
+    thread_local AlphaStatCounts t_alphaStatsPrimitive; // counts of the primitive being drawn
+
+    void alphaStatsMerge(const GSDrawState &state)
+    {
+        if (t_alphaStatsPrimitive.blended == 0 && t_alphaStatsPrimitive.adUsed == 0)
+            return;
+        const uint64_t key = alphaStatsKey(state);
+        {
+            std::lock_guard<std::mutex> lock(s_alphaStatsMutex);
+            s_alphaStats[key].add(t_alphaStatsPrimitive);
+        }
+        t_alphaStatsPrimitive = {};
+    }
+
+    void alphaStatsPrint()
+    {
+        std::lock_guard<std::mutex> lock(s_alphaStatsMutex);
+        if (s_alphaStats.empty())
+            return;
+        std::vector<std::pair<uint64_t, AlphaStatCounts>> rows(s_alphaStats.begin(), s_alphaStats.end());
+        std::sort(rows.begin(), rows.end(), [](const auto &a, const auto &b) { return a.second.blended > b.second.blended; });
+        AlphaStatCounts total;
+        for (const auto &r : rows)
+            total.add(r.second);
+        std::fprintf(stderr, "[gs:alpha] %zu draw states with blended pixels\n", rows.size());
+        std::fprintf(stderr, "[gs:alpha] TOTAL blended %llu  as_used %llu  as>128 %llu (%.4f%% of as_used)  as>128 visible %llu  as_max %u  ad_used %llu  fix_used %llu\n",
+                     static_cast<unsigned long long>(total.blended), static_cast<unsigned long long>(total.asUsed),
+                     static_cast<unsigned long long>(total.asAbove),
+                     total.asUsed ? 100.0 * static_cast<double>(total.asAbove) / static_cast<double>(total.asUsed) : 0.0,
+                     static_cast<unsigned long long>(total.asAboveVisible), total.asMax,
+                     static_cast<unsigned long long>(total.adUsed), static_cast<unsigned long long>(total.fixUsed));
+        for (const auto &r : rows)
+            std::fprintf(stderr, "[gs:alpha]  blended %llu as_used %llu as>128 %llu visible %llu as_max %u ad_used %llu fix_used %llu texpx %llu :: %s\n",
+                         static_cast<unsigned long long>(r.second.blended), static_cast<unsigned long long>(r.second.asUsed),
+                         static_cast<unsigned long long>(r.second.asAbove), static_cast<unsigned long long>(r.second.asAboveVisible),
+                         r.second.asMax, static_cast<unsigned long long>(r.second.adUsed), static_cast<unsigned long long>(r.second.fixUsed),
+                         static_cast<unsigned long long>(r.second.texPixels), alphaStatsKeyText(r.first).c_str());
+        s_alphaStats.clear();
+    }
+}
+
 namespace
 {
     static constexpr uint32_t kDefaultDisplayWidth = 640u;
@@ -440,131 +516,6 @@ namespace
                                      ((a >= 0x40u) ? 0x8000u : 0u));
     }
 
-    void decodeDisplaySize(uint64_t display64, uint32_t &outWidth, uint32_t &outHeight)
-    {
-        const uint32_t dw = static_cast<uint32_t>((display64 >> 32) & 0x0FFFu);
-        const uint32_t dh = static_cast<uint32_t>((display64 >> 44) & 0x07FFu);
-        const uint32_t magh = static_cast<uint32_t>((display64 >> 23) & 0x0Fu);
-
-        outWidth = (dw + 1u) / (magh + 1u);
-        outHeight = dh + 1u;
-        if (outWidth < 64u || outHeight < 64u)
-        {
-            outWidth = kDefaultDisplayWidth;
-            outHeight = kDefaultDisplayHeight;
-        }
-        outWidth = std::min<uint32_t>(outWidth, kHostFrameWidth);
-        outHeight = std::min<uint32_t>(outHeight, kHostFrameHeight);
-    }
-
-    GSFrameReg decodeDisplayFrame(uint64_t dispfb64)
-    {
-        GSFrameReg frame{};
-        frame.fbp = static_cast<uint32_t>(dispfb64 & 0x1FFu);
-        frame.fbw = static_cast<uint32_t>((dispfb64 >> 9) & 0x3Fu);
-        frame.psm = static_cast<uint8_t>((dispfb64 >> 15) & 0x1Fu);
-        return frame;
-    }
-
-    struct GSDisplayReadOrigin
-    {
-        uint32_t x = 0u;
-        uint32_t y = 0u;
-    };
-
-    GSDisplayReadOrigin decodeDisplayReadOrigin(uint64_t dispfb64)
-    {
-        return {
-            static_cast<uint32_t>((dispfb64 >> 32) & 0x7FFu),
-            static_cast<uint32_t>((dispfb64 >> 43) & 0x7FFu)};
-    }
-
-    bool hasDisplaySetup(uint64_t display64, const GSFrameReg &frame)
-    {
-        const uint32_t dw = static_cast<uint32_t>((display64 >> 32) & 0x0FFFu);
-        const uint32_t dh = static_cast<uint32_t>((display64 >> 44) & 0x07FFu);
-        const uint32_t magh = static_cast<uint32_t>((display64 >> 23) & 0x0Fu);
-        return frame.fbw != 0u || dw != 0u || dh != 0u || magh != 0u;
-    }
-
-    struct GSPmodeState
-    {
-        bool enableCrt1 = false;
-        bool enableCrt2 = false;
-        bool mmod = false;
-        bool amod = false;
-        bool slbg = false;
-        uint8_t alp = 0u;
-    };
-
-    GSPmodeState decodePmode(uint64_t pmode64)
-    {
-        return {
-            (pmode64 & 0x1ull) != 0ull,
-            (pmode64 & 0x2ull) != 0ull,
-            ((pmode64 >> 5) & 0x1ull) != 0ull,
-            ((pmode64 >> 6) & 0x1ull) != 0ull,
-            ((pmode64 >> 7) & 0x1ull) != 0ull,
-            static_cast<uint8_t>((pmode64 >> 8) & 0xFFu)};
-    }
-
-    struct GSSmode2State
-    {
-        bool interlaced = false;
-        bool frameMode = true;
-    };
-
-    GSSmode2State decodeSMode2(uint64_t smode2)
-    {
-        return {(smode2 & 0x1ull) != 0ull, ((smode2 >> 1) & 0x1ull) != 0ull};
-    }
-
-    void applyFieldPresentation(std::vector<uint8_t> &pixels, uint32_t width, uint32_t height, bool oddField)
-    {
-        if (pixels.empty() || width == 0u || height < 2u)
-            return;
-        const std::vector<uint8_t> source = pixels;
-        for (uint32_t y = 0; y < height; ++y)
-        {
-            uint32_t sourceY = ((y >> 1u) << 1u) + (oddField ? 1u : 0u);
-            if (sourceY >= height)
-                sourceY = height - 1u;
-            std::memcpy(pixels.data() + y * kHostFrameWidth * 4u,
-                        source.data() + sourceY * kHostFrameWidth * 4u,
-                        width * 4u);
-        }
-    }
-
-    void normalizePresentationAlpha(std::vector<uint8_t> &pixels, uint32_t width, uint32_t height)
-    {
-        for (uint32_t y = 0; y < height; ++y)
-        {
-            uint8_t *row = pixels.data() + y * kHostFrameWidth * 4u;
-            for (uint32_t x = 0; x < width; ++x)
-                row[x * 4u + 3u] = 255u;
-        }
-    }
-
-    uint8_t blendPresentationChannel(uint8_t src, uint8_t dst, uint32_t factor)
-    {
-        const int delta = static_cast<int>(src) - static_cast<int>(dst);
-        return GSInternal::clampU8(static_cast<int>(dst) + ((delta * static_cast<int>(factor)) / 255));
-    }
-
-    uint32_t countNonBlackPixels(const std::vector<uint8_t> &pixels, uint32_t width, uint32_t height)
-    {
-        uint32_t count = 0u;
-        for (uint32_t y = 0; y < height; ++y)
-        {
-            const uint8_t *row = pixels.data() + y * kHostFrameWidth * 4u;
-            for (uint32_t x = 0; x < width; ++x)
-            {
-                if (row[x * 4u] != 0u || row[x * 4u + 1u] != 0u || row[x * 4u + 2u] != 0u)
-                    ++count;
-            }
-        }
-        return count;
-    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2584,6 +2535,8 @@ GSCpuBackend::~GSCpuBackend()
     if (m_recActive)
         FinishRecordingUnlocked(); // a recording cut short (the game normally ends with _Exit)
     delete m_recLive.exchange(nullptr);
+    if (gsAlphaStatsEnabled())
+        alphaStatsPrint();
 }
 
 void GSCpuBackend::DrawBatch(const Batch &batch)
@@ -2703,33 +2656,8 @@ void GSCpuBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
     if (gsCensusEnabled())
         GsCensus::instance().clutCall(this, tex0);
 
-    switch (tex0.cld)
-    {
-    case 0u:
-    case 6u:
-    case 7u:
+    if (!ClutLoadWanted(tex0, m_clutCbp))
         return;
-    case 1u:
-        break;
-    case 2u:
-        m_clutCbp[0] = tex0.cbp;
-        break;
-    case 3u:
-        m_clutCbp[1] = tex0.cbp;
-        break;
-    case 4u:
-        if (m_clutCbp[0] == tex0.cbp)
-            return;
-        m_clutCbp[0] = tex0.cbp;
-        break;
-    case 5u:
-        if (m_clutCbp[1] == tex0.cbp)
-            return;
-        m_clutCbp[1] = tex0.cbp;
-        break;
-    default:
-        return;
-    }
 
     {
         // Queued primitives keep the CLUT they were queued with (Batch::cluts), so a load only
@@ -2754,50 +2682,8 @@ void GSCpuBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
 
 void GSCpuBackend::LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
 {
-    const bool fourBit = isFourBitIndexedPsm(tex0.psm);
-    const bool sixteenBit = tex0.cpsm == GS_PSM_CT16 || tex0.cpsm == GS_PSM_CT16S;
-    const bool thirtyTwoBit = tex0.cpsm == GS_PSM_CT32 || tex0.cpsm == GS_PSM_CT24;
-    if (!sixteenBit && !thirtyTwoBit)
-        return;
-
-    const uint32_t entryCount = fourBit ? 16u : 256u;
-    const uint32_t csaMask = sixteenBit ? 0x1Fu : 0x0Fu;
-    const uint32_t destinationBase = (static_cast<uint32_t>(tex0.csa) & csaMask) << 4u;
-
-    const bool loadCsm1Suffix = tex0.csm == 0u && thirtyTwoBit && !fourBit;
-    const uint32_t firstEntry = loadCsm1Suffix ? destinationBase : 0u;
-
-    for (uint32_t entry = firstEntry; entry < entryCount; ++entry)
-    {
-        uint32_t sourceX = 0u;
-        uint32_t sourceY = 0u;
-        uint32_t sourceWidth = 1u;
-
-        if (tex0.csm == 0u)
-        {
-            const uint32_t sourceIndex = swizzleClutIndexCSM1(entry);
-            sourceX = sourceIndex & 0x0Fu;
-            sourceY = sourceIndex >> 4u;
-        }
-        else
-        {
-            sourceWidth = texclut.cbw != 0u ? static_cast<uint32_t>(texclut.cbw) : 1u;
-            sourceX = (static_cast<uint32_t>(texclut.cou) << 4u) + entry;
-            sourceY = static_cast<uint32_t>(texclut.cov);
-        }
-
-        const uint32_t raw = ReadTextureVramUnlocked(tex0.cpsm, tex0.cbp, sourceWidth, sourceX, sourceY); 
-        const uint32_t destination = (loadCsm1Suffix ? entry : destinationBase + entry) & (sixteenBit ? 0x1FFu : 0x0FFu);
-        if (sixteenBit)
-        {
-            m_clut[destination] = static_cast<uint16_t>(raw);
-        }
-        else
-        {
-            m_clut[destination] = static_cast<uint16_t>(raw & 0xFFFFu);
-            m_clut[destination + 256u] = static_cast<uint16_t>(raw >> 16u);
-        }
-    }
+    LoadClutFromMemory(m_clut, tex0, texclut, [this](uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y)
+                       { return ReadTextureVramUnlocked(psm, base, bw, x, y); });
 }
 
 void GSCpuBackend::Flush()
@@ -3043,6 +2929,8 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
     default:
         break;
     }
+    if (gsAlphaStatsEnabled())
+        alphaStatsMerge(state);
 }
 
 void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uint8_t r, uint8_t g, uint8_t b, uint8_t a, uint8_t fog)
@@ -3170,6 +3058,42 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
                 int cAlpha = (csel == 0) ? a : (csel == 1) ? da
                                                            : fix;
 
+                if (gsAlphaStatsEnabled())
+                {
+                    AlphaStatCounts &stat = t_alphaStatsPrimitive;
+                    ++stat.blended;
+                    stat.texPixels += state.prim.tme ? 1u : 0u;
+                    if (csel == 0)
+                    {
+                        ++stat.asUsed;
+                        stat.asMax = std::max<uint32_t>(stat.asMax, a);
+                        if (a > 128u)
+                        {
+                            ++stat.asAbove;
+                            // The colour a clamping blender would give: the same formula with As = 0x80.
+                            bool visible = false;
+                            const int sr[3] = {r, g, b}, sd[3] = {dr, dg, db};
+                            for (int ch = 0; ch < 3; ++ch)
+                            {
+                                const int cs = sr[ch], cd = sd[ch];
+                                const int fa = pickRGB(asel, cs, cd), fb = pickRGB(bsel, cs, cd), fd = pickRGB(dsel, cs, cd);
+                                const int exact = clampU8(((fa - fb) * static_cast<int>(a) >> 7) + fd);
+                                const int clamped = clampU8(((fa - fb) * 128 >> 7) + fd);
+                                visible |= std::abs(exact - clamped) > 2;
+                            }
+                            stat.asAboveVisible += visible ? 1u : 0u;
+                        }
+                    }
+                    else if (csel == 1)
+                    {
+                        ++stat.adUsed;
+                    }
+                    else
+                    {
+                        ++stat.fixUsed;
+                    }
+                }
+
                 r = clampU8(((pickRGB(asel, r, dr) - pickRGB(bsel, r, dr)) * cAlpha >> 7) + pickRGB(dsel, r, dr));
                 g = clampU8(((pickRGB(asel, g, dg) - pickRGB(bsel, g, dg)) * cAlpha >> 7) + pickRGB(dsel, g, dg));
                 b = clampU8(((pickRGB(asel, b, db) - pickRGB(bsel, b, db)) * cAlpha >> 7) + pickRGB(dsel, b, db));
@@ -3221,41 +3145,7 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
                                   uint8_t csa,
                                   uint8_t sourcePsm)
 {
-    const bool sixteenBit = cpsm == GS_PSM_CT16 || cpsm == GS_PSM_CT16S;
-    const uint32_t csaMask = sixteenBit ? 0x1Fu : 0x0Fu;
-    const uint32_t clutBase = (static_cast<uint32_t>(csa) & csaMask) << 4u;
-    const uint32_t sourceIndex = isFourBitIndexedPsm(sourcePsm)
-                                     ? (static_cast<uint32_t>(index) & 0x0Fu)
-                                     : static_cast<uint32_t>(index);
-
-    const uint16_t *clut = t_clut ? t_clut : m_clut.data();
-    uint32_t clutIndex = (clutBase + sourceIndex) & (sixteenBit ? 0x1FFu : 0x0FFu);
-    if (!sixteenBit && csm == 0u && isEightBitIndexedPsm(sourcePsm))
-    {
-        const uint32_t block = std::min((sourceIndex & 0xF0u) + clutBase, 240u);
-        clutIndex = block + (sourceIndex & 0x0Fu);
-    }
-
-    switch (cpsm)
-    {
-    case GS_PSM_CT32:
-    {
-        const uint32_t raw = static_cast<uint32_t>(clut[clutIndex]) | (static_cast<uint32_t>(clut[clutIndex + 256u]) << 16u);
-        return applyTexa(state.texa, cpsm, raw);
-    }
-    case GS_PSM_CT24:
-    {
-        const uint32_t raw = static_cast<uint32_t>(clut[clutIndex]) | (static_cast<uint32_t>(clut[clutIndex + 256u]) << 16u);
-        return applyTexa(state.texa, cpsm, raw & 0x00FFFFFFu);
-    }
-    case GS_PSM_CT16:
-    case GS_PSM_CT16S:
-        return applyTexa(state.texa, cpsm, Rgba5551ToRgba8888(clut[clutIndex]));
-    default:
-        break;
-    }
-
-    return 0xFFFF00FFu;
+    return LookupClutEntry(t_clut ? t_clut : m_clut.data(), state.texa, index, cpsm, csm, csa, sourcePsm);
 }
 
 uint32_t GSCpuBackend::DecodeTexel(const GSDrawState &state, int u, int v, GSMem::TexturePageCache &pageCache)
@@ -3782,10 +3672,32 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
                 float w1 = static_cast<float>(static_cast<double>(e1) / static_cast<double>(absDenom));
                 float w2 = 1.0f - w0 - w1;
 
-                double z = v0.z * w0 + v1.z * w1 + v2.z * w2;
+                // PS2X_GS_CPU_EXACT=1 (a diagnostic, off by default): interpolate Z, colours and texture
+                // coordinates in double precision with a tiny bias, instead of float32. The float32 sums come
+                // out one step low for a few percent of pixels whose exact value is a whole number (a flat
+                // colour of 0x80 becomes 0x7F), and the truncation to a whole step then shows. The GPU renderer
+                // computes these values without that noise, so replaying with this switch shows how much of a
+                // CPU/GPU difference is the CPU's float rounding.
+                static const bool cpuExact = []
+                {
+                    const char *env = std::getenv("PS2X_GS_CPU_EXACT");
+                    return env && env[0] == '1';
+                }();
+                const double dw0 = cpuExact ? static_cast<double>(e0) / static_cast<double>(absDenom) : 0.0;
+                const double dw1 = cpuExact ? static_cast<double>(e1) / static_cast<double>(absDenom) : 0.0;
+                const double dw2 = cpuExact ? 1.0 - dw0 - dw1 : 0.0;
+
+                double z = cpuExact ? v0.z * dw0 + v1.z * dw1 + v2.z * dw2 : v0.z * w0 + v1.z * w1 + v2.z * w2;
 
                 uint8_t r, g, b, a;
-                if (state.prim.iip)
+                if (state.prim.iip && cpuExact)
+                {
+                    r = clampU8(static_cast<int>(v0.r * dw0 + v1.r * dw1 + v2.r * dw2 + 1e-6));
+                    g = clampU8(static_cast<int>(v0.g * dw0 + v1.g * dw1 + v2.g * dw2 + 1e-6));
+                    b = clampU8(static_cast<int>(v0.b * dw0 + v1.b * dw1 + v2.b * dw2 + 1e-6));
+                    a = clampU8(static_cast<int>(v0.a * dw0 + v1.a * dw1 + v2.a * dw2 + 1e-6));
+                }
+                else if (state.prim.iip)
                 {
                     r = clampU8(static_cast<int>(v0.r * w0 + v1.r * w1 + v2.r * w2));
                     g = clampU8(static_cast<int>(v0.g * w0 + v1.g * w1 + v2.g * w2));
@@ -3806,8 +3718,16 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
                     uint16_t iu, iv;
                     if (state.prim.fst)
                     {
-                        iu = static_cast<uint16_t>(v0.u * w0 + v1.u * w1 + v2.u * w2);
-                        iv = static_cast<uint16_t>(v0.v * w0 + v1.v * w1 + v2.v * w2);
+                        if (cpuExact)
+                        {
+                            iu = static_cast<uint16_t>(v0.u * dw0 + v1.u * dw1 + v2.u * dw2 + 1e-6);
+                            iv = static_cast<uint16_t>(v0.v * dw0 + v1.v * dw1 + v2.v * dw2 + 1e-6);
+                        }
+                        else
+                        {
+                            iu = static_cast<uint16_t>(v0.u * w0 + v1.u * w1 + v2.u * w2);
+                            iv = static_cast<uint16_t>(v0.v * w0 + v1.v * w1 + v2.v * w2);
+                        }
                         is = 0.0f;
                         it = 0.0f;
                         iq = 1.0f;
@@ -3817,9 +3737,18 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
                         // The GS DDA interpolates the homogeneous S, T and Q
                         // values. Texel coordinates are calculated from S/Q and
                         // T/Q only after interpolation.
-                        is = v0.s * w0 + v1.s * w1 + v2.s * w2;
-                        it = v0.t * w0 + v1.t * w1 + v2.t * w2;
-                        iq = v0.q * w0 + v1.q * w1 + v2.q * w2;
+                        if (cpuExact)
+                        {
+                            is = static_cast<float>(v0.s * dw0 + v1.s * dw1 + v2.s * dw2);
+                            it = static_cast<float>(v0.t * dw0 + v1.t * dw1 + v2.t * dw2);
+                            iq = static_cast<float>(v0.q * dw0 + v1.q * dw1 + v2.q * dw2);
+                        }
+                        else
+                        {
+                            is = v0.s * w0 + v1.s * w1 + v2.s * w2;
+                            it = v0.t * w0 + v1.t * w1 + v2.t * w2;
+                            iq = v0.q * w0 + v1.q * w1 + v2.q * w2;
+                        }
                         iu = 0;
                         iv = 0;
                     }
@@ -3929,12 +3858,7 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
     else
         PrepareUpload(command);
     m_transfer = command;
-    m_transferState.x = command.trxpos.dsax;
-    m_transferState.y = command.trxpos.dsay;
-    m_transferState.totalPixels = static_cast<uint32_t>(command.trxreg.rrw) * static_cast<uint32_t>(command.trxreg.rrh);
-    m_transferState.copiedPixels = 0u;
-    m_transferState.direction = command.direction;
-    m_transferState.localToHostPendingBytes = 0u;
+    GSTransfer::Begin(command, m_transferState);
 
     if (command.direction == 2u)
         PerformLocalToLocalTransfer();
@@ -3965,270 +3889,17 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
 
 void GSCpuBackend::UploadImageUnlocked(const uint8_t *data, uint32_t sizeBytes)
 {
-    if (!data || sizeBytes == 0u || !m_vram || m_transferState.direction != 0u)
-        return;
-    if (m_transfer.trxreg.rrw == 0u || m_transfer.trxreg.rrh == 0u || m_transferState.totalPixels == 0u)
-        return;
-
-    const uint32_t dbp = m_transfer.bitbltbuf.dbp;
-    const uint32_t dbw = std::max<uint32_t>(m_transfer.bitbltbuf.dbw, 1u);
-    const uint8_t dpsm = m_transfer.bitbltbuf.dpsm;
-    const uint32_t rrw = m_transfer.trxreg.rrw;
-    const uint32_t dsax = m_transfer.trxpos.dsax;
-    uint32_t offset = 0u;
-
-    auto advancePixel = [&](uint32_t count)
-    {
-        const uint32_t totalPixels = m_transferState.totalPixels;
-        m_transferState.copiedPixels =
-            std::min<uint32_t>(totalPixels, m_transferState.copiedPixels + count);
-
-        if (m_transferState.copiedPixels >= totalPixels)
-        {
-            m_transferState.direction = 3u;
-            m_transferState.totalPixels = 0u;
-            return;
-        }
-
-        m_transferState.x = dsax + (m_transferState.copiedPixels % rrw);
-        m_transferState.y = m_transfer.trxpos.dsay + (m_transferState.copiedPixels / rrw);
-    };
-
-    // Fast path: write the rest of the current row (or as much of it as the data covers) in one
-    // span. 4-bit formats need the span to start on a byte, i.e. an even pixel count so far in a
-    // transfer whose rows hold whole bytes; anything else falls through to the per-pixel code.
-    uint32_t bytesPerPixel = 0u;
-    switch (dpsm)
-    {
-    case GS_PSM_CT32:
-    case GS_PSM_Z32:
-        bytesPerPixel = 4u;
-        break;
-    case GS_PSM_CT24:
-    case GS_PSM_Z24:
-        bytesPerPixel = 3u;
-        break;
-    case GS_PSM_CT16:
-    case GS_PSM_CT16S:
-    case GS_PSM_Z16:
-    case GS_PSM_Z16S:
-        bytesPerPixel = 2u;
-        break;
-    case GS_PSM_T8:
-    case GS_PSM_T8H:
-        bytesPerPixel = 1u;
-        break;
-    default:
-        break;
-    }
-    const bool fourBit = dpsm == GS_PSM_T4 || dpsm == GS_PSM_T4HL || dpsm == GS_PSM_T4HH;
-
-    while (offset < sizeBytes && m_transferState.direction == 0u)
-    {
-        const uint32_t copied = m_transferState.copiedPixels;
-        const uint32_t column = copied % rrw;
-        const uint32_t rowLeft = std::min(rrw - column, m_transferState.totalPixels - copied);
-        uint32_t count = 0u;
-        uint32_t bytes = 0u;
-        if (bytesPerPixel != 0u)
-        {
-            count = std::min(rowLeft, (sizeBytes - offset) / bytesPerPixel);
-            bytes = count * bytesPerPixel;
-        }
-        else if (fourBit && (rrw & 1u) == 0u && (copied & 1u) == 0u)
-        {
-            count = std::min(rowLeft, (sizeBytes - offset) * 2u);
-            bytes = (count + 1u) / 2u;
-        }
-        if (count != 0u &&
-            GSMem::WriteSpan(m_vram, dpsm, dbp, dbw, dsax + column, m_transfer.trxpos.dsay + copied / rrw, data + offset, count))
-        {
-            offset += bytes;
-            advancePixel(count);
-            continue;
-        }
-
-        switch (dpsm)
-        {
-        case GS_PSM_CT32:
-        case GS_PSM_Z32:
-        {
-            if (sizeBytes - offset < 4u)
-                return;
-            uint32_t value = 0u;
-            std::memcpy(&value, data + offset, sizeof(value));
-            WriteVramUnlocked(dpsm, dbp, dbw, m_transferState.x, m_transferState.y, value);
-            offset += 4u;
-            advancePixel(1u);
-            break;
-        }
-        case GS_PSM_CT24:
-        case GS_PSM_Z24:
-        {
-            if (sizeBytes - offset < 3u)
-                return;
-            const uint32_t value = static_cast<uint32_t>(data[offset]) |
-                                   (static_cast<uint32_t>(data[offset + 1u]) << 8u) |
-                                   (static_cast<uint32_t>(data[offset + 2u]) << 16u);
-            WriteVramUnlocked(dpsm, dbp, dbw, m_transferState.x, m_transferState.y, value);
-            offset += 3u;
-            advancePixel(1u);
-            break;
-        }
-        case GS_PSM_CT16:
-        case GS_PSM_CT16S:
-        case GS_PSM_Z16:
-        case GS_PSM_Z16S:
-        {
-            if (sizeBytes - offset < 2u)
-                return;
-            uint16_t value = 0u;
-            std::memcpy(&value, data + offset, sizeof(value));
-            WriteVramUnlocked(dpsm, dbp, dbw, m_transferState.x, m_transferState.y, value);
-            offset += 2u;
-            advancePixel(1u);
-            break;
-        }
-        case GS_PSM_T8:
-        case GS_PSM_T8H:
-            WriteVramUnlocked(dpsm, dbp, dbw, m_transferState.x, m_transferState.y, data[offset++]);
-            advancePixel(1u);
-            break;
-        case GS_PSM_T4:
-        case GS_PSM_T4HL:
-        case GS_PSM_T4HH:
-        {
-            const uint8_t packed = data[offset++];
-            const uint32_t firstPixel = m_transferState.copiedPixels;
-            WriteVramUnlocked(dpsm, dbp, dbw,
-                              dsax + (firstPixel % rrw),
-                              m_transfer.trxpos.dsay + (firstPixel / rrw),
-                              packed & 0x0Fu);
-            if (firstPixel + 1u < m_transferState.totalPixels)
-            {
-                const uint32_t secondPixel = firstPixel + 1u;
-                WriteVramUnlocked(dpsm, dbp, dbw,
-                                  dsax + (secondPixel % rrw),
-                                  m_transfer.trxpos.dsay + (secondPixel / rrw),
-                                  (packed >> 4u) & 0x0Fu);
-            }
-            advancePixel(std::min<uint32_t>(2u, m_transferState.totalPixels - firstPixel));
-            break;
-        }
-        default:
-            return;
-        }
-    }
+    GSTransfer::UploadImage(m_vram, m_transfer, m_transferState, data, sizeBytes);
 }
 
 void GSCpuBackend::PerformLocalToLocalTransfer()
 {
-    if (!m_vram)
-        return;
-
-    const uint32_t rrw = m_transfer.trxreg.rrw;
-    const uint32_t rrh = m_transfer.trxreg.rrh;
-    const uint32_t total = rrw * rrh;
-    if (total == 0u)
-    {
-        m_transferState.direction = 3u;
-        return;
-    }
-
-    for (uint32_t pixel = 0; pixel < total; ++pixel)
-    {
-        uint32_t x = pixel % rrw;
-        uint32_t y = pixel / rrw;
-        if ((m_transfer.trxpos.dir & 0x2u) != 0u)
-            x = rrw - x - 1u;
-        if ((m_transfer.trxpos.dir & 0x1u) != 0u)
-            y = rrh - y - 1u;
-
-        const uint32_t value = ReadVramUnlocked(m_transfer.bitbltbuf.spsm,
-                                                m_transfer.bitbltbuf.sbp,
-                                                std::max<uint32_t>(m_transfer.bitbltbuf.sbw, 1u),
-                                                x + m_transfer.trxpos.ssax,
-                                                y + m_transfer.trxpos.ssay);
-        WriteVramUnlocked(m_transfer.bitbltbuf.dpsm,
-                          m_transfer.bitbltbuf.dbp,
-                          std::max<uint32_t>(m_transfer.bitbltbuf.dbw, 1u),
-                          x + m_transfer.trxpos.dsax,
-                          y + m_transfer.trxpos.dsay,
-                          value);
-    }
-
-    m_transferState.copiedPixels = total;
-    m_transferState.direction = 3u;
+    GSTransfer::LocalToLocal(m_vram, m_transfer, m_transferState);
 }
 
 void GSCpuBackend::PerformLocalToHostTransfer()
 {
-    m_localToHostBuffer.clear();
-    m_localToHostReadPos = 0u;
-    if (!m_vram)
-        return;
-
-    const uint32_t rrw = m_transfer.trxreg.rrw;
-    const uint32_t rrh = m_transfer.trxreg.rrh;
-    const uint32_t sbw = std::max<uint32_t>(m_transfer.bitbltbuf.sbw, 1u);
-    const uint8_t spsm = m_transfer.bitbltbuf.spsm;
-    const uint32_t bpp = static_cast<uint32_t>(GSMem::BitsPerPixel(static_cast<GSMem::PixelStorageMode>(spsm)));
-    const uint32_t total = rrw * rrh;
-    m_localToHostBuffer.reserve((static_cast<size_t>(total) * bpp + 7u) / 8u);
-
-    for (uint32_t pixel = 0u; pixel < total; ++pixel)
-    {
-        const uint32_t x = pixel % rrw;
-        const uint32_t y = pixel / rrw;
-        const uint32_t value = ReadVramUnlocked(spsm,
-                                                m_transfer.bitbltbuf.sbp,
-                                                sbw,
-                                                x + m_transfer.trxpos.ssax,
-                                                y + m_transfer.trxpos.ssay);
-        switch (bpp)
-        {
-        case 32:
-            m_localToHostBuffer.push_back(static_cast<uint8_t>(value));
-            m_localToHostBuffer.push_back(static_cast<uint8_t>(value >> 8u));
-            m_localToHostBuffer.push_back(static_cast<uint8_t>(value >> 16u));
-            m_localToHostBuffer.push_back(static_cast<uint8_t>(value >> 24u));
-            break;
-        case 24:
-            m_localToHostBuffer.push_back(static_cast<uint8_t>(value));
-            m_localToHostBuffer.push_back(static_cast<uint8_t>(value >> 8u));
-            m_localToHostBuffer.push_back(static_cast<uint8_t>(value >> 16u));
-            break;
-        case 16:
-            m_localToHostBuffer.push_back(static_cast<uint8_t>(value));
-            m_localToHostBuffer.push_back(static_cast<uint8_t>(value >> 8u));
-            break;
-        case 8:
-            m_localToHostBuffer.push_back(static_cast<uint8_t>(value));
-            break;
-        case 4:
-        {
-            if ((pixel & 1u) != 0u)
-                break;
-            uint32_t next = 0u;
-            if (pixel + 1u < total)
-            {
-                const uint32_t nextPixel = pixel + 1u;
-                const uint32_t nextX = nextPixel % rrw;
-                const uint32_t nextY = nextPixel / rrw;
-                next = ReadVramUnlocked(spsm, m_transfer.bitbltbuf.sbp, sbw,
-                                        nextX + m_transfer.trxpos.ssax,
-                                        nextY + m_transfer.trxpos.ssay);
-            }
-            m_localToHostBuffer.push_back(static_cast<uint8_t>((value & 0x0Fu) | ((next & 0x0Fu) << 4u)));
-            break;
-        }
-        default:
-            break;
-        }
-    }
-
-    m_transferState.copiedPixels = total;
-    m_transferState.localToHostPendingBytes = m_localToHostBuffer.size();
+    GSTransfer::LocalToHost(m_vram, m_transfer, m_transferState, m_localToHostBuffer, m_localToHostReadPos);
 }
 
 uint32_t GSCpuBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
@@ -4324,72 +3995,8 @@ bool GSCpuBackend::CopyFrameToHostRgba(const GSFrameReg &frame,
                                        uint32_t sourceOriginX,
                                        uint32_t sourceOriginY) const
 {
-    if (!m_vram || m_vramSize == 0u)
-        return false;
-
-    outPixels.assign(kHostFrameWidth * kHostFrameHeight * 4u, 0u);
-    const uint32_t baseBytes = frameBaseIsPages ? frame.fbp * 8192u : frame.fbp * 256u;
-    const uint32_t basePtr = frameBaseIsPages ? GSInternal::framePageBaseToBlock(frame.fbp) : frame.fbp;
-    const uint32_t fbw = frame.fbw ? frame.fbw : kHostFrameWidth / 64u;
-    const uint32_t bytesPerPixel = (frame.psm == GS_PSM_CT16 || frame.psm == GS_PSM_CT16S) ? 2u : 4u;
-    const uint32_t stride = fbw * 64u * bytesPerPixel;
-
-    for (uint32_t y = 0; y < height; ++y)
-    {
-        uint8_t *dst = outPixels.data() + y * kHostFrameWidth * 4u;
-        for (uint32_t x = 0; x < width; ++x)
-        {
-            const uint32_t sx = sourceOriginX + x;
-            const uint32_t sy = sourceOriginY + y;
-            if (frame.psm == GS_PSM_CT32 || frame.psm == GS_PSM_CT24)
-            {
-                uint32_t color = 0u;
-                if (useLocalMemoryLayout)
-                    color = ReadVramUnlocked(frame.psm, basePtr, fbw, sx, sy);
-                else
-                {
-                    const uint32_t pixelBytes = frame.psm == GS_PSM_CT24 ? 3u : 4u;
-                    const uint64_t offset = static_cast<uint64_t>(baseBytes) + static_cast<uint64_t>(sy) * stride + static_cast<uint64_t>(sx) * pixelBytes;
-                    if (offset + pixelBytes > m_vramSize)
-                        return false;
-                    color = m_vram[offset] | (static_cast<uint32_t>(m_vram[offset + 1u]) << 8u) |
-                            (static_cast<uint32_t>(m_vram[offset + 2u]) << 16u);
-                    if (pixelBytes == 4u)
-                        color |= static_cast<uint32_t>(m_vram[offset + 3u]) << 24u;
-                }
-                dst[x * 4u] = static_cast<uint8_t>(color);
-                dst[x * 4u + 1u] = static_cast<uint8_t>(color >> 8u);
-                dst[x * 4u + 2u] = static_cast<uint8_t>(color >> 16u);
-                dst[x * 4u + 3u] = preserveAlpha && frame.psm != GS_PSM_CT24 ? static_cast<uint8_t>(color >> 24u) : 255u;
-            }
-            else if (frame.psm == GS_PSM_CT16 || frame.psm == GS_PSM_CT16S)
-            {
-                uint16_t color = 0u;
-                if (useLocalMemoryLayout)
-                    color = static_cast<uint16_t>(ReadVramUnlocked(frame.psm, basePtr, fbw, sx, sy));
-                else
-                {
-                    const uint64_t offset = static_cast<uint64_t>(baseBytes) + static_cast<uint64_t>(sy) * stride + static_cast<uint64_t>(sx) * 2u;
-                    if (offset + 2u > m_vramSize)
-                        return false;
-                    std::memcpy(&color, m_vram + offset, sizeof(color));
-                }
-                const uint32_t r = color & 31u;
-                const uint32_t g = (color >> 5u) & 31u;
-                const uint32_t b = (color >> 10u) & 31u;
-                dst[x * 4u] = static_cast<uint8_t>((r << 3u) | (r >> 2u));
-                dst[x * 4u + 1u] = static_cast<uint8_t>((g << 3u) | (g >> 2u));
-                dst[x * 4u + 2u] = static_cast<uint8_t>((b << 3u) | (b >> 2u));
-                dst[x * 4u + 3u] = preserveAlpha ? ((color & 0x8000u) ? 0x80u : 0u) : 255u;
-            }
-            else
-            {
-                outPixels.clear();
-                return false;
-            }
-        }
-    }
-    return true;
+    return GSPresent::CopyFrameFromMemory(m_vram, m_vramSize, frame, width, height, outPixels, preserveAlpha,
+                                          useLocalMemoryLayout, frameBaseIsPages, sourceOriginX, sourceOriginY);
 }
 
 PresentationFrame GSCpuBackend::Present(const GSPresentationRequest &request)
@@ -4435,122 +4042,14 @@ PresentationFrame GSCpuBackend::Present(const GSPresentationRequest &request)
 
 PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationRequest &request)
 {
-    PresentationFrame result{};
-    const GSPmodeState pmode = decodePmode(request.pmode);
-    const GSSmode2State smode2 = decodeSMode2(request.smode2);
-    const bool fieldMode = smode2.interlaced && !smode2.frameMode;
-    const bool oddField = (request.vsyncTick & 1ull) != 0ull;
-    const GSFrameReg displayFrame1 = decodeDisplayFrame(request.dispfb1);
-    const GSFrameReg displayFrame2 = decodeDisplayFrame(request.dispfb2);
-    const GSDisplayReadOrigin origin1 = decodeDisplayReadOrigin(request.dispfb1);
-    const GSDisplayReadOrigin origin2 = decodeDisplayReadOrigin(request.dispfb2);
-    uint32_t width1 = 0u, height1 = 0u, width2 = 0u, height2 = 0u;
-    decodeDisplaySize(request.display1, width1, height1);
-    decodeDisplaySize(request.display2, width2, height2);
-    const bool valid1 = pmode.enableCrt1 && hasDisplaySetup(request.display1, displayFrame1);
-    const bool valid2 = pmode.enableCrt2 && hasDisplaySetup(request.display2, displayFrame2);
-    if (!valid1 && !valid2)
-        return result;
-
-    auto copySource = [&](const GSFrameReg &displayFrame,
-                          const GSDisplayReadOrigin &origin,
-                          uint32_t width,
-                          uint32_t height,
-                          bool allowPreferred,
-                          bool preserveAlpha,
-                          GSFrameReg &selected,
-                          std::vector<uint8_t> &pixels,
-                          bool &usedPreferred) -> bool
-    {
-        selected = displayFrame;
-        pixels.clear();
-        usedPreferred = false;
-        if (allowPreferred && request.hasPreferredSource && request.preferredDestFbp == displayFrame.fbp &&
-            (request.preferredSource.fbw != 0u || request.preferredSource.fbp != displayFrame.fbp) &&
-            CopyFrameToHostRgba(request.preferredSource, width, height, pixels, preserveAlpha, true, false, 0u, 0u))
-        {
-            selected = request.preferredSource;
-            usedPreferred = true;
-        }
-        if (pixels.empty() && !CopyFrameToHostRgba(displayFrame, width, height, pixels, preserveAlpha, true, true, origin.x, origin.y))
-            return false;
-
-        if (!usedPreferred && displayFrame.fbp == 0u && countNonBlackPixels(pixels, width, height) == 0u)
-        {
-            for (const GSFrameReg &candidate : request.contextFrames)
-            {
-                if (candidate.fbp == selected.fbp && candidate.fbw == selected.fbw && candidate.psm == selected.psm)
-                    continue;
-                std::vector<uint8_t> candidatePixels;
-                if (!CopyFrameToHostRgba(candidate, width, height, candidatePixels, preserveAlpha, true, true, 0u, 0u))
-                    continue;
-                if (countNonBlackPixels(candidatePixels, width, height) == 0u)
-                    continue;
-                selected = candidate;
-                pixels.swap(candidatePixels);
-                break;
-            }
-        }
-        return true;
-    };
-
-    if (valid1 && valid2)
-    {
-        GSFrameReg selected1{}, selected2{};
-        std::vector<uint8_t> crt1, crt2;
-        bool preferred1 = false, preferred2 = false;
-        if (copySource(displayFrame1, origin1, width1, height1, false, true, selected1, crt1, preferred1) &&
-            copySource(displayFrame2, origin2, width2, height2, false, true, selected2, crt2, preferred2))
-        {
-            result.width = std::max(width1, width2);
-            result.height = std::max(height1, height2);
-            result.pixels.assign(kHostFrameWidth * kHostFrameHeight * 4u, 0u);
-            const uint8_t bgR = static_cast<uint8_t>(request.bgcolor);
-            const uint8_t bgG = static_cast<uint8_t>(request.bgcolor >> 8u);
-            const uint8_t bgB = static_cast<uint8_t>(request.bgcolor >> 16u);
-            for (uint32_t y = 0; y < result.height; ++y)
-                for (uint32_t x = 0; x < result.width; ++x)
-                {
-                    uint8_t *dst = result.pixels.data() + (y * kHostFrameWidth + x) * 4u;
-                    dst[0] = bgR;
-                    dst[1] = bgG;
-                    dst[2] = bgB;
-                    dst[3] = pmode.alp;
-                }
-            if (!pmode.slbg)
-                for (uint32_t y = 0; y < height2; ++y)
-                    std::memcpy(result.pixels.data() + y * kHostFrameWidth * 4u, crt2.data() + y * kHostFrameWidth * 4u, width2 * 4u);
-            for (uint32_t y = 0; y < height1; ++y)
-                for (uint32_t x = 0; x < width1; ++x)
-                {
-                    const uint8_t *src = crt1.data() + (y * kHostFrameWidth + x) * 4u;
-                    uint8_t *dst = result.pixels.data() + (y * kHostFrameWidth + x) * 4u;
-                    const uint32_t factor = pmode.mmod ? pmode.alp : std::min<uint32_t>(255u, static_cast<uint32_t>(src[3]) * 2u);
-                    dst[0] = blendPresentationChannel(src[0], dst[0], factor);
-                    dst[1] = blendPresentationChannel(src[1], dst[1], factor);
-                    dst[2] = blendPresentationChannel(src[2], dst[2], factor);
-                    dst[3] = pmode.amod ? dst[3] : src[3];
-                }
-            normalizePresentationAlpha(result.pixels, result.width, result.height);
-            if (fieldMode)
-                applyFieldPresentation(result.pixels, result.width, result.height, oddField);
-            result.displayFbp = displayFrame1.fbp;
-            result.sourceFbp = selected1.fbp;
-            return result;
-        }
-    }
-
-    const GSFrameReg &displayFrame = valid1 ? displayFrame1 : displayFrame2;
-    const GSDisplayReadOrigin &origin = valid1 ? origin1 : origin2;
-    result.width = valid1 ? width1 : width2;
-    result.height = valid1 ? height1 : height2;
-    GSFrameReg selected = displayFrame;
-    if (!copySource(displayFrame, origin, result.width, result.height, true, false, selected, result.pixels, result.usedPreferred))
-        return {};
-    if (fieldMode)
-        applyFieldPresentation(result.pixels, result.width, result.height, oddField);
-    normalizePresentationAlpha(result.pixels, result.width, result.height);
-    result.displayFbp = displayFrame.fbp;
-    result.sourceFbp = selected.fbp;
-    return result;
+    // The picture rules are shared with GSGpuBackend (gs_presentation.cpp); this renderer reads the
+    // frame buffers from its copy of GS memory.
+    return GSPresent::Compose(request,
+                              [this](const GSFrameReg &frame, uint32_t width, uint32_t height, std::vector<uint8_t> &pixels,
+                                     bool preserveAlpha, bool useLocalMemoryLayout, bool frameBaseIsPages,
+                                     uint32_t originX, uint32_t originY)
+                              {
+                                  return CopyFrameToHostRgba(frame, width, height, pixels, preserveAlpha, useLocalMemoryLayout,
+                                                             frameBaseIsPages, originX, originY);
+                              });
 }

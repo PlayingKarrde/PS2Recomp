@@ -407,6 +407,8 @@ add_library(ps2_runtime STATIC
     src/lib/gs/gs_frontend.cpp
     src/lib/gs/gs_cpu_backend.cpp
     src/lib/gs/gs_recording.cpp
+    src/lib/gs/ps2_gs_transfer.cpp
+    src/lib/gs/gs_presentation.cpp
     src/lib/ps2_iop_host.cpp
     src/lib/ps2_memory.cpp
     src/lib/ps2_pad.cpp
@@ -434,7 +436,9 @@ if(NOT PS2X_IS_VITA)
     # folder). Those two include directories are given to this one file only, not to ps2_runtime or
     # ps2_host_backend, so no other compile command changes.
     target_sources(ps2_runtime PRIVATE src/lib/ps2_host_gpu.cpp)
-    set_source_files_properties(src/lib/ps2_host_gpu.cpp PROPERTIES
+    # The GS GPU renderer (GSGpuBackend, M2) takes the same two include directories, for the same reason.
+    target_sources(ps2_runtime PRIVATE src/lib/gs/gs_gpu_backend.cpp)
+    set_source_files_properties(src/lib/ps2_host_gpu.cpp src/lib/gs/gs_gpu_backend.cpp PROPERTIES
         INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/src/lib;${CMAKE_CURRENT_SOURCE_DIR}")
 endif()
 

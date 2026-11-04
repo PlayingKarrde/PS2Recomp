@@ -1,4 +1,5 @@
 #include <array>
+#include <mutex>
 
 #include "runtime/gs/ps2_gs_memory.h"
 
@@ -201,7 +202,17 @@ namespace GSMem
     static P8PageLookupTable   PageTableP8{ };
     static P4PageLookupTable   PageTableP4{ };
 
+    void InitLookupTablesOnce();
+
+    // FPWR: safe to call from more than one place (GSCpuBackend and GSGpuBackend both need the tables, and
+    // either may be the only backend that exists): the first call fills them, later calls do nothing.
     void InitLookupTables()
+    {
+        static std::once_flag once;
+        std::call_once(once, []() { InitLookupTablesOnce(); });
+    }
+
+    void InitLookupTablesOnce()
     {
         // 32 bit
         PixelStorageTraits<C32>::InitPageLookupTable(PageTableC32, BlockTableC32, ColumnTable32);
