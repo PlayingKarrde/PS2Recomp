@@ -11,7 +11,9 @@
 #include "Kernel/Stubs/GS.h"
 #include "Kernel/Stubs/MPEG.h"
 #include "ps2_host_backend.h"
+#if defined(PLATFORM_VITA)
 #include <rlgl.h>
+#endif
 #include "ps2_iop_host.h"
 #include "ps2x/iop/iop_subsystem.h"
 
@@ -96,6 +98,8 @@ static HostScaleFilter hostScaleFilter()
     return s_filter;
 }
 
+#if defined(PLATFORM_VITA)
+// raylib shader for the Vita path only. Desktop builds use SDL_SCALEMODE_PIXELART instead.
 static const char *const kSharpScaleFragmentShader = R"(#version 330
 in vec2 fragTexCoord;
 in vec4 fragColor;
@@ -113,6 +117,7 @@ void main()
     finalColor = texture(texture0, (floor(texel) + offset) / textureSize) * colDiffuse * fragColor;
 }
 )";
+#endif
 
 struct ElfHeader
 {
@@ -567,7 +572,24 @@ namespace
     };
 }
 
-static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
+#if defined(PLATFORM_VITA)
+using HostFrameTexture = Texture2D;
+static void uploadHostPixels(HostFrameTexture &tex, const void *pixels)
+{
+    UpdateTexture(tex, pixels);
+}
+#else
+// The picture texture lives in the host layer (ps2_host_sdl.cpp); this only stands in for it.
+struct HostFrameTexture
+{
+};
+static void uploadHostPixels(HostFrameTexture &, const void *pixels)
+{
+    ps2x_host::updatePicture(pixels, FB_WIDTH * 4);
+}
+#endif
+
+static void UploadFrame(HostFrameTexture &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
 {
     static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
     static bool s_hasLatchedInitialFrame = false;
@@ -610,9 +632,19 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
                                                    &sourceFbp,
                                                    &usedPreferredDisplaySource))
     {
-        Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, MAGENTA);
-        UpdateTexture(tex, blank.data);
-        UnloadImage(blank);
+        static std::vector<uint8_t> s_magenta;
+        if (s_magenta.empty())
+        {
+            s_magenta.resize(static_cast<size_t>(FB_WIDTH) * FB_HEIGHT * 4u);
+            for (size_t i = 0; i < s_magenta.size(); i += 4u)
+            {
+                s_magenta[i + 0u] = 255u;
+                s_magenta[i + 1u] = 0u;
+                s_magenta[i + 2u] = 255u;
+                s_magenta[i + 3u] = 255u;
+            }
+        }
+        uploadHostPixels(tex, s_magenta.data());
         outWidth = FB_WIDTH;
         outHeight = DEFAULT_DISPLAY_HEIGHT;
         s_lastWidth = outWidth;
@@ -678,7 +710,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
         }
     }
 
-    UpdateTexture(tex, s_uploadBuffer.data());
+    uploadHostPixels(tex, s_uploadBuffer.data());
     outWidth = width;
     outHeight = outputHeight;
     s_lastOutputHeight = outputHeight;
@@ -689,11 +721,10 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
 namespace
 {
     std::atomic<ps2x::iop::IopSubsystem *> s_audioSubsystem{nullptr};
-    AudioStream s_spu2Stream{};
 
-    void mixSpu2Audio(void *buffer, unsigned int frames)
+    // Called on the host's audio thread: the SPU2 emulation fills the buffer.
+    void mixSpu2Audio(void *, int16_t *output, unsigned int frames)
     {
-        auto *output = static_cast<int16_t *>(buffer);
         if (ps2x::iop::IopSubsystem *subsystem = s_audioSubsystem.load())
             subsystem->mixAudio(output, frames);
         else
@@ -755,11 +786,13 @@ PS2Runtime::~PS2Runtime()
     {
         requestStop();
 #if !defined(PLATFORM_VITA)
-        if (IsAudioDeviceReady())
+        // The old sound effects hold streams on the audio device, so they go before the device does.
+        m_audioBackend.stopAll();
+        m_audioBackend.setAudioReady(false);
+        if (ps2x_host::audioReady())
         {
             s_audioSubsystem.store(nullptr);
-            StopAudioStream(s_spu2Stream);
-            UnloadAudioStream(s_spu2Stream);
+            ps2x_host::stopAudioStream();
         }
 #endif
         m_iopSubsystem.reset();
@@ -767,12 +800,6 @@ PS2Runtime::~PS2Runtime()
 #if defined(PLATFORM_VITA)
         m_audioBackend.stopAll();
         m_audioBackend.setAudioReady(false);
-#else
-        if (IsAudioDeviceReady())
-        {
-            CloseAudioDevice();
-            m_audioBackend.setAudioReady(false);
-        }
 #endif
         if (m_debugUiInitialized && m_debugUiShutdownCallback)
         {
@@ -780,10 +807,14 @@ PS2Runtime::~PS2Runtime()
             m_debugUiInitialized = false;
         }
 
+#if defined(PLATFORM_VITA)
         if (IsWindowReady())
         {
             CloseWindow();
         }
+#else
+        ps2x_host::destroyWindow();
+#endif
 
         m_loadedModules.clear();
     }
@@ -963,22 +994,26 @@ bool PS2Runtime::initialize(const char *title)
         }
 #if defined(PLATFORM_VITA)
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
-#else
-        SetConfigFlags(FLAG_WINDOW_RESIZABLE);
-        InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
-        InitAudioDevice();
-        m_audioBackend.setAudioReady(IsAudioDeviceReady());
-        if (IsAudioDeviceReady())
-        {
-            // The SPU2 is mixed on raylib's audio thread and pulled at the device's pace.
-            s_audioSubsystem.store(m_iopSubsystem.get());
-            SetAudioStreamBufferSizeDefault(1024);
-            s_spu2Stream = LoadAudioStream(48000, 16, 2);
-            SetAudioStreamCallback(s_spu2Stream, mixSpu2Audio);
-            PlayAudioStream(s_spu2Stream);
-        }
-#endif
         SetTargetFPS(60);
+#else
+        {
+            const HostScaleFilter filter = hostScaleFilter();
+            const ps2x_host::ScaleMode mode = filter == HostScaleFilter::Nearest    ? ps2x_host::ScaleMode::Nearest
+                                              : filter == HostScaleFilter::Bilinear ? ps2x_host::ScaleMode::Bilinear
+                                                                                    : ps2x_host::ScaleMode::Sharp;
+            if (!ps2x_host::createWindow(title, HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, mode))
+            {
+                std::cerr << "Failed to create the host window" << std::endl;
+                return false;
+            }
+        }
+        // The SPU2 is mixed on the host's audio thread and pulled at the device's pace.
+        s_audioSubsystem.store(m_iopSubsystem.get());
+        const bool audioStarted = ps2x_host::startAudioStream(mixSpu2Audio, nullptr);
+        m_audioBackend.setAudioReady(audioStarted);
+        if (!audioStarted)
+            s_audioSubsystem.store(nullptr);
+#endif
         if (m_debugUiInitCallback)
         {
             m_debugUiInitCallback(*this, m_debugUiUserData);
@@ -2598,6 +2633,7 @@ void PS2Runtime::run()
 
     RUNTIME_LOG("Starting execution at address 0x" << std::hex << m_cpuContext.pc << std::dec);
 
+#if defined(PLATFORM_VITA)
     // A blank image to use as a framebuffer
     Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, BLANK);
     Texture2D frameTex = LoadTextureFromImage(blank);
@@ -2619,6 +2655,10 @@ void PS2Runtime::run()
         }
     }
     UnloadImage(blank);
+#else
+    // The picture texture was created with the window (ps2x_host::createWindow).
+    HostFrameTexture frameTex;
+#endif
 
     std::atomic<bool> gameThreadFinished{false};
 
@@ -2678,10 +2718,20 @@ void PS2Runtime::run()
 
             }
         });
+#if !defined(PLATFORM_VITA)
+        // Window, keyboard and controller events. A close request ends the run.
+        if (!ps2x_host::pumpEvents())
+        {
+            RUNTIME_LOG("[run] window close requested, breaking out of loop");
+            requestStop();
+            break;
+        }
+#endif
         uint32_t presentWidth = FB_WIDTH;
         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
         UploadFrame(frameTex, this, presentWidth, presentHeight);
 
+#if defined(PLATFORM_VITA)
         BeginDrawing();
         ClearBackground(BLACK);
         const float srcWidth = static_cast<float>(std::max<uint32_t>(1u, presentWidth));
@@ -2719,6 +2769,19 @@ void PS2Runtime::run()
             requestStop();
             break;
         }
+#else
+        // A TV stretches any display area to its own shape, 4:3 unless PS2X_ASPECT says otherwise.
+        const float aspect = hostDisplayAspect() > 0.0f
+                                 ? hostDisplayAspect()
+                                 : static_cast<float>(std::max<uint32_t>(1u, presentWidth)) /
+                                       static_cast<float>(std::max<uint32_t>(1u, presentHeight));
+        ps2x_host::drawPicture(static_cast<int>(presentWidth), static_cast<int>(presentHeight), aspect);
+        if (m_debugUiInitialized && m_debugUiDrawCallback)
+        {
+            m_debugUiDrawCallback(*this, m_debugUiUserData);
+        }
+        ps2x_host::presentAndPace();
+#endif
     }
 
     requestStop();
@@ -2732,10 +2795,14 @@ void PS2Runtime::run()
         m_debugUiShutdownCallback(*this, m_debugUiUserData);
         m_debugUiInitialized = false;
     }
+#if defined(PLATFORM_VITA)
     if (sharpScaleReady)
         UnloadShader(sharpScale);
     UnloadTexture(frameTex);
     CloseWindow();
+#else
+    ps2x_host::destroyWindow();
+#endif
 
     RUNTIME_LOG("[run] exiting loop");
 }

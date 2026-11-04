@@ -4,64 +4,9 @@
 #include <cstring>
 #include <vector>
 
-namespace
-{
-    std::vector<uint8_t> buildWavFromPcm(const int16_t *pcm, size_t sampleCount, uint32_t sampleRate)
-    {
-        const uint32_t dataSize = static_cast<uint32_t>(sampleCount * 2);
-        const uint32_t fileSize = 36 + dataSize;
-        std::vector<uint8_t> wav(8 + fileSize);
-
-        uint8_t *p = wav.data();
-        p[0] = 'R';
-        p[1] = 'I';
-        p[2] = 'F';
-        p[3] = 'F';
-        p[4] = static_cast<uint8_t>(fileSize);
-        p[5] = static_cast<uint8_t>(fileSize >> 8);
-        p[6] = static_cast<uint8_t>(fileSize >> 16);
-        p[7] = static_cast<uint8_t>(fileSize >> 24);
-        p[8] = 'W';
-        p[9] = 'A';
-        p[10] = 'V';
-        p[11] = 'E';
-        p[12] = 'f';
-        p[13] = 'm';
-        p[14] = 't';
-        p[15] = ' ';
-        p[16] = 16;
-        p[17] = 0;
-        p[18] = 0;
-        p[19] = 0;
-        p[20] = 1;
-        p[21] = 0;
-        p[22] = 1;
-        p[23] = 0;
-        p[24] = static_cast<uint8_t>(sampleRate);
-        p[25] = static_cast<uint8_t>(sampleRate >> 8);
-        p[26] = static_cast<uint8_t>(sampleRate >> 16);
-        p[27] = static_cast<uint8_t>(sampleRate >> 24);
-        const uint32_t byteRate = sampleRate * 2;
-        p[28] = static_cast<uint8_t>(byteRate);
-        p[29] = static_cast<uint8_t>(byteRate >> 8);
-        p[30] = static_cast<uint8_t>(byteRate >> 16);
-        p[31] = static_cast<uint8_t>(byteRate >> 24);
-        p[32] = 2;
-        p[33] = 0;
-        p[34] = 16;
-        p[35] = 0;
-        p[36] = 'd';
-        p[37] = 'a';
-        p[38] = 't';
-        p[39] = 'a';
-        p[40] = static_cast<uint8_t>(dataSize);
-        p[41] = static_cast<uint8_t>(dataSize >> 8);
-        p[42] = static_cast<uint8_t>(dataSize >> 16);
-        p[43] = static_cast<uint8_t>(dataSize >> 24);
-        std::memcpy(p + 44, pcm, dataSize);
-        return wav;
-    }
-}
+#if !defined(PLATFORM_VITA)
+#include <SDL3/SDL.h>
+#endif
 
 namespace ps2_vag
 {
@@ -71,11 +16,34 @@ namespace ps2_vag
 
 struct PS2AudioBackend::Impl
 {
+#if defined(PLATFORM_VITA)
     struct TrackedSound
     {
-        Sound snd;
         uint32_t sampleKey;
     };
+#else
+    // One SDL audio stream per sound, opened on the default playback device. It plays mono at the
+    // sample's own rate; the pitch is a frequency ratio on the stream.
+    struct TrackedSound
+    {
+        SDL_AudioStream *stream;
+        uint32_t sampleKey;
+    };
+
+    static bool isPlaying(const TrackedSound &sound)
+    {
+        return sound.stream && SDL_GetAudioStreamQueued(sound.stream) > 0;
+    }
+
+    static void release(TrackedSound &sound)
+    {
+        if (sound.stream)
+        {
+            SDL_DestroyAudioStream(sound.stream);
+            sound.stream = nullptr;
+        }
+    }
+#endif
     std::vector<TrackedSound> activeSounds;
 };
 
@@ -235,9 +203,9 @@ void PS2AudioBackend::pruneFinishedSounds()
     auto it = sounds.begin();
     while (it != sounds.end())
     {
-        if (!IsSoundPlaying(it->snd))
+        if (!Impl::isPlaying(*it))
         {
-            UnloadSound(it->snd);
+            Impl::release(*it);
             it = sounds.erase(it);
         }
         else
@@ -266,7 +234,7 @@ void PS2AudioBackend::playDecodedSample(uint32_t sampleKey, DecodedSample &sampl
 
     for (const auto &t : m_impl->activeSounds)
     {
-        if (t.sampleKey == sampleKey && IsSoundPlaying(t.snd))
+        if (t.sampleKey == sampleKey && Impl::isPlaying(t))
             return;
     }
 
@@ -275,10 +243,9 @@ void PS2AudioBackend::playDecodedSample(uint32_t sampleKey, DecodedSample &sampl
     {
         for (auto it = sounds.begin(); it != sounds.end();)
         {
-            if (IsSoundPlaying(it->snd))
+            if (Impl::isPlaying(*it))
             {
-                StopSound(it->snd);
-                UnloadSound(it->snd);
+                Impl::release(*it);
                 it = sounds.erase(it);
             }
             else
@@ -289,21 +256,24 @@ void PS2AudioBackend::playDecodedSample(uint32_t sampleKey, DecodedSample &sampl
     constexpr int kMaxConcurrentSounds = 4;
     while (static_cast<int>(sounds.size()) >= kMaxConcurrentSounds)
     {
-        StopSound(sounds.front().snd);
-        UnloadSound(sounds.front().snd);
+        Impl::release(sounds.front());
         sounds.erase(sounds.begin());
     }
 
-    std::vector<uint8_t> wav = buildWavFromPcm(sample.pcm.data(), sample.pcm.size(), sample.sampleRate);
-    Wave wave = LoadWaveFromMemory(".wav", wav.data(), static_cast<int>(wav.size()));
-    if (wave.frameCount <= 0)
+    SDL_AudioSpec spec{};
+    spec.format = SDL_AUDIO_S16;
+    spec.channels = 1;
+    spec.freq = static_cast<int>(sample.sampleRate);
+    SDL_AudioStream *stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, nullptr, nullptr);
+    if (!stream)
         return;
-    Sound snd = LoadSoundFromWave(wave);
-    UnloadWave(wave);
-    SetSoundPitch(snd, pitch);
-    SetSoundVolume(snd, volume);
-    m_impl->activeSounds.push_back({snd, sampleKey});
-    PlaySound(snd);
+    SDL_SetAudioStreamFrequencyRatio(stream, pitch > 0.0f ? pitch : 1.0f);
+    // raylib scaled every stereo sound by its centre-pan law, 0.6875 (see ps2_host_sdl.cpp).
+    SDL_SetAudioStreamGain(stream, volume * 0.6875f);
+    SDL_PutAudioStreamData(stream, sample.pcm.data(), static_cast<int>(sample.pcm.size() * sizeof(int16_t)));
+    SDL_FlushAudioStream(stream);
+    m_impl->activeSounds.push_back({stream, sampleKey});
+    SDL_ResumeAudioStreamDevice(stream);
 #endif
 }
 
@@ -319,10 +289,7 @@ void PS2AudioBackend::stopAll()
     return;
 #else
     for (auto &t : m_impl->activeSounds)
-    {
-        StopSound(t.snd);
-        UnloadSound(t.snd);
-    }
+        Impl::release(t);
     m_impl->activeSounds.clear();
 #endif
 }

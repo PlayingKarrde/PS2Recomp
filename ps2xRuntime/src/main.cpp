@@ -229,7 +229,7 @@ int main(int argc, char *argv[])
 
         PS2Runtime runtime;
 #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
-        // This hook is to prevent leak rlimgui deps to recompiler etc
+        // This hook keeps the debug panel (and ImGui) out of the recompiler and other tools
         PS2DebugPanel debugPanel;
         runtime.setDebugUiCallbacks(
             [](PS2Runtime &rt, void *userData)

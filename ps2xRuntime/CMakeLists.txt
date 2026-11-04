@@ -71,17 +71,54 @@ else()
     set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
     set(BUILD_GAMES OFF CACHE BOOL "" FORCE)
 
+    # SDL3 provides the window, picture presentation, input and audio on desktop. It is built from
+    # source and linked statically. The tag is the newest release that was at least 30 days old when
+    # it was chosen (release-3.4.18, published 2026-10-02). SDL_SCALEMODE_PIXELART needs 3.4.0 or later.
+    # PS2X_SDL3_SOURCE_DIR points at an existing checkout, so a second build tree does not clone again.
+    set(PS2X_SDL3_SOURCE_DIR "" CACHE PATH "Use this SDL3 checkout instead of cloning release-3.4.18")
+    set(SDL_TESTS OFF CACHE BOOL "" FORCE)
+    set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
+    set(SDL_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(SDL_INSTALL OFF CACHE BOOL "" FORCE)
     if(PS2X_IS_ANDROID)
-        set(PLATFORM "Android" CACHE STRING "" FORCE)
+        # Untested: SDL on Android has to be a shared library loaded by its Java activity.
+        set(SDL_SHARED ON CACHE BOOL "" FORCE)
+        set(SDL_STATIC OFF CACHE BOOL "" FORCE)
+        set(PS2X_SDL3_TARGET SDL3::SDL3-shared)
+    else()
+        set(SDL_SHARED OFF CACHE BOOL "" FORCE)
+        set(SDL_STATIC ON CACHE BOOL "" FORCE)
+        set(PS2X_SDL3_TARGET SDL3::SDL3-static)
     endif()
 
-    FetchContent_Declare(
-        raylib
-        GIT_REPOSITORY "https://github.com/raysan5/raylib.git"
-        GIT_TAG "5.5" # we will migrate to 4.2.0 later, trust me it will be better
-        GIT_PROGRESS TRUE
-    )
-    FetchContent_MakeAvailable(raylib)
+    if(UNIX AND NOT APPLE AND NOT ANDROID)
+        # SDL3 stops configuring when an optional X11 extension library is missing. These two only
+        # cover screensaver control and an input-injection helper, and docs/bringup.md's package list
+        # has neither libxss-dev nor libxtst-dev, so build without them when their headers are absent.
+        find_path(PS2X_XSS_HEADER X11/extensions/scrnsaver.h)
+        if(NOT PS2X_XSS_HEADER)
+            message(STATUS "libxss-dev not found: SDL3 is built without X11 screensaver support")
+            set(SDL_X11_XSCRNSAVER OFF CACHE BOOL "" FORCE)
+        endif()
+        find_path(PS2X_XTEST_HEADER X11/extensions/XTest.h)
+        if(NOT PS2X_XTEST_HEADER)
+            message(STATUS "libxtst-dev not found: SDL3 is built without X11 XTest support")
+            set(SDL_X11_XTEST OFF CACHE BOOL "" FORCE)
+        endif()
+    endif()
+
+    if(PS2X_SDL3_SOURCE_DIR)
+        FetchContent_Declare(SDL3 SOURCE_DIR "${PS2X_SDL3_SOURCE_DIR}")
+    else()
+        FetchContent_Declare(
+            SDL3
+            GIT_REPOSITORY "https://github.com/libsdl-org/SDL.git"
+            GIT_TAG "release-3.4.18"
+            GIT_SHALLOW TRUE
+            GIT_PROGRESS TRUE
+        )
+    endif()
+    FetchContent_MakeAvailable(SDL3)
 
     if(PS2X_ENABLE_DEBUG_UI AND NOT PS2X_IS_ANDROID)
         FetchContent_Declare(
@@ -104,28 +141,12 @@ else()
             "${PS2X_IMGUI_SOURCE_DIR}/imgui_tables.cpp"
             "${PS2X_IMGUI_SOURCE_DIR}/imgui_widgets.cpp"
             "${PS2X_IMGUI_SOURCE_DIR}/imgui_demo.cpp"
+            # ImGui's own SDL3 backends: events and platform window from SDL, drawing through SDL_Renderer.
+            "${PS2X_IMGUI_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp"
+            "${PS2X_IMGUI_SOURCE_DIR}/backends/imgui_impl_sdlrenderer3.cpp"
         )
-        target_include_directories(imgui PUBLIC "${PS2X_IMGUI_SOURCE_DIR}")
-
-        FetchContent_Declare(
-            rlImGui
-            GIT_REPOSITORY https://github.com/raylib-extras/rlImGui.git
-            GIT_TAG "Raylib_5_5"
-            GIT_SHALLOW TRUE
-        )
-        FetchContent_GetProperties(rlImGui)
-
-        if(NOT rlimgui_POPULATED)
-            FetchContent_Populate(rlImGui)
-        endif()
-
-        set(PS2X_RLIMGUI_SOURCE_DIR "${rlimgui_SOURCE_DIR}")
-
-        add_library(rlImGui STATIC
-            "${PS2X_RLIMGUI_SOURCE_DIR}/rlImGui.cpp"
-        )
-        target_include_directories(rlImGui PUBLIC "${PS2X_RLIMGUI_SOURCE_DIR}")
-        target_link_libraries(rlImGui PUBLIC raylib imgui)
+        target_include_directories(imgui PUBLIC "${PS2X_IMGUI_SOURCE_DIR}" "${PS2X_IMGUI_SOURCE_DIR}/backends")
+        target_link_libraries(imgui PUBLIC ${PS2X_SDL3_TARGET})
     endif()
 endif()
 
@@ -235,7 +256,7 @@ if(PS2X_IS_VITA)
         pthread
     )
 else()
-    target_link_libraries(ps2_host_backend INTERFACE raylib)
+    target_link_libraries(ps2_host_backend INTERFACE ${PS2X_SDL3_TARGET})
 
     if(PS2X_IS_ANDROID)
         target_link_libraries(ps2_host_backend INTERFACE log android)
@@ -397,6 +418,12 @@ add_library(ps2_runtime STATIC
     src/lib/games_database.cpp
 )
 
+if(NOT PS2X_IS_VITA)
+    # Window, picture, input and audio output on SDL3. The Vita build keeps its raylib code in
+    # ps2_runtime.cpp and does not compile this file.
+    target_sources(ps2_runtime PRIVATE src/lib/ps2_host_sdl.cpp)
+endif()
+
 if(PS2X_ENABLE_RUNTIME_LOGS)
     target_compile_definitions(ps2_runtime PUBLIC
         PS2_RUNTIME_LOGS=1
@@ -470,7 +497,7 @@ if(PS2X_ENABLE_RUNNER_UNITY_BUILD)
     )
 endif()
 
-# The crash reporter includes windows.h, which clashes with raylib's names, so it is compiled alone.
+# The crash reporter includes windows.h, so it is compiled alone.
 set(RUNNER_CRASH_REPORT_CPP "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/zzz_crash_report.cpp")
 if(EXISTS "${RUNNER_CRASH_REPORT_CPP}")
     set_source_files_properties("${RUNNER_CRASH_REPORT_CPP}" PROPERTIES
@@ -528,11 +555,11 @@ target_link_libraries(ps2EntryRunner
 )
 
 if(PS2X_ENABLE_DEBUG_UI AND NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
-    target_sources(ps2EntryRunner PRIVATE
-        src/lib/ps2_debug_panel.cpp
-    )
-    target_link_libraries(ps2EntryRunner PRIVATE rlImGui imgui)
-    target_compile_definitions(ps2EntryRunner PRIVATE PS2X_ENABLE_DEBUG_UI=1)
+    # The panel is its own library, so editing it does not rebuild a unity batch of generated code.
+    add_library(ps2_debug_panel STATIC src/lib/ps2_debug_panel.cpp)
+    target_link_libraries(ps2_debug_panel PUBLIC ps2_runtime imgui)
+    target_compile_definitions(ps2_debug_panel PUBLIC PS2X_ENABLE_DEBUG_UI=1)
+    target_link_libraries(ps2EntryRunner PRIVATE ps2_debug_panel)
 endif()
 
 ps2x_stage_ffmpeg_runtime_dlls(ps2EntryRunner)
@@ -585,11 +612,6 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebI
             )
         endif()
     endif()
-endif()
-
-# Work around WinAPI vs raylib symbol clash for CloseWindow on x64
-if(MSVC)
-    target_link_options(ps2EntryRunner PRIVATE "/FORCE:MULTIPLE")
 endif()
 
 # Vita: Work around for GCC 10's LTO plugin

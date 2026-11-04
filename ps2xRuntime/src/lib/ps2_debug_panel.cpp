@@ -12,8 +12,11 @@
 
 #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
 #include "imgui.h"
-#include "rlImGui.h"
-#include "raylib.h"
+#include "imgui_impl_sdl3.h"
+#include "imgui_impl_sdlrenderer3.h"
+#include "ps2_host_backend.h"
+#include <SDL3/SDL.h>
+#include <atomic>
 #endif
 
 #include <algorithm>
@@ -33,6 +36,16 @@
 namespace
 {
 #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
+    // Set while the panel is on screen. Only then are SDL events passed to ImGui, because ImGui
+    // keeps every event until its next frame and the panel draws no frames while hidden.
+    std::atomic<bool> s_panelShown{false};
+
+    void forwardEventToImGui(const void *sdlEvent)
+    {
+        if (s_panelShown.load(std::memory_order_relaxed))
+            ImGui_ImplSDL3_ProcessEvent(static_cast<const SDL_Event *>(sdlEvent));
+    }
+
     const char *threadStatusName(EeThreadStatus status)
     {
         switch (status)
@@ -2181,7 +2194,18 @@ void PS2DebugPanel::initialize()
 #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
     if (!m_initialized)
     {
-        rlImGuiSetup(true);
+        auto *window = static_cast<SDL_Window *>(ps2x_host::nativeWindow());
+        auto *renderer = static_cast<SDL_Renderer *>(ps2x_host::nativeRenderer());
+        if (!window || !renderer)
+        {
+            return;
+        }
+        IMGUI_CHECKVERSION();
+        ImGui::CreateContext();
+        ImGui::StyleColorsDark();
+        ImGui_ImplSDL3_InitForSDLRenderer(window, renderer);
+        ImGui_ImplSDLRenderer3_Init(renderer);
+        ps2x_host::setEventHook(&forwardEventToImGui);
         m_initialized = true;
         // Hidden until F1. It covers the picture and takes keyboard input from the game.
         const char *env = std::getenv("PS2X_DEBUG_PANEL");
@@ -2195,7 +2219,12 @@ void PS2DebugPanel::shutdown()
 #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
     if (m_initialized)
     {
-        rlImGuiShutdown();
+        ps2x_host::setEventHook(nullptr);
+        s_panelShown.store(false);
+        ps2x_host::setKeyboardCapturedByUi(false);
+        ImGui_ImplSDLRenderer3_Shutdown();
+        ImGui_ImplSDL3_Shutdown();
+        ImGui::DestroyContext();
         m_initialized = false;
     }
 #endif
@@ -2209,17 +2238,22 @@ void PS2DebugPanel::draw(PS2Runtime &runtime)
         return;
     }
 
-    if (IsKeyPressed(KEY_F1))
+    // F1 toggles the panel (one press, not while held). While it is showing, the game gets no keys.
+    if (ps2x_host::keyPressed(ps2x_host::Key::F1, ps2x_host::ReaderUi))
     {
         toggleVisible();
     }
+    ps2x_host::setKeyboardCapturedByUi(m_visible);
+    s_panelShown.store(m_visible, std::memory_order_relaxed);
 
     if (!m_visible)
     {
         return;
     }
 
-    rlImGuiBegin();
+    ImGui_ImplSDLRenderer3_NewFrame();
+    ImGui_ImplSDL3_NewFrame();
+    ImGui::NewFrame();
 
     ImGui::SetNextWindowSize(ImVec2(780.0f, 620.0f), ImGuiCond_FirstUseEver);
     if (ImGui::Begin("Runtime Debugger", &m_visible, ImGuiWindowFlags_MenuBar))
@@ -2306,7 +2340,8 @@ void PS2DebugPanel::draw(PS2Runtime &runtime)
     }
     ImGui::End();
 
-    rlImGuiEnd();
+    ImGui::Render();
+    ImGui_ImplSDLRenderer3_RenderDrawData(ImGui::GetDrawData(), static_cast<SDL_Renderer *>(ps2x_host::nativeRenderer()));
 #else
     (void)runtime;
 #endif

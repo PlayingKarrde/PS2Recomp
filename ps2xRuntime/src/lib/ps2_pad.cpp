@@ -25,7 +25,7 @@ namespace
     constexpr uint16_t PAD_L2 = 0x0100u;
 }
 
-bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t size)
+bool PSPadBackend::readState(int port, int /*slot*/, uint8_t *data, size_t size)
 {
     if (!data || size < 32)
         return false;
@@ -37,85 +37,103 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
     data[3] = 0xFF;
     data[4] = data[5] = data[6] = data[7] = kPadStickCenter;
 
+    using ps2x_host::Key;
+    using ps2x_host::PadAxis;
+    using ps2x_host::PadButton;
+    // Each pad port is its own reader, so a quick tap is seen once by each (see ps2_host_backend.h).
+    const int reader = (port == 1) ? ps2x_host::ReaderPort1 : ps2x_host::ReaderPort0;
     uint16_t btns = 0xFFFFu;
-    constexpr int kGamepad = 0;
-    const bool useGamepad = IsGamepadAvailable(kGamepad);
+    const bool useGamepad = ps2x_host::gamepadAvailable();
     auto clearBit = [&btns](uint16_t mask)
     { btns &= ~mask; };
+    auto key = [reader](Key k)
+    { return ps2x_host::keyDown(k, reader); };
+    auto pad = [reader](PadButton b)
+    { return ps2x_host::gamepadButtonDown(b, reader); };
 
     if (useGamepad)
     {
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_UP))
+        if (pad(PadButton::Up))
             clearBit(PAD_UP);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_DOWN))
+        if (pad(PadButton::Down))
             clearBit(PAD_DOWN);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_LEFT))
+        if (pad(PadButton::Left))
             clearBit(PAD_LEFT);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_RIGHT))
+        if (pad(PadButton::Right))
             clearBit(PAD_RIGHT);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_DOWN))
+        if (pad(PadButton::Cross))
             clearBit(PAD_CROSS);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_RIGHT))
+        if (pad(PadButton::Circle))
             clearBit(PAD_CIRCLE);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_LEFT))
+        if (pad(PadButton::Square))
             clearBit(PAD_SQUARE);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_UP))
+        if (pad(PadButton::Triangle))
             clearBit(PAD_TRIANGLE);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_TRIGGER_1))
+        if (pad(PadButton::L1))
             clearBit(PAD_L1);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_TRIGGER_1))
+        if (pad(PadButton::R1))
             clearBit(PAD_R1);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_TRIGGER_2))
+        if (pad(PadButton::L2))
             clearBit(PAD_L2);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_TRIGGER_2))
+        if (pad(PadButton::R2))
             clearBit(PAD_R2);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_MIDDLE_RIGHT))
+        if (pad(PadButton::Start))
             clearBit(PAD_START);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_MIDDLE_LEFT))
+        if (pad(PadButton::Select))
             clearBit(PAD_SELECT);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_THUMB))
+        if (pad(PadButton::L3))
             clearBit(PAD_L3);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_THUMB))
+        if (pad(PadButton::R3))
             clearBit(PAD_R3);
 
-        float lx = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_LEFT_X);
-        float ly = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_LEFT_Y);
-        float rx = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_RIGHT_X);
-        float ry = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_RIGHT_Y);
+        float lx = ps2x_host::gamepadAxis(PadAxis::LeftX);
+        float ly = ps2x_host::gamepadAxis(PadAxis::LeftY);
+        float rx = ps2x_host::gamepadAxis(PadAxis::RightX);
+        float ry = ps2x_host::gamepadAxis(PadAxis::RightY);
         data[6] = static_cast<uint8_t>(128 + lx * 127);
         data[7] = static_cast<uint8_t>(128 + ly * 127);
         data[4] = static_cast<uint8_t>(128 + rx * 127);
         data[5] = static_cast<uint8_t>(128 + ry * 127);
     }
 
-    // The keyboard stays live with a controller connected.
-    if (IsKeyDown(KEY_UP) || IsKeyDown(KEY_W))
+    // The keyboard stays live with a controller connected. Every key is asked about exactly once,
+    // so each one's latch is consumed once per read (a || would skip the second key and leave its
+    // latch set for later).
+    const bool up = key(Key::Up), w = key(Key::W);
+    const bool down = key(Key::Down), s = key(Key::S);
+    const bool left = key(Key::Left), a = key(Key::A);
+    const bool right = key(Key::Right), d = key(Key::D);
+    const bool x = key(Key::X), space = key(Key::Space);
+    const bool c = key(Key::C), escape = key(Key::Escape);
+    const bool z = key(Key::Z), kp0 = key(Key::Keypad0);
+    const bool v = key(Key::V), kp1 = key(Key::Keypad1);
+    if (up || w)
         clearBit(PAD_UP);
-    if (IsKeyDown(KEY_DOWN) || IsKeyDown(KEY_S))
+    if (down || s)
         clearBit(PAD_DOWN);
-    if (IsKeyDown(KEY_LEFT) || IsKeyDown(KEY_A))
+    if (left || a)
         clearBit(PAD_LEFT);
-    if (IsKeyDown(KEY_RIGHT) || IsKeyDown(KEY_D))
+    if (right || d)
         clearBit(PAD_RIGHT);
-    if (IsKeyDown(KEY_X) || IsKeyDown(KEY_SPACE))
+    if (x || space)
         clearBit(PAD_CROSS);
-    if (IsKeyDown(KEY_C) || IsKeyDown(KEY_ESCAPE))
+    if (c || escape)
         clearBit(PAD_CIRCLE);
-    if (IsKeyDown(KEY_Z) || IsKeyDown(KEY_KP_0))
+    if (z || kp0)
         clearBit(PAD_SQUARE);
-    if (IsKeyDown(KEY_V) || IsKeyDown(KEY_KP_1))
+    if (v || kp1)
         clearBit(PAD_TRIANGLE);
-    if (IsKeyDown(KEY_Q))
+    if (key(Key::Q))
         clearBit(PAD_L1);
-    if (IsKeyDown(KEY_E))
+    if (key(Key::E))
         clearBit(PAD_R1);
-    if (IsKeyDown(KEY_LEFT_SHIFT))
+    if (key(Key::LeftShift))
         clearBit(PAD_L2);
-    if (IsKeyDown(KEY_RIGHT_SHIFT))
+    if (key(Key::RightShift))
         clearBit(PAD_R2);
-    if (IsKeyDown(KEY_ENTER))
+    if (key(Key::Enter))
         clearBit(PAD_START);
-    if (IsKeyDown(KEY_TAB))
+    if (key(Key::Tab))
         clearBit(PAD_SELECT);
 
     data[2] = static_cast<uint8_t>(btns & 0xFF);
