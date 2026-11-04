@@ -1,9 +1,14 @@
 // The desktop host layer on SDL3: window, picture, keyboard and controller input, audio output.
 // See include/ps2_host_backend.h for what each function promises.
 //
+// Presenting the picture: by default through SDL_GPU (ps2_host_gpu.cpp). SDL_Renderer stays as a
+// fallback, used automatically when no SDL_GPU device can be created or the window cannot be claimed
+// for it (machines without Vulkan, Direct3D 12 or Metal). PS2X_PRESENT=gpu or PS2X_PRESENT=renderer
+// forces one of them; with "gpu" forced, a failure to set it up is an error, not a fallback.
+//
 // Threads:
-//  - The main thread owns the window and the renderer. It runs pumpEvents(), updatePicture(),
-//    drawPicture() and presentAndPace() once per host frame.
+//  - The main thread owns the window and the renderer (or the GPU device). It runs pumpEvents(),
+//    updatePicture(), drawPicture() and presentAndPace() once per host frame.
 //  - The game thread (the PS2's CPU) reads the pad while it runs. It never calls SDL: the main
 //    thread copies keyboard and controller state into atomics, and the game thread reads those.
 //  - SDL's audio thread calls audioCallback(), which asks the SPU2 emulation for samples.
@@ -16,6 +21,7 @@
 // arriving on the next screen.
 
 #include "ps2_host_backend.h"
+#include "ps2_host_gpu.h"
 
 #include <SDL3/SDL.h>
 #if defined(__linux__) && !defined(__ANDROID__)
@@ -241,11 +247,148 @@ namespace ps2x_host
         struct Video
         {
             SDL_Window *window = nullptr;
+            // Exactly one of these presents the picture: the SDL_GPU presenter (gpu), or the SDL_Renderer
+            // fallback (renderer and picture).
+            bool gpu = false;
             SDL_Renderer *renderer = nullptr;
             SDL_Texture *picture = nullptr;
             bool sdlVideoStarted = false;
             bool padSubsystemStarted = false;
         } g_video;
+
+        // ---- Opt-in timing of the main thread's presentation work (PS2X_PRESENT_STATS=1) ----
+        //
+        // Three phases per host frame, summed over one second and printed by reportStats():
+        //   update  - updatePicture(): getting the CPU picture to the presenter (once per game frame, not per host frame)
+        //   draw    - drawPicture(): clear and draw (SDL_Renderer only queues commands; the GPU presenter only
+        //             records the box)
+        //   present - presentAndPace() without the pacing wait: everything else the presenter does (the GPU
+        //             presenter's upload, render pass and submit; SDL_Renderer's flush and present)
+        // The debug panel's own drawing happens between draw and present and is not in the numbers.
+
+        struct PhaseTimer
+        {
+            uint64_t totalNs = 0;
+            uint64_t maxNs = 0;
+            uint32_t count = 0;
+            void add(uint64_t ns)
+            {
+                totalNs += ns;
+                maxNs = std::max(maxNs, ns);
+                ++count;
+            }
+            void clear() { *this = PhaseTimer{}; }
+        };
+        struct PresentStats
+        {
+            bool on = false;
+            PhaseTimer update, draw, present;
+        } g_presentStats;
+
+        // Adds the time spent in its scope to a PhaseTimer, if the stats are on.
+        class ScopedPhase
+        {
+        public:
+            explicit ScopedPhase(PhaseTimer &timer) : m_timer(timer), m_start(g_presentStats.on ? SDL_GetTicksNS() : 0) {}
+            ~ScopedPhase()
+            {
+                if (g_presentStats.on)
+                    m_timer.add(SDL_GetTicksNS() - m_start);
+            }
+            ScopedPhase(const ScopedPhase &) = delete;
+            ScopedPhase &operator=(const ScopedPhase &) = delete;
+
+        private:
+            PhaseTimer &m_timer;
+            uint64_t m_start;
+        };
+
+        // ---- Opt-in hooks for comparing presenters on identical pictures ----
+        //
+        // Nearly every game screen moves, so two runs never show the same picture, and the SDL_GPU and
+        // SDL_Renderer presenters cannot be compared screenshot against screenshot. These two variables let
+        // one real picture be captured and then shown by either presenter in a later run:
+        //   PS2X_PRESENT_DUMP=<file>   when the file <file>.go exists, write the picture being shown (the
+        //                              top-left srcWidth x srcHeight part of the picture texture, its shape,
+        //                              and all 640 x 512 RGBA pixels) to <file>, and delete <file>.go
+        //   PS2X_PRESENT_FRAME=<file>  ignore the game's pictures and show the one in <file> instead
+        // The file is: "PS2XPIC1", then little-endian uint32 srcWidth, srcHeight, float aspect, uint32 width, height
+        // (always 640, 512), then width x height x 4 RGBA bytes. Nothing else uses them.
+
+        struct PictureHooks
+        {
+            std::string dumpPath;
+            std::vector<uint8_t> lastPixels;
+            int lastWidth = 0, lastHeight = 0;
+            float lastAspect = 0.0f;
+            bool havePixels = false;
+
+            bool fixed = false;
+            std::vector<uint8_t> fixedPixels;
+            int fixedWidth = 0, fixedHeight = 0;
+            float fixedAspect = 0.0f;
+        } g_pictureHooks;
+
+        constexpr char kPictureFileMagic[8] = {'P', 'S', '2', 'X', 'P', 'I', 'C', '1'};
+
+        void loadPictureHooks()
+        {
+            if (const char *dump = std::getenv("PS2X_PRESENT_DUMP"))
+                g_pictureHooks.dumpPath = dump;
+            const char *frame = std::getenv("PS2X_PRESENT_FRAME");
+            if (!frame || !frame[0])
+                return;
+            std::FILE *file = std::fopen(frame, "rb");
+            char magic[8] = {};
+            uint32_t header[5] = {};
+            const size_t bytes = static_cast<size_t>(kPictureWidth) * kPictureHeight * 4u;
+            std::vector<uint8_t> pixels(bytes);
+            const bool ok = file && std::fread(magic, 1, 8, file) == 8 && std::memcmp(magic, kPictureFileMagic, 8) == 0 &&
+                            std::fread(header, sizeof(uint32_t), 5, file) == 5 && header[3] == kPictureWidth &&
+                            header[4] == kPictureHeight && std::fread(pixels.data(), 1, bytes, file) == bytes;
+            if (file)
+                std::fclose(file);
+            if (!ok)
+            {
+                std::fprintf(stderr, "[host] PS2X_PRESENT_FRAME=%s is not a usable picture file, ignored\n", frame);
+                return;
+            }
+            g_pictureHooks.fixedPixels = std::move(pixels);
+            g_pictureHooks.fixedWidth = static_cast<int>(header[0]);
+            g_pictureHooks.fixedHeight = static_cast<int>(header[1]);
+            std::memcpy(&g_pictureHooks.fixedAspect, &header[2], sizeof(float));
+            g_pictureHooks.fixed = true;
+            std::printf("[host] showing the fixed picture %s (%dx%d, aspect %.4f) instead of the game's\n",
+                        frame, g_pictureHooks.fixedWidth, g_pictureHooks.fixedHeight,
+                        static_cast<double>(g_pictureHooks.fixedAspect));
+        }
+
+        // Called from drawPicture(): writes the dump if its trigger file is there.
+        void maybeDumpPicture(int srcWidth, int srcHeight, float aspect)
+        {
+            if (g_pictureHooks.dumpPath.empty() || !g_pictureHooks.havePixels)
+                return;
+            const std::string trigger = g_pictureHooks.dumpPath + ".go";
+            std::FILE *probe = std::fopen(trigger.c_str(), "rb");
+            if (!probe)
+                return;
+            std::fclose(probe);
+            std::remove(trigger.c_str());
+            std::FILE *file = std::fopen(g_pictureHooks.dumpPath.c_str(), "wb");
+            if (!file)
+                return;
+            const uint32_t header[5] = {static_cast<uint32_t>(srcWidth), static_cast<uint32_t>(srcHeight), 0u,
+                                        static_cast<uint32_t>(kPictureWidth), static_cast<uint32_t>(kPictureHeight)};
+            uint32_t withAspect[5];
+            std::memcpy(withAspect, header, sizeof(withAspect));
+            std::memcpy(&withAspect[2], &aspect, sizeof(float));
+            std::fwrite(kPictureFileMagic, 1, 8, file);
+            std::fwrite(withAspect, sizeof(uint32_t), 5, file);
+            std::fwrite(g_pictureHooks.lastPixels.data(), 1, g_pictureHooks.lastPixels.size(), file);
+            std::fclose(file);
+            std::printf("[host] picture written to %s (%dx%d)\n", g_pictureHooks.dumpPath.c_str(), srcWidth, srcHeight);
+            std::fflush(stdout);
+        }
         std::atomic<bool> g_quitRequested{false};
         std::atomic<void (*)(const void *)> g_eventHook{nullptr};
 
@@ -337,7 +480,8 @@ namespace ps2x_host
                 const char *value = std::getenv("PS2X_INPUT_STATS");
                 return value && value[0] == '1';
             }();
-            if (!audio && !input)
+            const bool presenting = g_presentStats.on;
+            if (!audio && !input && !presenting)
                 return;
             static uint64_t lastMs = SDL_GetTicks();
             const uint64_t now = SDL_GetTicks();
@@ -360,6 +504,22 @@ namespace ps2x_host
                             static_cast<double>(now) / 1000.0, static_cast<unsigned long long>(frames), peak, rms, callbacks,
                             minRequest == 0xFFFFFFFFu ? 0u : minRequest / 4u, maxRequest / 4u,
                             minQueued == 0xFFFFFFFFu ? 0u : minQueued / 4u, maxQueued / 4u);
+            }
+            if (presenting)
+            {
+                const PhaseTimer update = g_presentStats.update;
+                const PhaseTimer draw = g_presentStats.draw;
+                const PhaseTimer present = g_presentStats.present;
+                g_presentStats.update.clear();
+                g_presentStats.draw.clear();
+                g_presentStats.present.clear();
+                auto avgMs = [](const PhaseTimer &t) { return t.count ? static_cast<double>(t.totalNs) / t.count / 1e6 : 0.0; };
+                auto maxMs = [](const PhaseTimer &t) { return static_cast<double>(t.maxNs) / 1e6; };
+                const double perFrameMs = present.count ? static_cast<double>(update.totalNs + draw.totalNs + present.totalNs) / present.count / 1e6 : 0.0;
+                std::printf("[present:stats] t=%.1fs presenter=%s host_frames=%u pictures=%u update_ms avg=%.3f max=%.3f "
+                            "draw_ms avg=%.3f max=%.3f present_ms avg=%.3f max=%.3f main_thread_ms_per_frame=%.3f (over %.1fs)\n",
+                            static_cast<double>(now) / 1000.0, g_video.gpu ? "gpu" : "renderer", present.count, update.count,
+                            avgMs(update), maxMs(update), avgMs(draw), maxMs(draw), avgMs(present), maxMs(present), perFrameMs, seconds);
             }
             if (input)
             {
@@ -550,7 +710,7 @@ namespace ps2x_host
 
     bool windowReady()
     {
-        return g_video.window != nullptr && g_video.renderer != nullptr;
+        return g_video.window != nullptr && (g_video.gpu || g_video.renderer != nullptr);
     }
 
     bool createWindow(const char *title, int width, int height, ScaleMode scale)
@@ -586,42 +746,84 @@ namespace ps2x_host
             destroyWindow();
             return false;
         }
-        g_video.renderer = SDL_CreateRenderer(g_video.window, nullptr);
-        if (!g_video.renderer)
+        // Which presenter: SDL_GPU unless told otherwise, with SDL_Renderer as the fallback.
+        const char *wanted = std::getenv("PS2X_PRESENT");
+        const bool forceRenderer = wanted && std::strcmp(wanted, "renderer") == 0;
+        const bool forceGpu = wanted && std::strcmp(wanted, "gpu") == 0;
+        if (wanted && !forceRenderer && !forceGpu)
+            std::fprintf(stderr, "[host] PS2X_PRESENT=%s is not gpu or renderer, ignored\n", wanted);
+        if (!forceRenderer)
         {
-            std::fprintf(stderr, "[host] could not create the renderer: %s\n", SDL_GetError());
-            destroyWindow();
-            return false;
+            std::string failure;
+            if (gpu_present::create(g_video.window, scale, failure))
+            {
+                g_video.gpu = true;
+            }
+            else if (forceGpu)
+            {
+                std::fprintf(stderr, "[host] PS2X_PRESENT=gpu but the SDL_GPU presenter could not start: %s\n", failure.c_str());
+                destroyWindow();
+                return false;
+            }
+            else
+            {
+                std::printf("[host] SDL_GPU is not available (%s); presenting through SDL_Renderer instead\n", failure.c_str());
+                std::fflush(stdout);
+            }
         }
-        SDL_SetRenderVSync(g_video.renderer, 0); // the host loop paces itself at 60 Hz
-        g_video.picture = SDL_CreateTexture(g_video.renderer, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STREAMING,
-                                            kPictureWidth, kPictureHeight);
-        if (!g_video.picture)
+        std::string presenterText;
+        if (g_video.gpu)
         {
-            std::fprintf(stderr, "[host] could not create the picture texture: %s\n", SDL_GetError());
-            destroyWindow();
-            return false;
+            presenterText = gpu_present::describe();
         }
-        // The old build drew the picture with alpha blending over a black clear.
-        SDL_SetTextureBlendMode(g_video.picture, SDL_BLENDMODE_BLEND);
-        SDL_ScaleMode mode = SDL_SCALEMODE_PIXELART;
-        if (scale == ScaleMode::Nearest)
-            mode = SDL_SCALEMODE_NEAREST;
-        else if (scale == ScaleMode::Bilinear)
-            mode = SDL_SCALEMODE_LINEAR;
-        if (!SDL_SetTextureScaleMode(g_video.picture, mode))
+        else
         {
-            // Same fallback as the old shader: smooth scaling if the sharp mode is unavailable.
-            std::fprintf(stderr, "[host] scale mode not available (%s), using bilinear\n", SDL_GetError());
-            SDL_SetTextureScaleMode(g_video.picture, SDL_SCALEMODE_LINEAR);
+            g_video.renderer = SDL_CreateRenderer(g_video.window, nullptr);
+            if (!g_video.renderer)
+            {
+                std::fprintf(stderr, "[host] could not create the renderer: %s\n", SDL_GetError());
+                destroyWindow();
+                return false;
+            }
+            SDL_SetRenderVSync(g_video.renderer, 0); // the host loop paces itself at 60 Hz
+            g_video.picture = SDL_CreateTexture(g_video.renderer, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STREAMING,
+                                                kPictureWidth, kPictureHeight);
+            if (!g_video.picture)
+            {
+                std::fprintf(stderr, "[host] could not create the picture texture: %s\n", SDL_GetError());
+                destroyWindow();
+                return false;
+            }
+            // The old build drew the picture with alpha blending over a black clear.
+            SDL_SetTextureBlendMode(g_video.picture, SDL_BLENDMODE_BLEND);
+            SDL_ScaleMode mode = SDL_SCALEMODE_PIXELART;
+            if (scale == ScaleMode::Nearest)
+                mode = SDL_SCALEMODE_NEAREST;
+            else if (scale == ScaleMode::Bilinear)
+                mode = SDL_SCALEMODE_LINEAR;
+            if (!SDL_SetTextureScaleMode(g_video.picture, mode))
+            {
+                // Same fallback as the old shader: smooth scaling if the sharp mode is unavailable.
+                std::fprintf(stderr, "[host] scale mode not available (%s), using bilinear\n", SDL_GetError());
+                SDL_SetTextureScaleMode(g_video.picture, SDL_SCALEMODE_LINEAR);
+            }
+            presenterText = std::string("renderer ") + SDL_GetRendererName(g_video.renderer);
         }
+        {
+            const char *stats = std::getenv("PS2X_PRESENT_STATS");
+            g_presentStats.on = stats && stats[0] == '1';
+        }
+        loadPictureHooks();
 
         int windowW = 0, windowH = 0, pixelW = 0, pixelH = 0;
         SDL_GetWindowSize(g_video.window, &windowW, &windowH);
-        SDL_GetCurrentRenderOutputSize(g_video.renderer, &pixelW, &pixelH);
-        std::printf("[host] SDL %d.%d.%d, video driver %s, renderer %s, window %dx%d (render output %dx%d), scale %s\n",
+        if (g_video.gpu)
+            SDL_GetWindowSizeInPixels(g_video.window, &pixelW, &pixelH);
+        else
+            SDL_GetCurrentRenderOutputSize(g_video.renderer, &pixelW, &pixelH);
+        std::printf("[host] SDL %d.%d.%d, video driver %s, presenter %s, window %dx%d (render output %dx%d), scale %s\n",
                     SDL_MAJOR_VERSION, SDL_MINOR_VERSION, SDL_MICRO_VERSION, SDL_GetCurrentVideoDriver(),
-                    SDL_GetRendererName(g_video.renderer), windowW, windowH, pixelW, pixelH,
+                    presenterText.c_str(), windowW, windowH, pixelW, pixelH,
                     scale == ScaleMode::Sharp ? "sharp (SDL_SCALEMODE_PIXELART)" : (scale == ScaleMode::Nearest ? "nearest" : "bilinear"));
         std::fflush(stdout);
         return true;
@@ -629,12 +831,16 @@ namespace ps2x_host
 
     void destroyWindow()
     {
+        // The GPU device releases its claim on the window, so it goes first.
+        if (g_video.gpu || gpu_present::active())
+            gpu_present::destroy();
         if (g_video.picture)
             SDL_DestroyTexture(g_video.picture);
         if (g_video.renderer)
             SDL_DestroyRenderer(g_video.renderer);
         if (g_video.window)
             SDL_DestroyWindow(g_video.window);
+        g_video.gpu = false;
         g_video.picture = nullptr;
         g_video.renderer = nullptr;
         g_video.window = nullptr;
@@ -665,12 +871,48 @@ namespace ps2x_host
 
     void updatePicture(const void *rgbaPixels, int pitchBytes)
     {
-        if (g_video.picture && rgbaPixels)
+        if (g_pictureHooks.fixed)
+        {
+            rgbaPixels = g_pictureHooks.fixedPixels.data();
+            pitchBytes = kPictureWidth * 4;
+        }
+        else if (!g_pictureHooks.dumpPath.empty() && rgbaPixels)
+        {
+            // Keep a copy of what is being shown, for maybeDumpPicture().
+            g_pictureHooks.lastPixels.resize(static_cast<size_t>(kPictureWidth) * kPictureHeight * 4u);
+            for (int y = 0; y < kPictureHeight; ++y)
+                std::memcpy(g_pictureHooks.lastPixels.data() + static_cast<size_t>(y) * kPictureWidth * 4u,
+                            static_cast<const uint8_t *>(rgbaPixels) + static_cast<size_t>(y) * static_cast<size_t>(pitchBytes),
+                            static_cast<size_t>(kPictureWidth) * 4u);
+            g_pictureHooks.havePixels = true;
+        }
+        ScopedPhase timing(g_presentStats.update);
+        if (g_video.gpu)
+            gpu_present::stagePicture(rgbaPixels, pitchBytes);
+        else if (g_video.picture && rgbaPixels)
             SDL_UpdateTexture(g_video.picture, nullptr, rgbaPixels, pitchBytes);
     }
 
     void drawPicture(int srcWidth, int srcHeight, float aspect)
     {
+        if (g_pictureHooks.fixed)
+        {
+            srcWidth = g_pictureHooks.fixedWidth;
+            srcHeight = g_pictureHooks.fixedHeight;
+            aspect = g_pictureHooks.fixedAspect;
+        }
+        else
+        {
+            maybeDumpPicture(srcWidth, srcHeight, aspect);
+        }
+        ScopedPhase timing(g_presentStats.draw);
+        if (g_video.gpu)
+        {
+            // The GPU presenter draws everything in presentAndPace(), after the debug panel has said what it
+            // wants on top; here it only learns where the box goes.
+            gpu_present::setPictureBox(srcWidth, srcHeight, aspect);
+            return;
+        }
         if (!g_video.renderer || !g_video.picture)
             return;
         SDL_SetRenderDrawColor(g_video.renderer, 0, 0, 0, 255);
@@ -692,8 +934,13 @@ namespace ps2x_host
 
     void presentAndPace()
     {
-        if (g_video.renderer)
-            SDL_RenderPresent(g_video.renderer);
+        {
+            ScopedPhase timing(g_presentStats.present);
+            if (g_video.gpu)
+                gpu_present::present();
+            else if (g_video.renderer)
+                SDL_RenderPresent(g_video.renderer);
+        }
         reportStats();
         pace();
     }
@@ -705,7 +952,7 @@ namespace ps2x_host
 
     void *nativeRenderer()
     {
-        return g_video.renderer;
+        return g_video.renderer; // null while the SDL_GPU presenter is in use; see gpuDevice() in ps2_host_gpu.h
     }
 
     void setEventHook(void (*hook)(const void *))

@@ -13,8 +13,10 @@
 #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
 #include "imgui.h"
 #include "imgui_impl_sdl3.h"
+#include "imgui_impl_sdlgpu3.h"
 #include "imgui_impl_sdlrenderer3.h"
 #include "ps2_host_backend.h"
+#include "ps2_host_gpu.h"
 #include <SDL3/SDL.h>
 #include <atomic>
 #endif
@@ -39,6 +41,22 @@ namespace
     // Set while the panel is on screen. Only then are SDL events passed to ImGui, because ImGui
     // keeps every event until its next frame and the panel draws no frames while hidden.
     std::atomic<bool> s_panelShown{false};
+
+    // True when the host presents through SDL_GPU (ImGui's sdlgpu3 backend, drawn in the host's render
+    // pass), false for the SDL_Renderer fallback (ImGui's sdlrenderer3 backend, drawn immediately).
+    bool s_usesGpu = false;
+
+    // The two halves of drawing ImGui into the host's frame under SDL_GPU: the backend must upload its
+    // vertex data before the render pass starts, and record its draw calls inside it.
+    void gpuOverlayPrepare(SDL_GPUCommandBuffer *commandBuffer, void *)
+    {
+        ImGui_ImplSDLGPU3_PrepareDrawData(ImGui::GetDrawData(), commandBuffer);
+    }
+
+    void gpuOverlayDraw(SDL_GPUCommandBuffer *commandBuffer, SDL_GPURenderPass *renderPass, void *)
+    {
+        ImGui_ImplSDLGPU3_RenderDrawData(ImGui::GetDrawData(), commandBuffer, renderPass);
+    }
 
     void forwardEventToImGui(const void *sdlEvent)
     {
@@ -2196,15 +2214,29 @@ void PS2DebugPanel::initialize()
     {
         auto *window = static_cast<SDL_Window *>(ps2x_host::nativeWindow());
         auto *renderer = static_cast<SDL_Renderer *>(ps2x_host::nativeRenderer());
-        if (!window || !renderer)
+        SDL_GPUDevice *gpuDevice = ps2x_host::gpuDevice();
+        if (!window || (!renderer && !gpuDevice))
         {
             return;
         }
         IMGUI_CHECKVERSION();
         ImGui::CreateContext();
         ImGui::StyleColorsDark();
-        ImGui_ImplSDL3_InitForSDLRenderer(window, renderer);
-        ImGui_ImplSDLRenderer3_Init(renderer);
+        s_usesGpu = gpuDevice != nullptr;
+        if (s_usesGpu)
+        {
+            ImGui_ImplSDL3_InitForSDLGPU(window);
+            ImGui_ImplSDLGPU3_InitInfo gpuInfo;
+            gpuInfo.Device = gpuDevice;
+            gpuInfo.ColorTargetFormat = ps2x_host::gpuSwapchainFormat();
+            gpuInfo.MSAASamples = SDL_GPU_SAMPLECOUNT_1;
+            ImGui_ImplSDLGPU3_Init(&gpuInfo);
+        }
+        else
+        {
+            ImGui_ImplSDL3_InitForSDLRenderer(window, renderer);
+            ImGui_ImplSDLRenderer3_Init(renderer);
+        }
         ps2x_host::setEventHook(&forwardEventToImGui);
         m_initialized = true;
         // Hidden until F1. It covers the picture and takes keyboard input from the game.
@@ -2222,7 +2254,16 @@ void PS2DebugPanel::shutdown()
         ps2x_host::setEventHook(nullptr);
         s_panelShown.store(false);
         ps2x_host::setKeyboardCapturedByUi(false);
-        ImGui_ImplSDLRenderer3_Shutdown();
+        if (s_usesGpu)
+        {
+            // The last frame's draw calls may still be running on the GPU.
+            SDL_WaitForGPUIdle(ps2x_host::gpuDevice());
+            ImGui_ImplSDLGPU3_Shutdown();
+        }
+        else
+        {
+            ImGui_ImplSDLRenderer3_Shutdown();
+        }
         ImGui_ImplSDL3_Shutdown();
         ImGui::DestroyContext();
         m_initialized = false;
@@ -2251,7 +2292,14 @@ void PS2DebugPanel::draw(PS2Runtime &runtime)
         return;
     }
 
-    ImGui_ImplSDLRenderer3_NewFrame();
+    if (s_usesGpu)
+    {
+        ImGui_ImplSDLGPU3_NewFrame();
+    }
+    else
+    {
+        ImGui_ImplSDLRenderer3_NewFrame();
+    }
     ImGui_ImplSDL3_NewFrame();
     ImGui::NewFrame();
 
@@ -2341,7 +2389,18 @@ void PS2DebugPanel::draw(PS2Runtime &runtime)
     ImGui::End();
 
     ImGui::Render();
-    ImGui_ImplSDLRenderer3_RenderDrawData(ImGui::GetDrawData(), static_cast<SDL_Renderer *>(ps2x_host::nativeRenderer()));
+    if (s_usesGpu)
+    {
+        // The host records the panel into the same render pass as the picture, in present().
+        ps2x_host::GpuOverlay overlay;
+        overlay.prepare = &gpuOverlayPrepare;
+        overlay.draw = &gpuOverlayDraw;
+        ps2x_host::setGpuOverlay(overlay);
+    }
+    else
+    {
+        ImGui_ImplSDLRenderer3_RenderDrawData(ImGui::GetDrawData(), static_cast<SDL_Renderer *>(ps2x_host::nativeRenderer()));
+    }
 #else
     (void)runtime;
 #endif

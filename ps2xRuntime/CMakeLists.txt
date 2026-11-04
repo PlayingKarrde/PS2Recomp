@@ -141,8 +141,10 @@ else()
             "${PS2X_IMGUI_SOURCE_DIR}/imgui_tables.cpp"
             "${PS2X_IMGUI_SOURCE_DIR}/imgui_widgets.cpp"
             "${PS2X_IMGUI_SOURCE_DIR}/imgui_demo.cpp"
-            # ImGui's own SDL3 backends: events and platform window from SDL, drawing through SDL_Renderer.
+            # ImGui's own SDL3 backends: events and platform window from SDL, drawing through SDL_GPU (the
+            # host's default presenter) or SDL_Renderer (its fallback).
             "${PS2X_IMGUI_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp"
+            "${PS2X_IMGUI_SOURCE_DIR}/backends/imgui_impl_sdlgpu3.cpp"
             "${PS2X_IMGUI_SOURCE_DIR}/backends/imgui_impl_sdlrenderer3.cpp"
         )
         target_include_directories(imgui PUBLIC "${PS2X_IMGUI_SOURCE_DIR}" "${PS2X_IMGUI_SOURCE_DIR}/backends")
@@ -426,6 +428,14 @@ if(NOT PS2X_IS_VITA)
     # SDL_GPU shader loader for the compiled blobs in shaders/compiled/ (see shaders/build_shaders.py).
     # Nothing the generated game code includes refers to it.
     target_sources(ps2_runtime PRIVATE src/lib/gpu/gpu_shaders.cpp)
+
+    # The SDL_GPU presenter that shows the picture and the debug panel (src/lib/ps2_host_gpu.h). Its compiled
+    # shaders include "gpu/gpu_shaders.h" (in src/lib) and are found as "shaders/compiled/..." (relative to this
+    # folder). Those two include directories are given to this one file only, not to ps2_runtime or
+    # ps2_host_backend, so no other compile command changes.
+    target_sources(ps2_runtime PRIVATE src/lib/ps2_host_gpu.cpp)
+    set_source_files_properties(src/lib/ps2_host_gpu.cpp PROPERTIES
+        INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/src/lib;${CMAKE_CURRENT_SOURCE_DIR}")
 endif()
 
 if(PS2X_ENABLE_RUNTIME_LOGS)
