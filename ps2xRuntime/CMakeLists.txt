@@ -422,6 +422,10 @@ if(NOT PS2X_IS_VITA)
     # Window, picture, input and audio output on SDL3. The Vita build keeps its raylib code in
     # ps2_runtime.cpp and does not compile this file.
     target_sources(ps2_runtime PRIVATE src/lib/ps2_host_sdl.cpp)
+
+    # SDL_GPU shader loader for the compiled blobs in shaders/compiled/ (see shaders/build_shaders.py).
+    # Nothing the generated game code includes refers to it.
+    target_sources(ps2_runtime PRIVATE src/lib/gpu/gpu_shaders.cpp)
 endif()
 
 if(PS2X_ENABLE_RUNTIME_LOGS)

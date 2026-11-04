@@ -125,6 +125,35 @@ if(PS2X_BUILD_GS_REPLAY)
     endif()
 endif()
 
+# ps2x_gpu_smoke checks the SDL_GPU shader toolchain: the HLSL shaders in ps2xRuntime/shaders, compiled
+# offline into the committed headers in shaders/compiled/, are loaded by SDL_GPU and draw a test scene.
+# It links the runtime library for the shader loader (src/lib/gpu/gpu_shaders.cpp) and SDL, but no generated
+# game code, and nothing in the game's build refers to it (the game is configured with PS2X_BUILD_TEST=OFF).
+option(PS2X_BUILD_GPU_SMOKE "Build ps2x_gpu_smoke, the SDL_GPU shader toolchain smoke test" ON)
+if(PS2X_BUILD_GPU_SMOKE)
+    add_executable(ps2x_gpu_smoke
+        gpu_smoke/gpu_smoke_main.cpp
+        $<TARGET_OBJECTS:ps2_test_function_table>
+    )
+    target_include_directories(ps2x_gpu_smoke PRIVATE
+        ${CMAKE_SOURCE_DIR}/ps2xRuntime/include
+        # "gpu/gpu_shaders.h" lives in src/lib; "shaders/compiled/*.h" is relative to ps2xRuntime.
+        # These are added here, not to ps2_runtime, so the game's compile commands do not change.
+        ${CMAKE_SOURCE_DIR}/ps2xRuntime/src/lib
+        ${CMAKE_SOURCE_DIR}/ps2xRuntime
+    )
+    target_link_libraries(ps2x_gpu_smoke PRIVATE ps2_runtime)
+    if(UNIX AND NOT APPLE)
+        target_link_libraries(ps2x_gpu_smoke PRIVATE ${CMAKE_DL_LIBS})
+    endif()
+    if(COMMAND ps2x_stage_ffmpeg_runtime_dlls)
+        ps2x_stage_ffmpeg_runtime_dlls(ps2x_gpu_smoke)
+    endif()
+    if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
+        EnableFastReleaseMode(ps2x_gpu_smoke)
+    endif()
+endif()
+
 if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
     EnableFastReleaseMode(ps2_test_lib)
     EnableFastReleaseMode(ps2x_tests)
