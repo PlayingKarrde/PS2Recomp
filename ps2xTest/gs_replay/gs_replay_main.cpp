@@ -5,6 +5,7 @@
 //                         [--png-dir D] [--png-every N] [--diff-dir D] [--diff-worst N] [--diff-every N]
 //                         [--json F] [--threads N] [--defer 0|1] [--hashes F] [--max-markers N]
 //                         [--drop-state LIST] [--info] [--presents]
+//                         [--direct [--direct-every N] [--direct-dir D]]
 //
 // How it works. The recording starts at a presentation marker with the whole GS memory and the
 // backend's other state. The player loads that into a fresh backend, then makes every call the game
@@ -19,11 +20,20 @@
 // than 2 (and the largest difference); it reports mean, median, 95th percentile and the worst frame per
 // clip, and writes the CPU, GPU and an amplified difference picture for the worst frames (--diff-dir).
 //
+// --direct (with --backend gpu) also runs the GPU renderer's direct presentation path (path B, see
+// gs_gpu_present.h) next to its readback path (path A): at each marker the picture the runtime would get
+// from path A is rebuilt the way UploadFrame does it (the CPU GSFieldDeinterlacer), the picture path B
+// builds on the GPU is downloaded, and the two are compared byte for byte. --direct-every N consumes only
+// every Nth marker, as a host that cannot keep up with the game does. --direct-dir D writes the pictures of
+// the first differing markers.
+//
 // Exit code: 0 when everything that could be checked matched (with --compare also: the pictures are
 // within the thresholds below), 1 when something did not, 2 on usage errors or a file that cannot be read.
 
 #include "runtime/gs/gs_cpu_backend.h"
+#include "runtime/gs/gs_field_deinterlacer.h"
 #include "runtime/gs/gs_gpu_backend.h"
+#include "runtime/gs/gs_gpu_present.h"
 #include "runtime/gs/gs_recording.h"
 #include "../common/png_write.h"
 
@@ -85,6 +95,10 @@ namespace
         std::string dropState; // debugging: start without part of the recorded backend state
         bool info = false;
         bool presents = false;
+        bool direct = false;
+        bool noFields = false;
+        uint32_t directEvery = 1;
+        std::string directDir;
         bool states = false;
         int onlyState = -1;     // debugging: draw only primitives of this recorded state id
         int skipState = -1;     // debugging: skip primitives of this recorded state id
@@ -97,6 +111,7 @@ namespace
                      "                             [--png-dir D] [--png-every N] [--diff-dir D] [--diff-worst N] [--diff-every N]\n"
                      "                             [--json F] [--threads N] [--defer 0|1] [--hashes F] [--max-markers N]\n"
                      "                             [--drop-state LIST] [--info] [--presents]\n"
+                     "                             [--direct [--direct-every N] [--direct-dir D]] [--no-fields]\n"
                      "  --backend B     the renderer to replay through: cpu (default) or gpu (SDL_GPU, headless)\n"
                      "  --compare       replay through both and measure how the pictures differ\n"
                      "  --driver D      SDL_GPU driver for the gpu renderer: vulkan, direct3d12 or metal (default: SDL picks)\n"
@@ -113,6 +128,12 @@ namespace
                      "  --max-markers N stop after N markers\n"
                      "  --drop-state L  debugging: start without part of the recorded backend state (comma list of\n"
                      "                  clut, pagecache, transfer) to see whether the replay still matches\n"
+                     "  --direct        with --backend gpu: also run the direct presentation path and compare its picture with the\n"
+                     "                  readback path's, byte for byte (see the top of this file)\n"
+                     "  --no-fields     the gpu renderer reads the frame targets when Present is called, as in M2, instead of\n"
+                     "                  using the field copies it takes at each marker\n"
+                     "  --direct-every N  consume only every Nth marker, as a slow host would (default 1)\n"
+                     "  --direct-dir D  write the pictures of the first differing markers to D\n"
                      "  --info          list the records in the file and stop\n"
                      "  --presents      list the distinct presentation requests in the file and stop\n");
     }
@@ -228,6 +249,26 @@ namespace
                 if (!v) return false;
                 o.dropState = v;
             }
+            else if (arg == "--direct")
+            {
+                o.direct = true;
+            }
+            else if (arg == "--no-fields")
+            {
+                o.noFields = true;
+            }
+            else if (arg == "--direct-every")
+            {
+                const char *v = value("--direct-every");
+                if (!v) return false;
+                o.directEvery = static_cast<uint32_t>(std::max(1l, std::strtol(v, nullptr, 10)));
+            }
+            else if (arg == "--direct-dir")
+            {
+                const char *v = value("--direct-dir");
+                if (!v) return false;
+                o.directDir = v;
+            }
             else if (arg == "--info")
             {
                 o.info = true;
@@ -293,6 +334,7 @@ namespace
         GSCpuBackend *cpu = nullptr;
         GSGpuBackend *gpu = nullptr;
         double seconds = 0.0; // time spent in calls (and the waits at markers)
+        double markSeconds = 0.0; // of which MarkPresentation alone
         uint64_t callChecks = 0, callMismatches = 0;
         std::vector<std::string> callProblems;
     };
@@ -386,6 +428,7 @@ namespace
             side.cpu->MarkPresentation(rec.request);
         else
             side.gpu->MarkPresentation(rec.request);
+        side.markSeconds += std::chrono::duration<double>(Clock::now() - t0).count();
         side.backend->Sync(GSSyncReason::Presentation); // waits until the drawer has copied VRAM / the GPU is done
         PresentationFrame frame = side.backend->Present(rec.request);
         side.seconds += std::chrono::duration<double>(Clock::now() - t0).count();
@@ -750,6 +793,37 @@ int main(int argc, char **argv)
         gpuSide.gpu = gpuBackend.get();
         gpuBackend->Initialize(gpuSide.vram.data(), static_cast<uint32_t>(gpuSide.vram.size()));
         gpuBackend->ImportRecordingState(start);
+        // The game's mode: the picture of a marker is the field copy taken at that marker.
+        if (!opt.noFields && !gpuBackend->SetFieldPublishing(true))
+        {
+            std::fprintf(stderr, "the GPU renderer could not publish field copies\n");
+            return 2;
+        }
+    }
+    std::unique_ptr<GSGpuPresenter> presenter;
+    GSFieldDeinterlacer readbackDeinterlacer; // what the runtime does with path A's pictures
+    uint64_t directCompared = 0, directDiffering = 0, directPixelsDiffering = 0, directMagenta = 0, directFieldPictures = 0;
+    int directMaxDiff = 0;
+    uint32_t directWritten = 0;
+    double directPullSeconds = 0.0, directRecordSeconds = 0.0;
+    if (opt.direct)
+    {
+        if (!useGpu)
+        {
+            std::fprintf(stderr, "--direct needs --backend gpu\n");
+            return 2;
+        }
+        if (opt.noFields)
+        {
+            std::fprintf(stderr, "--direct needs the field copies (do not use --no-fields)\n");
+            return 2;
+        }
+        presenter = std::make_unique<GSGpuPresenter>(*gpuBackend);
+        if (!presenter->Ready())
+        {
+            std::fprintf(stderr, "the direct presenter could not be set up\n");
+            return 2;
+        }
     }
 
     std::vector<Replayed> replayed; // the CPU side's when there is one, else the GPU's
@@ -819,6 +893,125 @@ int main(int argc, char **argv)
                 pictures[1] = toPicture(frame);
                 if (!useCpu && frame)
                     replayed[rec.marker].frameHash = GSRec::HashFrame(frame.pixels.data(), frame.width, frame.height, kStride * 4u);
+            }
+            if (presenter && rec.marker % opt.directEvery == opt.directEvery - 1u)
+            {
+                // Path A: the picture the runtime would have built from Present()'s pixels (UploadFrame in ps2_runtime.cpp).
+                std::vector<uint8_t> expected(static_cast<size_t>(kStride) * 512u * 4u, 0u);
+                const Picture &readback = pictures[1];
+                uint32_t pictureWidth = 640, pictureHeight = 448;
+                if (readback.pixels.empty())
+                {
+                    for (size_t i = 0; i < expected.size(); i += 4)
+                    {
+                        expected[i] = 255;
+                        expected[i + 2] = 255;
+                        expected[i + 3] = 255;
+                    }
+                    ++directMagenta;
+                }
+                else
+                {
+                    const uint32_t width = readback.width, height = readback.height;
+                    std::vector<uint8_t> packed(static_cast<size_t>(width) * height * 4u);
+                    for (uint32_t y = 0; y < height; ++y)
+                        std::memcpy(packed.data() + static_cast<size_t>(y) * width * 4u,
+                                    readback.pixels.data() + static_cast<size_t>(y) * kStride * 4u, static_cast<size_t>(width) * 4u);
+                    const bool fieldPictures = (rec.request.smode2 & 1ull) != 0ull && height != 0u && height * 2u <= 512u && width != 0u && width <= 640u;
+                    if (fieldPictures)
+                    {
+                        readbackDeinterlacer.process(packed.data(), width, height, expected.data(), static_cast<size_t>(kStride) * 4u);
+                        pictureHeight = height * 2u;
+                        ++directFieldPictures;
+                    }
+                    else
+                    {
+                        readbackDeinterlacer.reset();
+                        for (uint32_t y = 0; y < std::min<uint32_t>(height, 512u); ++y)
+                            std::memcpy(expected.data() + static_cast<size_t>(y) * kStride * 4u, packed.data() + static_cast<size_t>(y) * width * 4u,
+                                        static_cast<size_t>(std::min<uint32_t>(width, 640u)) * 4u);
+                        pictureHeight = height;
+                    }
+                    pictureWidth = width;
+                }
+                (void)pictureWidth;
+                (void)pictureHeight;
+
+                // Path B: the picture built on the GPU from the field the marker published.
+                const auto d0 = Clock::now();
+                presenter->Pull();
+                const auto d1 = Clock::now();
+                SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(gpuDevice);
+                presenter->Record(cmd);
+                SDL_SubmitGPUCommandBuffer(cmd);
+                presenter->Submitted();
+                const auto d2 = Clock::now();
+                directPullSeconds += std::chrono::duration<double>(d1 - d0).count();
+                directRecordSeconds += std::chrono::duration<double>(d2 - d1).count();
+                std::vector<uint8_t> got;
+                if (!presenter->Download(got))
+                {
+                    std::fprintf(stderr, "marker %u: the direct picture could not be downloaded\n", rec.marker);
+                    return 2;
+                }
+                ++directCompared;
+                if (std::getenv("PS2X_REPLAY_TRACE_DECISION"))
+                {
+                    const GSFieldDeinterlacer::Decision &cpuDecision = readbackDeinterlacer.lastDecision();
+                    uint64_t gpuLower = 0, gpuUpper = 0;
+                    bool gpuIsLower = false;
+                    presenter->DebugDecision(gpuLower, gpuUpper, gpuIsLower);
+                    std::printf("trace marker %u: CPU measured %d %lld/%lld %s | GPU %llu/%llu %s\n", rec.marker, cpuDecision.measured ? 1 : 0,
+                                static_cast<long long>(cpuDecision.lowerError), static_cast<long long>(cpuDecision.upperError),
+                                cpuDecision.lower ? "lower" : "upper", static_cast<unsigned long long>(gpuLower),
+                                static_cast<unsigned long long>(gpuUpper), gpuIsLower ? "lower" : "upper");
+                }
+                uint64_t different = 0;
+                int largest = 0;
+                for (size_t i = 0; i < expected.size(); i += 4)
+                {
+                    int worst = 0;
+                    for (int c = 0; c < 4; ++c)
+                        worst = std::max(worst, std::abs(static_cast<int>(expected[i + static_cast<size_t>(c)]) - static_cast<int>(got[i + static_cast<size_t>(c)])));
+                    largest = std::max(largest, worst);
+                    different += worst != 0 ? 1u : 0u;
+                }
+                if (different != 0)
+                {
+                    ++directDiffering;
+                    directPixelsDiffering += different;
+                    directMaxDiff = std::max(directMaxDiff, largest);
+                    if (directWritten < 4 && !opt.directDir.empty())
+                    {
+                        ++directWritten;
+                        Picture a, b, diff;
+                        a.pixels = expected;
+                        b.pixels = got;
+                        a.width = b.width = diff.width = 640;
+                        a.height = b.height = diff.height = 512;
+                        diff = makeDiffPicture(a, b);
+                        char name[96];
+                        std::snprintf(name, sizeof(name), "%s_m%05u_", clip.c_str(), rec.marker);
+                        const std::string base = opt.directDir + "/" + name;
+                        writePicture(base + "readback.png", a);
+                        writePicture(base + "direct.png", b);
+                        writePicture(base + "diff.png", diff);
+                    }
+                    if (directDiffering <= 5)
+                    {
+                        std::printf("  marker %u: direct picture differs from the readback path's in %llu pixels (largest channel difference %d)\n",
+                                    rec.marker, static_cast<unsigned long long>(different), largest);
+                        const GSFieldDeinterlacer::Decision &cpuDecision = readbackDeinterlacer.lastDecision();
+                        uint64_t gpuLower = 0, gpuUpper = 0;
+                        bool gpuIsLower = false;
+                        const bool gpuKnown = presenter->DebugDecision(gpuLower, gpuUpper, gpuIsLower);
+                        std::printf("    CPU deinterlacer: measured %d, lower error %lld, upper error %lld, answer %s | GPU: lower sum %llu, upper sum %llu, answer %s\n",
+                                    cpuDecision.measured ? 1 : 0, static_cast<long long>(cpuDecision.lowerError),
+                                    static_cast<long long>(cpuDecision.upperError), cpuDecision.lower ? "lower" : "upper",
+                                    static_cast<unsigned long long>(gpuLower), static_cast<unsigned long long>(gpuUpper),
+                                    gpuKnown ? (gpuIsLower ? "lower" : "upper") : "?");
+                    }
+                }
             }
             const Picture &shown = useCpu ? pictures[0] : pictures[1];
             replayed[rec.marker].width = shown.width;
@@ -998,6 +1191,23 @@ int main(int argc, char **argv)
     std::printf("settings: threads %s, defer %s%s%s\n", opt.threads >= 0 ? std::to_string(opt.threads).c_str() : "default",
                 opt.defer >= 0 ? std::to_string(opt.defer).c_str() : "default", opt.dropState.empty() ? "" : ", dropped state: ",
                 opt.dropState.c_str());
+    if (presenter)
+    {
+        const GSGpuBackend::Stats ds = gpuBackend->GetStats();
+        std::printf("direct path: compared %llu pictures (every %u marker%s; %llu field pictures, %llu magenta placeholders): %llu differ "
+                    "(%llu pixels in all, largest channel difference %d)\n",
+                    static_cast<unsigned long long>(directCompared), opt.directEvery, opt.directEvery == 1 ? "" : "s",
+                    static_cast<unsigned long long>(directFieldPictures), static_cast<unsigned long long>(directMagenta),
+                    static_cast<unsigned long long>(directDiffering), static_cast<unsigned long long>(directPixelsDiffering), directMaxDiff);
+        std::printf("direct path: fields published fast %llu (%llu with fallback frames), slow %llu, invalid %llu, dropped %llu; "
+                    "GS-side MarkPresentation %.3f ms per marker; host-side Pull %.3f ms, Record+submit %.3f ms per picture\n",
+                    static_cast<unsigned long long>(ds.fieldsFast), static_cast<unsigned long long>(ds.fieldsWithCandidates),
+                    static_cast<unsigned long long>(ds.fieldsSlow), static_cast<unsigned long long>(ds.fieldsInvalid),
+                    static_cast<unsigned long long>(ds.fieldsDropped),
+                    markers ? gpuSide.markSeconds * 1000.0 / static_cast<double>(markers) : 0.0,
+                    directCompared ? directPullSeconds * 1000.0 / static_cast<double>(directCompared) : 0.0,
+                    directCompared ? directRecordSeconds * 1000.0 / static_cast<double>(directCompared) : 0.0);
+    }
     const double gameRate = lastHostNs > firstHostNs ? static_cast<double>(markers - 1) * 1.0e9 / static_cast<double>(lastHostNs - firstHostNs) : 0.0;
 
     if (useCpu)
@@ -1171,7 +1381,7 @@ int main(int argc, char **argv)
         }
     }
 
-    bool failed = callMismatches != 0;
+    bool failed = callMismatches != 0 || directDiffering != 0;
     if (useCpu)
         failed = failed || frameMatched != frameChecked || dispMatched != dispChecked;
     if (!failed && useCpu && frameChecked + dispChecked == 0)
@@ -1186,6 +1396,7 @@ int main(int argc, char **argv)
     std::printf("%s\n", (failed || !pictureOk) ? "RESULT: MISMATCH" : (useCpu ? "RESULT: ok" : "RESULT: ok (pictures not compared)"));
     std::fflush(stdout);
 
+    presenter.reset();
     gpuBackend.reset();
     if (gpuDevice)
     {

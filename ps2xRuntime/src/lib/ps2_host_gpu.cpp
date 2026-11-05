@@ -12,6 +12,7 @@
 #include "ps2_host_gpu.h"
 
 #include "gpu/gpu_shaders.h"
+#include "runtime/gs/gs_gpu_threads.h"
 #include "shaders/compiled/present_frag.h"
 #include "shaders/compiled/present_vert.h"
 
@@ -57,6 +58,7 @@ namespace ps2x_host
             float boxAspect = 0.0f;
 
             GpuOverlay overlay;
+            PictureSource source; // set: the picture comes from the GS GPU renderer's texture, not from stagePicture()
             bool loggedProblem = false;
         };
         Presenter g;
@@ -99,6 +101,13 @@ namespace ps2x_host
         {
             const char *value = std::getenv(name);
             return value && value[0] == '1';
+        }
+
+        // PS2X_GPU_DEFRAG_GUARD=0 turns the Vulkan guard off (gs_gpu_threads.h), to show what it prevents.
+        bool envOff(const char *name)
+        {
+            const char *value = std::getenv(name);
+            return value && value[0] == '0';
         }
 
         // Reasons are collected into one string, which the caller prints with the fallback notice.
@@ -160,6 +169,7 @@ namespace ps2x_host
             color.clear_color = {0.0f, 0.0f, 0.0f, 1.0f};
             color.load_op = SDL_GPU_LOADOP_CLEAR;
             color.store_op = SDL_GPU_STOREOP_STORE;
+            ps2x_gs::DebugPassLock passLock; // validation only: see gs_gpu_threads.h
             SDL_GPURenderPass *pass = SDL_BeginGPURenderPass(commandBuffer, &color, 1, nullptr);
             if (!pass)
             {
@@ -236,12 +246,28 @@ namespace ps2x_host
             return g.device != nullptr && g.pipeline != nullptr;
         }
 
+        void setPictureSource(const PictureSource &source)
+        {
+            g.source = source;
+        }
+
+        bool hasPictureSource()
+        {
+            return g.source.record != nullptr;
+        }
+
+        bool downloadPicture(std::vector<uint8_t> &rgba)
+        {
+            return g.source.download && g.source.download(g.source.user, rgba);
+        }
+
         bool create(SDL_Window *window, ScaleMode scale, std::string &failure)
         {
             g = Presenter{};
             g.window = window;
             g.scale = scale;
             g.debugMode = envFlag("PS2X_GPU_DEBUG");
+            ps2x_gs::debugPassSerialization().store(g.debugMode); // the GS thread and this one both record render passes
 
             // All three shader formats are allowed so SDL can pick whichever driver the machine has: Vulkan
             // takes SPIR-V, Direct3D 12 takes DXIL, Metal takes MSL. SDL_GPU_DRIVER (SDL_HINT_GPU_DRIVER)
@@ -260,6 +286,9 @@ namespace ps2x_host
             if (!g.device)
                 return fail(failure, "SDL_CreateGPUDevice");
 
+            // SDL's Vulkan driver defragments memory inside a submit, racing with a release on the other thread (gs_gpu_threads.h).
+            if (const char *driver = SDL_GetGPUDeviceDriver(g.device))
+                ps2x_gs::defragGuardEnabled().store(std::strcmp(driver, "vulkan") == 0 && !envOff("PS2X_GPU_DEFRAG_GUARD"));
             if (!SDL_ClaimWindowForGPUDevice(g.device, window))
                 return fail(failure, "SDL_ClaimWindowForGPUDevice");
             g.windowClaimed = true;
@@ -369,6 +398,8 @@ namespace ps2x_host
                     SDL_ReleaseWindowFromGPUDevice(g.device, g.window);
                 SDL_DestroyGPUDevice(g.device);
             }
+            ps2x_gs::debugPassSerialization().store(false);
+            ps2x_gs::defragGuardEnabled().store(false);
             g = Presenter{};
         }
 
@@ -432,6 +463,7 @@ namespace ps2x_host
         {
             if (!active())
                 return;
+            ps2x_gs::DefragGuard window; // Vulkan only: held from here to the submit, see gs_gpu_threads.h
             SDL_GPUCommandBuffer *commandBuffer = SDL_AcquireGPUCommandBuffer(g.device);
             if (!commandBuffer)
             {
@@ -442,11 +474,21 @@ namespace ps2x_host
                 return;
             }
 
-            if (g.staged)
+            // The picture: built on the GPU by the GS renderer's presenter (path B), or the CPU picture uploaded here.
+            SDL_GPUTexture *picture = nullptr;
+            if (g.source.record)
             {
-                recordUpload(commandBuffer);
-                g.staged = false;
-                g.hasPicture = true;
+                picture = g.source.record(commandBuffer, g.source.user);
+            }
+            else
+            {
+                if (g.staged)
+                {
+                    recordUpload(commandBuffer);
+                    g.staged = false;
+                    g.hasPicture = true;
+                }
+                picture = g.hasPicture ? g.picture : nullptr;
             }
             if (g.overlay.prepare)
                 g.overlay.prepare(commandBuffer, g.overlay.user);
@@ -464,13 +506,18 @@ namespace ps2x_host
                 swapchain = nullptr;
             }
             if (swapchain && width != 0 && height != 0)
-                recordBlit(commandBuffer, swapchain, width, height, g.hasPicture ? g.picture : nullptr, kPictureWidth, kPictureHeight);
+                recordBlit(commandBuffer, swapchain, width, height, picture, kPictureWidth, kPictureHeight);
 
-            if (!SDL_SubmitGPUCommandBuffer(commandBuffer) && !g.loggedProblem)
+            const bool submitted = SDL_SubmitGPUCommandBuffer(commandBuffer);
+            window.Unlock();
+            if (!submitted && !g.loggedProblem)
             {
                 std::fprintf(stderr, "[host] SDL_SubmitGPUCommandBuffer failed: %s\n", SDL_GetError());
                 g.loggedProblem = true;
             }
+            // Only now may the GS thread reuse the field textures this frame's commands read.
+            if (g.source.submitted)
+                g.source.submitted(g.source.user);
             g.overlay = GpuOverlay{};
         }
     } // namespace gpu_present

@@ -3,6 +3,7 @@
 #include "ps2_runtime_macros.h"
 #include "ps2_log.h"
 #include "runtime/ee_scheduler.h"
+#include "runtime/gs/gs_gpu_host.h"
 
 #include <unordered_set>
 #include "Kernel/Syscalls/Helpers/State.h"
@@ -2310,6 +2311,14 @@ void PS2DebugPanel::draw(PS2Runtime &runtime)
         {
             ImGui::MenuItem("Registers", nullptr, &m_showRegisters);
             ImGui::EndMenuBar();
+        }
+
+        {
+            // With the GPU GS renderer, drawn pixels live on the GPU: the GS views here and the VRAM they snapshot hold
+            // only what the game uploaded.
+            const std::string note = ps2x_gs::debugPanelNote();
+            if (!note.empty())
+                ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f), "%s", note.c_str());
         }
 
         if (ImGui::BeginTabBar("debug-tabs"))

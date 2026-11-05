@@ -6,7 +6,34 @@
 //   Impl::Submit             primitive -> vertices (gs_gpu_math.h), draw grouping
 //   Impl::ResolveTexture     the texture cache (comment below)
 //   Impl::FlushLocked        one command buffer: uploads, then render passes, then submit
-//   Impl::Present            reads the displayed frame buffers back and composes the picture
+//   Impl::Present            reads the displayed frame buffers back and composes the picture (path A)
+//   Impl::produceField       copies the displayed region into a field texture and publishes it (path B)
+//
+// Field ring (path B). Two threads share five field textures, and neither may wait for the other (nor for
+// the GPU): the GS thread (the game's thread, which calls MarkPresentation) writes them, the host's main
+// thread reads them.
+//   - A slot is owned by the GS thread from acquireSlot() until it publishes it, by the consumer while
+//     its pin count is above zero, and otherwise it is free. Pins and the "latest" record change only
+//     under ringMutex, which is held for a few instructions and never across a GPU call. The slot the
+//     GS thread picks is never pinned and is not the latest one, and the consumer can only pin the latest
+//     slot (TakeNewestField) or one it already holds, so the two threads never touch one slot at once.
+//   - A field uses up to three slots (the displayed region and the two fallback frames). The consumer pins
+//     at most the slots of one field (it copies each field into textures of its own as soon as it draws it,
+//     so it does not keep slots as history), the latest published field's slots are kept, and the GS thread
+//     needs up to three for the next one: nine slots are enough for the worst case. If it still finds
+//     too few free, the field is dropped (fieldsDropped) rather than waiting.
+//   - The GPU side needs no fence. SDL_gpu.h: "Command buffers are executed in submission order. If you
+//     submit command buffer A and then command buffer B all commands in A will begin executing before
+//     any command in B begins executing." The GS thread submits the command buffer that writes a slot
+//     (SDL_SubmitGPUCommandBuffer, inside flushLocked) before it publishes the slot; the consumer reads
+//     the slot only after it has seen the publication, so its command buffer is submitted later and runs
+//     later. SDL puts the barriers between a texture's write and its later read (and between a read and a
+//     later overwrite) into the command buffers themselves. A slot is overwritten only after the
+//     consumer unpinned it, which it does after submitting its last read, so the overwrite is submitted
+//     after that read. (That SDL's barriers cover the hand-over between two command buffers on two
+//     threads is taken from its documentation and checked by the A-versus-B comparison, not by reading
+//     SDL's backends.)
+//   - Nothing here touches the swapchain or the window: the main thread does that alone.
 //
 // Texture cache. A GS texture is a swizzled region of the 4 MiB memory image that the game overwrites
 // again and again (it streams textures through a small VRAM area, re-uploading the same data often).
@@ -26,6 +53,7 @@
 
 #include "runtime/gs/gs_gpu_backend.h"
 
+#include "runtime/gs/gs_gpu_threads.h"
 #include "runtime/gs/gs_gpu_math.h"
 #include "runtime/gs/gs_presentation.h"
 #include "runtime/gs/gs_recording.h"
@@ -43,10 +71,13 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bitset>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -60,8 +91,17 @@ namespace
     constexpr uint32_t kPageBytes = 8192u;
     constexpr uint32_t kTargetRows = 512u;                 // rows of a frame or depth target (GS limit used by the CPU renderer)
     constexpr uint64_t kTextureBudget = 384ull << 20;      // bytes of cached GPU textures before eviction starts
-    constexpr size_t kMaxVerticesPerFlush = 2u << 20;      // a list this long is submitted early
-    constexpr size_t kMaxStageBytes = 192u << 20;          // so is one with this much texture data waiting
+    // A draw list this long is submitted early, and so is one with this much texture data waiting. The limits also
+    // size the transfer buffer and the vertex buffer (the next power of two above what a flush needs, and the transfer
+    // buffer is cycled once per frame in flight), so they set how much memory the backend holds: a scene change that
+    // loads a hundred textures is spread over a few submissions instead of growing a 256 MB buffer.
+    constexpr size_t kMaxVerticesPerFlush = 512u << 10;
+    constexpr size_t kMaxStageBytes = 32u << 20;
+    // The GPU may run this many markers (frames) behind the game thread. A GPU slower than the game would otherwise
+    // let the queue of submitted work, and the memory it holds, grow without end; at the limit the GS thread waits for
+    // the oldest frame's fence. It only waits for the GPU, never for the host's main thread, and with a GPU that keeps
+    // up the fences are long signalled and the wait never happens.
+    constexpr size_t kMaxFramesInFlight = 3;
 
     uint64_t nowNanos()
     {
@@ -132,6 +172,26 @@ namespace
         uint32_t coveredRows = 0;
         std::bitset<kPageCount> dirty;
     };
+
+    // A region of a frame target to copy into a field texture, at the end of a flush.
+    struct FieldCopy
+    {
+        SDL_GPUTexture *src = nullptr;
+        uint32_t x = 0, y = 0, w = 0, h = 0;
+        SDL_GPUTexture *dst = nullptr;
+    };
+
+    bool slotUsedBy(const GSGpuBackend::FieldInfo &f, int slot)
+    {
+        if (slot < 0)
+            return false;
+        if (f.valid && f.slot == slot)
+            return true;
+        for (int i = 0; i < f.candidateCount; ++i)
+            if (f.candidates[i] == slot)
+                return true;
+        return false;
+    }
 
     struct Draw
     {
@@ -248,7 +308,29 @@ struct GSGpuBackend::Impl
     std::vector<PendingUpload> pendingUploads;
     std::vector<SDL_GPUTexture *> transientTextures; // decoded Z pages: released once the list is submitted
     GSPresentationRequest lastMarker{};
+    bool hasMarker = false;
     bool loggedUnsupported[16] = {};
+
+    std::deque<SDL_GPUFence *> frameFences; // one per submitted marker, oldest first
+
+    // ---- field publishing (paths A and B); see "Field ring" at the top
+    std::atomic<bool> fields{false};
+    bool directConsumer = false;
+    struct FieldSlot
+    {
+        SDL_GPUTexture *tex = nullptr;
+        int pins = 0; // ringMutex
+    };
+    std::array<FieldSlot, GSGpuBackend::kFieldSlots> slots;
+    mutable std::mutex ringMutex;
+    FieldInfo latest; // ringMutex: the newest published field
+    GSPresentationRequest latestRequest; // ringMutex: the request of that marker
+    int nextSlotHint = 0; // GS thread only
+
+    // ---- opt-in once-a-second counters (PS2X_GS_GPU_STATS=1)
+    bool statsOn = false;
+    uint64_t statsLastNs = 0, statsMarkers = 0;
+    Stats statsPrev;
 
     ~Impl();
     bool init(SDL_GPUDevice *device, uint32_t s);
@@ -272,8 +354,15 @@ struct GSGpuBackend::Impl
     uint64_t clutHash(const GSDrawState &state);
     SDL_GPUTexture *createTexture(const GSDrawState &state, uint64_t contentHash, uint32_t w, uint32_t h);
     size_t allocateStage(size_t bytes);
-    void flushLocked(bool wait);
+    void flushLocked(bool wait, const FieldCopy *fieldCopies = nullptr, int fieldCopyCount = 0);
     void evictTextures();
+    bool enableFields();
+    bool acquireSlots(int count, int *out);
+    void publish(FieldInfo info, const GSPresentationRequest &request);
+    MarkResult produceField(const GSPresentationRequest &request);
+    bool downloadSlot(int slot, uint32_t width, uint32_t height, std::vector<uint8_t> &out, bool preserveAlpha);
+    PresentationFrame presentFromField(const FieldInfo &field, const GSPresentationRequest &request);
+    void printStats();
     bool ensureBuffers(size_t vertexBytes, size_t transferBytes);
 
     // readback
@@ -289,6 +378,10 @@ bool GSGpuBackend::Impl::init(SDL_GPUDevice *device, uint32_t s)
 {
     dev = device;
     scale = std::max(1u, s);
+    {
+        const char *value = std::getenv("PS2X_GS_GPU_STATS");
+        statsOn = value && value[0] == '1';
+    }
     if (!dev)
     {
         std::fprintf(stderr, "[gs:gpu] no GPU device\n");
@@ -347,6 +440,8 @@ GSGpuBackend::Impl::~Impl()
     if (!dev)
         return;
     SDL_WaitForGPUIdle(dev);
+    for (SDL_GPUFence *fence : frameFences)
+        SDL_ReleaseGPUFence(dev, fence);
     for (auto &p : pipelines)
         SDL_ReleaseGPUGraphicsPipeline(dev, p.second);
     for (auto &t : contentTextures)
@@ -357,6 +452,9 @@ GSGpuBackend::Impl::~Impl()
         SDL_ReleaseGPUTexture(dev, d.depth);
     if (dummy)
         SDL_ReleaseGPUTexture(dev, dummy);
+    for (FieldSlot &slot : slots)
+        if (slot.tex)
+            SDL_ReleaseGPUTexture(dev, slot.tex);
     if (vertexBuffer)
         SDL_ReleaseGPUBuffer(dev, vertexBuffer);
     if (uploadBuffer)
@@ -866,6 +964,8 @@ SDL_GPUTexture *GSGpuBackend::Impl::resolveTexture(const GSDrawState &state)
         if (!result)
             return nullptr;
     }
+    if (signatures.size() >= 200000u)
+        signatures.clear(); // each entry is small but the clut hash makes keys unbounded; a miss only costs a hash
     signatures[key] = {hash, epoch, span};
     recentValid = true;
     recentKey = key;
@@ -891,7 +991,10 @@ void GSGpuBackend::Impl::evictTextures()
         if (textureBytes <= target)
             break;
         const auto it = contentTextures.find(o.second);
-        SDL_ReleaseGPUTexture(dev, it->second.tex);
+        {
+            ps2x_gs::DefragGuard defragGuard; // see gs_gpu_threads.h
+            SDL_ReleaseGPUTexture(dev, it->second.tex);
+        }
         textureBytes -= it->second.bytes;
         contentTextures.erase(it);
         ++stats.texturesEvicted;
@@ -1023,7 +1126,10 @@ bool GSGpuBackend::Impl::ensureBuffers(size_t vertexBytes, size_t transferBytes)
     if (vertexBytes > vertexBufferBytes)
     {
         if (vertexBuffer)
+        {
+            ps2x_gs::DefragGuard defragGuard;
             SDL_ReleaseGPUBuffer(dev, vertexBuffer);
+        }
         size_t size = std::max<size_t>(1u << 20, vertexBufferBytes);
         while (size < vertexBytes)
             size *= 2u;
@@ -1041,7 +1147,10 @@ bool GSGpuBackend::Impl::ensureBuffers(size_t vertexBytes, size_t transferBytes)
     if (transferBytes > uploadBufferBytes)
     {
         if (uploadBuffer)
+        {
+            ps2x_gs::DefragGuard defragGuard;
             SDL_ReleaseGPUTransferBuffer(dev, uploadBuffer);
+        }
         size_t size = std::max<size_t>(4u << 20, uploadBufferBytes);
         while (size < transferBytes)
             size *= 2u;
@@ -1059,9 +1168,11 @@ bool GSGpuBackend::Impl::ensureBuffers(size_t vertexBytes, size_t transferBytes)
     return true;
 }
 
-void GSGpuBackend::Impl::flushLocked(bool wait)
+// `fieldCopies` (path B): after the draws, copy regions of frame targets into field textures, in the same
+// command buffer, so the copies see every draw recorded so far and nothing recorded later.
+void GSGpuBackend::Impl::flushLocked(bool wait, const FieldCopy *fieldCopies, int fieldCopyCount)
 {
-    if (draws.empty() && pendingUploads.empty())
+    if (draws.empty() && pendingUploads.empty() && fieldCopyCount == 0)
     {
         if (wait)
             SDL_WaitForGPUIdle(dev);
@@ -1069,28 +1180,34 @@ void GSGpuBackend::Impl::flushLocked(bool wait)
     }
     const size_t vertexBytes = vertices.size() * sizeof(Vertex);
     const size_t stageBase = alignUp(vertexBytes, 256u);
-    if (!ensureBuffers(vertexBytes, stageBase + stage.size()))
+    const bool haveUploads = vertexBytes != 0 || !stage.empty();
+    if (haveUploads)
     {
-        draws.clear();
-        vertices.clear();
-        pendingUploads.clear();
-        stage.clear();
-        return;
+        if (!ensureBuffers(vertexBytes, stageBase + stage.size()))
+        {
+            draws.clear();
+            vertices.clear();
+            pendingUploads.clear();
+            stage.clear();
+            return;
+        }
+
+        uint8_t *map = static_cast<uint8_t *>(SDL_MapGPUTransferBuffer(dev, uploadBuffer, true));
+        if (!map)
+        {
+            std::fprintf(stderr, "[gs:gpu] SDL_MapGPUTransferBuffer: %s\n", SDL_GetError());
+            return;
+        }
+        if (vertexBytes)
+            std::memcpy(map, vertices.data(), vertexBytes);
+        if (!stage.empty())
+            std::memcpy(map + stageBase, stage.data(), stage.size());
+        SDL_UnmapGPUTransferBuffer(dev, uploadBuffer);
     }
 
-    uint8_t *map = static_cast<uint8_t *>(SDL_MapGPUTransferBuffer(dev, uploadBuffer, true));
-    if (!map)
-    {
-        std::fprintf(stderr, "[gs:gpu] SDL_MapGPUTransferBuffer: %s\n", SDL_GetError());
-        return;
-    }
-    if (vertexBytes)
-        std::memcpy(map, vertices.data(), vertexBytes);
-    if (!stage.empty())
-        std::memcpy(map + stageBase, stage.data(), stage.size());
-    SDL_UnmapGPUTransferBuffer(dev, uploadBuffer);
-
+    ps2x_gs::DefragGuard window; // Vulkan only: held from here to the submit, see gs_gpu_threads.h
     SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(dev);
+    if (haveUploads)
     {
         SDL_GPUCopyPass *copy = SDL_BeginGPUCopyPass(cmd);
         if (vertexBytes)
@@ -1116,6 +1233,7 @@ void GSGpuBackend::Impl::flushLocked(bool wait)
         SDL_EndGPUCopyPass(copy);
     }
 
+    ps2x_gs::DebugPassLock passLock; // validation only: see gs_gpu_threads.h
     SDL_GPURenderPass *pass = nullptr;
     uint32_t curFrame = ~0u, curDepth = ~0u;
     uint32_t curPipeline = ~0u;
@@ -1171,10 +1289,58 @@ void GSGpuBackend::Impl::flushLocked(bool wait)
     }
     if (pass)
         SDL_EndGPURenderPass(pass);
+    passLock.Unlock();
+
+    if (fieldCopyCount > 0)
+    {
+        SDL_GPUCopyPass *copy = SDL_BeginGPUCopyPass(cmd);
+        for (int i = 0; i < fieldCopyCount; ++i)
+        {
+            const FieldCopy &fc = fieldCopies[i];
+            SDL_GPUTextureLocation from = {};
+            from.texture = fc.src;
+            from.x = fc.x;
+            from.y = fc.y;
+            SDL_GPUTextureLocation to = {};
+            to.texture = fc.dst;
+            SDL_CopyGPUTextureToTexture(copy, &from, &to, fc.w, fc.h, 1, false);
+        }
+        SDL_EndGPUCopyPass(copy);
+    }
 
     ++stats.flushes;
     stats.maxDrawsPerFlush = std::max<uint64_t>(stats.maxDrawsPerFlush, draws.size());
-    SDL_SubmitGPUCommandBuffer(cmd);
+    SDL_GPUFence *fence = nullptr;
+    if (fieldCopyCount > 0)
+        fence = SDL_SubmitGPUCommandBufferAndAcquireFence(cmd); // a marker's flush: keep its fence
+    else
+        SDL_SubmitGPUCommandBuffer(cmd);
+    window.Unlock();
+    if (fieldCopyCount > 0)
+    {
+        // The fence keeps the GPU from falling more than kMaxFramesInFlight markers behind.
+        if (fence)
+        {
+            frameFences.push_back(fence);
+            while (frameFences.size() > kMaxFramesInFlight)
+            {
+                // Poll instead of SDL_WaitForGPUFences: SDL's Direct3D 12 backend holds its submit lock for the whole of
+                // a fence wait (SDL_gpu_d3d12.c, D3D12_WaitForFences), which would also stop the host's main thread
+                // from submitting its frame. SDL_QueryGPUFence takes no lock.
+                if (!SDL_QueryGPUFence(dev, frameFences.front()))
+                {
+                    const uint64_t waitStart = nowNanos();
+                    do
+                        SDL_Delay(1);
+                    while (!SDL_QueryGPUFence(dev, frameFences.front()) && nowNanos() - waitStart < 2000000000ull);
+                    stats.backlogWaitNanos += nowNanos() - waitStart;
+                    ++stats.backlogWaits;
+                }
+                SDL_ReleaseGPUFence(dev, frameFences.front());
+                frameFences.pop_front();
+            }
+        }
+    }
     if (wait)
         SDL_WaitForGPUIdle(dev);
 
@@ -1183,7 +1349,10 @@ void GSGpuBackend::Impl::flushLocked(bool wait)
     pendingUploads.clear();
     stage.clear();
     for (SDL_GPUTexture *t : transientTextures)
+    {
+        ps2x_gs::DefragGuard defragGuard;
         SDL_ReleaseGPUTexture(dev, t); // safe while the submitted command buffer still uses it
+    }
     transientTextures.clear();
     ++flushIndex;
     evictTextures();
@@ -1204,6 +1373,7 @@ bool GSGpuBackend::Impl::downloadRegion(SDL_GPUTexture *tex, uint32_t x, uint32_
         std::fprintf(stderr, "[gs:gpu] SDL_CreateGPUTransferBuffer(download): %s\n", SDL_GetError());
         return false;
     }
+    ps2x_gs::DefragGuard window; // Vulkan only: held from here to the submit, see gs_gpu_threads.h
     SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(dev);
     SDL_GPUCopyPass *copy = SDL_BeginGPUCopyPass(cmd);
     SDL_GPUTextureRegion region = {};
@@ -1217,6 +1387,7 @@ bool GSGpuBackend::Impl::downloadRegion(SDL_GPUTexture *tex, uint32_t x, uint32_
     SDL_DownloadFromGPUTexture(copy, &region, &dst);
     SDL_EndGPUCopyPass(copy);
     SDL_GPUFence *fence = SDL_SubmitGPUCommandBufferAndAcquireFence(cmd);
+    window.Unlock();
     bool ok = false;
     if (fence)
     {
@@ -1231,7 +1402,10 @@ bool GSGpuBackend::Impl::downloadRegion(SDL_GPUTexture *tex, uint32_t x, uint32_
             ok = true;
         }
     }
-    SDL_ReleaseGPUTransferBuffer(dev, tb);
+    {
+        ps2x_gs::DefragGuard defragGuard;
+        SDL_ReleaseGPUTransferBuffer(dev, tb);
+    }
     return ok;
 }
 
@@ -1269,6 +1443,333 @@ bool GSGpuBackend::Impl::copyFrame(const GSFrameReg &frame, uint32_t width, uint
         }
     }
     return true;
+}
+
+// ------------------------------------------------------------------------------------------------
+// direct presentation (path B)
+
+bool GSGpuBackend::Impl::enableFields()
+{
+    if (fields)
+        return true;
+    for (FieldSlot &slot : slots)
+    {
+        SDL_GPUTextureCreateInfo ti = {};
+        ti.type = SDL_GPU_TEXTURETYPE_2D;
+        ti.format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
+        ti.usage = SDL_GPU_TEXTUREUSAGE_SAMPLER;
+        ti.width = GSGpuBackend::kFieldTextureWidth;
+        ti.height = GSGpuBackend::kFieldTextureHeight;
+        ti.layer_count_or_depth = 1;
+        ti.num_levels = 1;
+        ti.sample_count = SDL_GPU_SAMPLECOUNT_1;
+        slot.tex = SDL_CreateGPUTexture(dev, &ti);
+        if (!slot.tex)
+        {
+            std::fprintf(stderr, "[gs:gpu] cannot create a field texture: %s\n", SDL_GetError());
+            for (FieldSlot &made : slots)
+                if (made.tex)
+                {
+                    {
+                        ps2x_gs::DefragGuard defragGuard;
+                        SDL_ReleaseGPUTexture(dev, made.tex);
+                    }
+                    made.tex = nullptr;
+                }
+            return false;
+        }
+    }
+    fields = true;
+    return true;
+}
+
+// `count` free slots for the GS thread to write, or false. Free: not pinned by the host and not part of the
+// latest published field. See "Field ring" at the top.
+bool GSGpuBackend::Impl::acquireSlots(int count, int *out)
+{
+    std::lock_guard<std::mutex> lock(ringMutex);
+    int found = 0;
+    for (int k = 0; k < GSGpuBackend::kFieldSlots && found < count; ++k)
+    {
+        const int i = (nextSlotHint + k) % GSGpuBackend::kFieldSlots;
+        if (slots[static_cast<size_t>(i)].pins == 0 && !slotUsedBy(latest, i))
+            out[found++] = i;
+    }
+    if (found < count)
+        return false;
+    nextSlotHint = (out[count - 1] + 1) % GSGpuBackend::kFieldSlots;
+    return true;
+}
+
+// Called after the command buffer that wrote the slot was submitted.
+void GSGpuBackend::Impl::publish(FieldInfo info, const GSPresentationRequest &request)
+{
+    std::lock_guard<std::mutex> lock(ringMutex);
+    info.seq = latest.seq + 1u;
+    latest = info;
+    latestRequest = request;
+}
+
+GSGpuBackend::MarkResult GSGpuBackend::Impl::produceField(const GSPresentationRequest &request)
+{
+    MarkResult result;
+    result.published = true;
+    result.direct = directConsumer;
+    const GSPresent::Plan plan = GSPresent::MakePlan(request);
+    FieldInfo info;
+    info.interlaced = plan.interlaced;
+    auto fill = [&]()
+    {
+        result.valid = info.valid;
+        result.width = info.width;
+        result.height = info.height;
+        result.displayFbp = info.displayFbp;
+        result.sourceFbp = info.sourceFbp;
+        result.usedPreferred = info.usedPreferred;
+    };
+
+    if (plan.kind == GSPresent::Plan::Kind::None)
+    {
+        // Neither display circuit is set up: Compose returns no picture. The host shows its placeholder.
+        flushLocked(false);
+        ++stats.fieldsInvalid;
+        publish(info, request);
+        return result;
+    }
+
+    if (plan.kind == GSPresent::Plan::Kind::DisplayFrame && scale == 1u)
+    {
+        // The usual case: both circuits show one region of one frame buffer. Copy it on the GPU.
+        const uint32_t fbw = plan.frame.fbw ? plan.frame.fbw : GSPresent::kHostFrameWidth / 64u;
+        const FrameTarget *target = nullptr;
+        for (const FrameTarget &f : frames)
+            if (f.fbp == plan.frame.fbp && f.fbw == fbw && f.psm == plan.frame.psm)
+                target = &f;
+        if (target && target->psm == GS_PSM_CT32 && plan.width > 0 && plan.height > 0 &&
+            plan.width <= GSGpuBackend::kFieldTextureWidth && plan.height <= GSGpuBackend::kFieldTextureHeight &&
+            plan.originX + plan.width <= target->w && plan.originY + plan.height <= target->h)
+        {
+            // Compose swaps a black display frame at fbp 0 for the first non-black one of the two context
+            // frames (those that differ from it), read from the top-left corner. The host decides on the GPU;
+            // here the candidates' regions are copied along with the displayed one.
+            const FrameTarget *candidates[2] = {nullptr, nullptr};
+            int candidateCount = 0;
+            bool candidatesOk = true;
+            if (plan.frame.fbp == 0u)
+            {
+                for (const GSFrameReg &c : request.contextFrames)
+                {
+                    if (c.fbp == plan.frame.fbp && c.fbw == plan.frame.fbw && c.psm == plan.frame.psm)
+                        continue;
+                    const uint32_t cfbw = c.fbw ? c.fbw : GSPresent::kHostFrameWidth / 64u;
+                    const FrameTarget *ct = nullptr;
+                    for (const FrameTarget &f : frames)
+                        if (f.fbp == c.fbp && f.fbw == cfbw && f.psm == c.psm)
+                            ct = &f;
+                    if (!ct || ct->psm != GS_PSM_CT32 || plan.width > ct->w || plan.height > ct->h)
+                    {
+                        candidatesOk = false; // a fallback frame that is not a drawn target: only Compose with pixels can say
+                        break;
+                    }
+                    candidates[candidateCount++] = ct;
+                }
+            }
+            if (candidatesOk)
+            {
+                int got[3];
+                if (!acquireSlots(1 + candidateCount, got))
+                {
+                    flushLocked(false);
+                    ++stats.fieldsDropped;
+                    return result;
+                }
+                FieldCopy copies[3];
+                copies[0] = {target->color, plan.originX, plan.originY, plan.width, plan.height, slots[static_cast<size_t>(got[0])].tex};
+                for (int i = 0; i < candidateCount; ++i)
+                    copies[1 + i] = {candidates[i]->color, 0u, 0u, plan.width, plan.height, slots[static_cast<size_t>(got[1 + i])].tex};
+                flushLocked(false, copies, 1 + candidateCount);
+                ++stats.fieldsFast;
+                if (candidateCount != 0)
+                    ++stats.fieldsWithCandidates;
+                info.valid = true;
+                info.slot = got[0];
+                info.candidateCount = candidateCount;
+                info.displayFrame = plan.frame;
+                info.originX = plan.originX;
+                info.originY = plan.originY;
+                int candidateIndex = 0;
+                for (const GSFrameReg &c : request.contextFrames)
+                {
+                    if (c.fbp == plan.frame.fbp && c.fbw == plan.frame.fbw && c.psm == plan.frame.psm)
+                        continue;
+                    if (candidateIndex < candidateCount)
+                        info.candidateFrames[candidateIndex++] = c;
+                }
+                for (int i = 0; i < candidateCount; ++i)
+                    info.candidates[i] = got[1 + i];
+                info.width = plan.width;
+                info.height = plan.height;
+                info.displayFbp = plan.frame.fbp;
+                info.sourceFbp = plan.frame.fbp;
+                publish(info, request);
+                fill();
+                return result;
+            }
+        }
+    }
+
+    // Anything else: the full Compose with real pixels (reads the targets back and waits for the GPU).
+    flushLocked(true);
+    PresentationFrame frame = GSPresent::Compose(request, [this](const GSFrameReg &f, uint32_t w, uint32_t h, std::vector<uint8_t> &pixels,
+                                                                 bool preserveAlpha, bool useLocalMemoryLayout, bool frameBaseIsPages,
+                                                                 uint32_t originX, uint32_t originY)
+                                                 { return copyFrame(f, w, h, pixels, preserveAlpha, useLocalMemoryLayout,
+                                                                    frameBaseIsPages, originX, originY); });
+    if (!frame || frame.width == 0 || frame.height == 0 || frame.width > GSGpuBackend::kFieldTextureWidth ||
+        frame.height > GSGpuBackend::kFieldTextureHeight)
+    {
+        ++stats.fieldsInvalid;
+        publish(info, request);
+        return result;
+    }
+    int slot = -1;
+    if (!acquireSlots(1, &slot))
+    {
+        ++stats.fieldsDropped;
+        return result;
+    }
+    const uint32_t w = frame.width, h = frame.height;
+    const size_t offset = allocateStage(static_cast<size_t>(w) * h * 4u);
+    for (uint32_t y = 0; y < h; ++y) // Compose's rows are kHostFrameWidth pixels apart; the upload wants them packed
+        std::memcpy(stage.data() + offset + static_cast<size_t>(y) * w * 4u,
+                    frame.pixels.data() + static_cast<size_t>(y) * GSPresent::kHostFrameWidth * 4u, static_cast<size_t>(w) * 4u);
+    pendingUploads.push_back({slots[static_cast<size_t>(slot)].tex, w, h, offset});
+    flushLocked(false);
+    ++stats.fieldsSlow;
+    info.valid = true;
+    info.composed = true;
+    info.slot = slot;
+    info.width = w;
+    info.height = h;
+    info.displayFbp = frame.displayFbp;
+    info.sourceFbp = frame.sourceFbp;
+    info.usedPreferred = frame.usedPreferred;
+    publish(info, request);
+    fill();
+    return result;
+}
+
+// Path A's pixels: a field slot's top-left width x height region, in the layout GSPresent::CopyFrameFromMemory
+// gives (kHostFrameWidth pixels per row, the picture in the top-left corner, the rest zero). The alpha is what
+// copyFrame makes of it: the GS's own 0..0x80 meaning, or 0xFF when the picture does not use alpha.
+bool GSGpuBackend::Impl::downloadSlot(int slot, uint32_t width, uint32_t height, std::vector<uint8_t> &out, bool preserveAlpha)
+{
+    if (slot < 0 || slot >= GSGpuBackend::kFieldSlots || width > GSGpuBackend::kFieldTextureWidth || height > GSGpuBackend::kFieldTextureHeight)
+        return false;
+    std::vector<uint8_t> region;
+    if (!downloadRegion(slots[static_cast<size_t>(slot)].tex, 0, 0, width, height, region))
+        return false;
+    out.assign(static_cast<size_t>(GSPresent::kHostFrameWidth) * GSPresent::kHostFrameHeight * 4u, 0u);
+    for (uint32_t y = 0; y < height; ++y)
+    {
+        uint8_t *dst = out.data() + static_cast<size_t>(y) * GSPresent::kHostFrameWidth * 4u;
+        const uint8_t *src = region.data() + static_cast<size_t>(y) * width * 4u;
+        std::memcpy(dst, src, static_cast<size_t>(width) * 4u);
+        for (uint32_t x = 0; x < width; ++x)
+            dst[x * 4u + 3u] = preserveAlpha ? static_cast<uint8_t>((static_cast<uint32_t>(src[x * 4u + 3u]) * 128u + 127u) / 255u) : 255u;
+    }
+    return true;
+}
+
+// Present() when fields are published: the picture of the latest VBlank marker, from the field copies the GS
+// thread took at that VBlank (so later draws cannot have changed it). The field's slots are pinned by the
+// caller. This runs on the calling thread without the backend's lock: the GS thread is not held up.
+PresentationFrame GSGpuBackend::Impl::presentFromField(const FieldInfo &field, const GSPresentationRequest &request)
+{
+    if (!field.valid)
+        return {};
+    if (field.composed)
+    {
+        // Compose already ran with real pixels at the marker; the slot holds its picture.
+        PresentationFrame frame;
+        if (!downloadSlot(field.slot, field.width, field.height, frame.pixels, false))
+            return {};
+        frame.width = field.width;
+        frame.height = field.height;
+        frame.displayFbp = field.displayFbp;
+        frame.sourceFbp = field.sourceFbp;
+        frame.usedPreferred = field.usedPreferred;
+        return frame;
+    }
+    const auto sameFrame = [](const GSFrameReg &a, const GSFrameReg &b) { return a.fbp == b.fbp && a.fbw == b.fbw && a.psm == b.psm; };
+    // With two display circuits Compose asks for the same frame twice: download it once.
+    int cachedSlot = -1;
+    bool cachedAlpha = false;
+    std::vector<uint8_t> cached;
+    const auto fetch = [&](int slot, uint32_t w, uint32_t h, std::vector<uint8_t> &pixels, bool alpha)
+    {
+        if (slot == cachedSlot && alpha == cachedAlpha)
+        {
+            pixels = cached;
+            return true;
+        }
+        if (!downloadSlot(slot, w, h, pixels, alpha))
+            return false;
+        cachedSlot = slot;
+        cachedAlpha = alpha;
+        cached = pixels;
+        return true;
+    };
+    return GSPresent::Compose(request, [&](const GSFrameReg &frame, uint32_t width, uint32_t height, std::vector<uint8_t> &pixels,
+                                            bool preserveAlpha, bool useLocalMemoryLayout, bool frameBaseIsPages,
+                                            uint32_t originX, uint32_t originY)
+                              {
+                                  if (useLocalMemoryLayout && frameBaseIsPages && width == field.width && height == field.height)
+                                  {
+                                      if (sameFrame(frame, field.displayFrame) && originX == field.originX && originY == field.originY)
+                                          return fetch(field.slot, width, height, pixels, preserveAlpha);
+                                      for (int i = 0; i < field.candidateCount; ++i)
+                                          if (sameFrame(frame, field.candidateFrames[i]) && originX == 0u && originY == 0u)
+                                              return fetch(field.candidates[i], width, height, pixels, preserveAlpha);
+                                  }
+                                  // Something the field did not capture (cannot happen for the plans that publish a frame region).
+                                  std::lock_guard<std::mutex> lock(mutex);
+                                  flushLocked(true);
+                                  return copyFrame(frame, width, height, pixels, preserveAlpha, useLocalMemoryLayout, frameBaseIsPages, originX, originY);
+                              });
+}
+
+void GSGpuBackend::Impl::printStats()
+{
+    const uint64_t now = nowNanos();
+    ++statsMarkers;
+    if (statsLastNs == 0)
+    {
+        statsLastNs = now;
+        return;
+    }
+    if (now - statsLastNs < 1000000000ull)
+        return;
+    const Stats &a = stats;
+    const Stats &b = statsPrev;
+    const auto d = [](uint64_t x, uint64_t y) { return static_cast<unsigned long long>(x - y); };
+    std::printf("[gs:gpu-stats] markers=%llu prims=%llu culled=%llu draws=%llu passes=%llu flushes=%llu max_draws/flush=%llu pipelines=%llu | "
+                "textures created=%llu evicted=%llu live=%.1fMB signatures=%llu (hits recent=%llu sig=%llu content=%llu miss=%llu decode=%.1fms) | "
+                "uploads=%.1fMB depth_restores=%llu | fields fast=%llu (with fallback frames %llu) slow=%llu invalid=%llu dropped=%llu | downloads=%.1fMB | GPU backlog waits=%llu (%.2fms)\n",
+                static_cast<unsigned long long>(statsMarkers), d(a.primitives, b.primitives), d(a.primitivesCulled, b.primitivesCulled),
+                d(a.drawCalls, b.drawCalls), d(a.renderPasses, b.renderPasses), d(a.flushes, b.flushes),
+                static_cast<unsigned long long>(a.maxDrawsPerFlush), static_cast<unsigned long long>(a.pipelinesCreated),
+                d(a.texturesCreated, b.texturesCreated), d(a.texturesEvicted, b.texturesEvicted), static_cast<double>(textureBytes) / 1048576.0,
+                static_cast<unsigned long long>(signatures.size()), d(a.texHitsRecent, b.texHitsRecent), d(a.texHitsSignature, b.texHitsSignature),
+                d(a.texHitsContent, b.texHitsContent), d(a.texMisses, b.texMisses), static_cast<double>(a.texDecodeNanos - b.texDecodeNanos) / 1e6,
+                static_cast<double>(a.uploadBytes - b.uploadBytes) / 1048576.0, d(a.depthRestores, b.depthRestores), d(a.fieldsFast, b.fieldsFast),
+                d(a.fieldsWithCandidates, b.fieldsWithCandidates), d(a.fieldsSlow, b.fieldsSlow), d(a.fieldsInvalid, b.fieldsInvalid), d(a.fieldsDropped, b.fieldsDropped),
+                static_cast<double>(a.downloadBytes - b.downloadBytes) / 1048576.0, d(a.backlogWaits, b.backlogWaits),
+                static_cast<double>(a.backlogWaitNanos - b.backlogWaitNanos) / 1e6);
+    std::fflush(stdout);
+    statsPrev = stats;
+    statsMarkers = 0;
+    statsLastNs = now;
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -1421,6 +1922,10 @@ void GSGpuBackend::TextureFlush()
 void GSGpuBackend::Sync(GSSyncReason reason)
 {
     Impl &s = *m_impl;
+    // With published fields the picture of a VBlank is already on its way at the marker, and Present() waits for
+    // exactly what it reads: a presentation sync has nothing left to do (and must not hold the GS thread up).
+    if (reason == GSSyncReason::Presentation && s.fields)
+        return;
     std::lock_guard<std::mutex> lock(s.mutex);
     if (!s.ready)
         return;
@@ -1428,27 +1933,141 @@ void GSGpuBackend::Sync(GSSyncReason reason)
     s.flushLocked(reason != GSSyncReason::Finish);
 }
 
-void GSGpuBackend::MarkPresentation(const GSPresentationRequest &request)
+GSGpuBackend::MarkResult GSGpuBackend::MarkPresentation(const GSPresentationRequest &request)
 {
     Impl &s = *m_impl;
     std::lock_guard<std::mutex> lock(s.mutex);
+    MarkResult result;
     if (!s.ready || !s.vram)
-        return;
+        return result;
     s.lastMarker = request;
-    s.flushLocked(false);
+    s.hasMarker = true;
+    if (s.fields)
+        result = s.produceField(request);
+    else
+        s.flushLocked(false);
+    if (s.statsOn)
+        s.printStats();
+    return result;
+}
+
+bool GSGpuBackend::SetFieldPublishing(bool enabled, bool directConsumer)
+{
+    Impl &s = *m_impl;
+    std::lock_guard<std::mutex> lock(s.mutex);
+    if (!s.ready)
+        return false;
+    s.directConsumer = enabled && directConsumer;
+    if (!enabled)
+    {
+        s.fields = false; // the slot textures stay allocated; nothing publishes
+        return true;
+    }
+    return s.enableFields();
+}
+
+bool GSGpuBackend::FieldPublishing() const
+{
+    return m_impl->fields;
+}
+
+bool GSGpuBackend::TakeNewestField(uint64_t afterSeq, FieldInfo &out)
+{
+    Impl &s = *m_impl;
+    std::lock_guard<std::mutex> lock(s.ringMutex); // not s.mutex: that one is held while the GS thread waits for the GPU
+    if (s.latest.seq <= afterSeq)
+        return false;
+    out = s.latest;
+    if (out.valid && out.slot >= 0)
+    {
+        ++s.slots[static_cast<size_t>(out.slot)].pins;
+        for (int i = 0; i < out.candidateCount; ++i)
+            ++s.slots[static_cast<size_t>(out.candidates[i])].pins;
+    }
+    return true;
+}
+
+void GSGpuBackend::PinField(int slot)
+{
+    Impl &s = *m_impl;
+    std::lock_guard<std::mutex> lock(s.ringMutex);
+    if (slot >= 0 && slot < kFieldSlots)
+        ++s.slots[static_cast<size_t>(slot)].pins;
+}
+
+void GSGpuBackend::UnpinField(int slot)
+{
+    Impl &s = *m_impl;
+    std::lock_guard<std::mutex> lock(s.ringMutex);
+    if (slot >= 0 && slot < kFieldSlots && s.slots[static_cast<size_t>(slot)].pins > 0)
+        --s.slots[static_cast<size_t>(slot)].pins;
+}
+
+SDL_GPUTexture *GSGpuBackend::FieldTexture(int slot) const
+{
+    if (slot < 0 || slot >= kFieldSlots)
+        return nullptr;
+    return m_impl->slots[static_cast<size_t>(slot)].tex; // set once, before the game runs
+}
+
+SDL_GPUDevice *GSGpuBackend::Device() const
+{
+    return m_impl->dev;
 }
 
 PresentationFrame GSGpuBackend::Present(const GSPresentationRequest &request)
 {
     Impl &s = *m_impl;
+    if (!s.ready)
+        return {};
+    if (s.fields)
+    {
+        // The picture of the latest VBlank marker (the CPU renderer does the same: what Present shows is the memory
+        // as of the latest marker, not as of the call). Its slots are pinned while they are read, so the GS thread
+        // does not reuse them, and nothing here takes the backend's lock.
+        FieldInfo field;
+        GSPresentationRequest shown;
+        bool have = false;
+        {
+            std::lock_guard<std::mutex> lock(s.ringMutex);
+            if (s.latest.seq != 0)
+            {
+                field = s.latest;
+                shown = s.latestRequest;
+                have = true;
+                if (field.valid)
+                {
+                    ++s.slots[static_cast<size_t>(field.slot)].pins;
+                    for (int i = 0; i < field.candidateCount; ++i)
+                        ++s.slots[static_cast<size_t>(field.candidates[i])].pins;
+                }
+            }
+        }
+        if (have)
+        {
+            PresentationFrame frame = s.presentFromField(field, shown);
+            if (field.valid)
+            {
+                UnpinField(field.slot);
+                for (int i = 0; i < field.candidateCount; ++i)
+                    UnpinField(field.candidates[i]);
+            }
+            ++s.stats.presentsFromFields; // a plain counter, only the host's thread writes it
+            return frame;
+        }
+    }
+
     std::lock_guard<std::mutex> lock(s.mutex);
-    if (!s.ready || !s.vram)
+    if (!s.vram)
         return {};
     s.flushLocked(true);
     ++s.stats.presents;
-    return GSPresent::Compose(request, [&s](const GSFrameReg &frame, uint32_t width, uint32_t height, std::vector<uint8_t> &pixels,
-                                            bool preserveAlpha, bool useLocalMemoryLayout, bool frameBaseIsPages,
-                                            uint32_t originX, uint32_t originY)
+    // Like the CPU renderer, show the registers as they were at the latest VBlank marker; the caller's request
+    // is for when it asks, which can be a frame later.
+    const GSPresentationRequest &shown = s.hasMarker ? s.lastMarker : request;
+    return GSPresent::Compose(shown, [&s](const GSFrameReg &frame, uint32_t width, uint32_t height, std::vector<uint8_t> &pixels,
+                                          bool preserveAlpha, bool useLocalMemoryLayout, bool frameBaseIsPages,
+                                          uint32_t originX, uint32_t originY)
                               { return s.copyFrame(frame, width, height, pixels, preserveAlpha, useLocalMemoryLayout,
                                                    frameBaseIsPages, originX, originY); });
 }
@@ -1550,7 +2169,10 @@ GSTransferSnapshot GSGpuBackend::GetTransferSnapshot() const
 GSGpuBackend::Stats GSGpuBackend::GetStats() const
 {
     std::lock_guard<std::mutex> lock(m_impl->mutex);
-    return m_impl->stats;
+    Stats result = m_impl->stats;
+    result.signaturesLive = m_impl->signatures.size();
+    result.textureBytesLive = m_impl->textureBytes;
+    return result;
 }
 
 void GSGpuBackend::ResetStats()

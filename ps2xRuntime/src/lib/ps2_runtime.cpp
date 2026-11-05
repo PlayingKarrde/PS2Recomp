@@ -5,6 +5,8 @@
 #include "game_overrides.h"
 #include "ps2_runtime_macros.h"
 #include "runtime/gs/gs_frontend.h"
+#include "runtime/gs/gs_field_deinterlacer.h"
+#include "runtime/gs/gs_gpu_host.h"
 #include "runtime/ee_scheduler.h"
 #include "ThreadNaming.h"
 #include "Kernel/Stubs/Audio.h"
@@ -447,131 +449,6 @@ constexpr uint32_t kAsyncCallbackStackTop = 0x00100000u;
     }
 }
 
-namespace
-{
-    // Games in the PS2's field mode draw one 224-line picture per VBlank, with every other picture
-    // half a line higher. A TV lays those pictures between each other's lines. Shown one at a time
-    // they bounce, so we rebuild the 448-line picture: lines from the newest picture stay, and the
-    // lines between come from the previous picture where nothing moved and are interpolated where
-    // something did.
-    class FieldDeinterlacer
-    {
-    public:
-        void reset()
-        {
-            m_hasPrevious = false;
-            m_hasOlder = false;
-        }
-
-        void process(const uint8_t *current, uint32_t width, uint32_t height, uint8_t *output, size_t outputStride)
-        {
-            const size_t stride = static_cast<size_t>(width) * 4u;
-            const size_t bytes = stride * height;
-            if (m_previous.size() != bytes)
-            {
-                m_previous.resize(bytes);
-                m_older.resize(bytes);
-                m_motion.resize(static_cast<size_t>(width) * height);
-                reset();
-            }
-
-            if (m_hasPrevious)
-                m_lower = currentIsLower(current, width, height);
-            const bool lower = m_lower;
-
-            for (uint32_t y = 0; y < height; ++y)
-            {
-                const uint8_t *row = current + y * stride;
-                const uint8_t *older = m_older.data() + y * stride;
-                uint8_t *motion = m_motion.data() + static_cast<size_t>(y) * width;
-                for (uint32_t x = 0; x < width; ++x)
-                    motion[x] = m_hasOlder ? channelDifference(row + x * 4u, older + x * 4u) : 255u;
-            }
-
-            for (uint32_t y = 0; y < height; ++y)
-            {
-                std::memcpy(output + (y * 2u + (lower ? 1u : 0u)) * outputStride, current + y * stride, stride);
-
-                const uint32_t above = lower ? (y > 0u ? y - 1u : 0u) : y;
-                const uint32_t below = lower ? y : std::min(y + 1u, height - 1u);
-                const uint8_t *rowAbove = current + above * stride;
-                const uint8_t *rowBelow = current + below * stride;
-                const uint8_t *motionAbove = m_motion.data() + static_cast<size_t>(above) * width;
-                const uint8_t *motionBelow = m_motion.data() + static_cast<size_t>(below) * width;
-                const uint8_t *previous = m_previous.data() + y * stride;
-                uint8_t *target = output + (y * 2u + (lower ? 0u : 1u)) * outputStride;
-                for (uint32_t x = 0; x < width; ++x)
-                {
-                    const uint32_t left = x > 0u ? x - 1u : 0u;
-                    const uint32_t right = std::min(x + 1u, width - 1u);
-                    const uint8_t motion = std::max({motionAbove[left], motionAbove[x], motionAbove[right],
-                                                     motionBelow[left], motionBelow[x], motionBelow[right]});
-                    uint8_t *pixel = target + x * 4u;
-                    if (m_hasPrevious && motion <= kStillThreshold)
-                    {
-                        std::memcpy(pixel, previous + x * 4u, 4u);
-                        continue;
-                    }
-                    const uint8_t *a = rowAbove + x * 4u;
-                    const uint8_t *b = rowBelow + x * 4u;
-                    for (int channel = 0; channel < 4; ++channel)
-                        pixel[channel] = static_cast<uint8_t>((a[channel] + b[channel] + 1) / 2);
-                }
-            }
-
-            m_older.swap(m_previous);
-            std::memcpy(m_previous.data(), current, bytes);
-            m_hasOlder = m_hasPrevious;
-            m_hasPrevious = true;
-        }
-
-    private:
-        static constexpr uint8_t kStillThreshold = 16u;
-
-        static uint8_t channelDifference(const uint8_t *a, const uint8_t *b)
-        {
-            const int red = std::abs(static_cast<int>(a[0]) - b[0]);
-            const int green = std::abs(static_cast<int>(a[1]) - b[1]);
-            const int blue = std::abs(static_cast<int>(a[2]) - b[2]);
-            return static_cast<uint8_t>(std::max({red, green, blue}));
-        }
-
-        // Which way a picture is offset can't be read from the display registers, so measure it:
-        // a picture half a line below the last one sits between that one's rows y and y + 1.
-        // A tie, such as two identical pictures, flips the last answer as the fields would.
-        bool currentIsLower(const uint8_t *current, uint32_t width, uint32_t height) const
-        {
-            const size_t stride = static_cast<size_t>(width) * 4u;
-            int64_t lowerError = 0;
-            int64_t upperError = 0;
-            for (uint32_t y = 0; y + 1u < height; ++y)
-            {
-                const uint8_t *row = current + y * stride;
-                const uint8_t *nextRow = row + stride;
-                const uint8_t *previous = m_previous.data() + y * stride;
-                const uint8_t *nextPrevious = previous + stride;
-                for (uint32_t x = 0; x < width; x += 4u)
-                {
-                    const size_t i = static_cast<size_t>(x) * 4u + 1u; // green
-                    const int between = previous[i] + nextPrevious[i];
-                    lowerError += std::abs(2 * row[i] - between);
-                    upperError += std::abs(2 * nextRow[i] - between);
-                }
-            }
-            if (lowerError == upperError)
-                return !m_lower;
-            return lowerError < upperError;
-        }
-
-        std::vector<uint8_t> m_previous;
-        std::vector<uint8_t> m_older;
-        std::vector<uint8_t> m_motion;
-        bool m_hasPrevious = false;
-        bool m_hasOlder = false;
-        bool m_lower = false;
-    };
-}
-
 #if defined(PLATFORM_VITA)
 using HostFrameTexture = Texture2D;
 static void uploadHostPixels(HostFrameTexture &tex, const void *pixels)
@@ -589,8 +466,37 @@ static void uploadHostPixels(HostFrameTexture &, const void *pixels)
 }
 #endif
 
+#if !defined(PLATFORM_VITA)
+// The GS GPU renderer's direct path (PS2X_GS_BACKEND=gpu, no PS2X_GS_GPU_READBACK): the picture is built on the
+// GPU from field textures the GS thread published, and the host presenter draws it. This only follows the same
+// once-per-VBlank rhythm as UploadFrame below and reports the size of the picture.
+static void UploadFrameDirect(PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
+{
+    static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
+    static bool s_hasPulled = false;
+    static ps2x_gs::PictureSize s_size;
+
+    const uint64_t currentTick = rt->eeScheduler().currentVSyncTick();
+    if (!s_hasPulled || currentTick != s_lastPresentationTick)
+    {
+        s_size = ps2x_gs::pullPicture();
+        s_lastPresentationTick = currentTick;
+        s_hasPulled = true;
+    }
+    outWidth = s_size.width;
+    outHeight = s_size.height;
+}
+#endif
+
 static void UploadFrame(HostFrameTexture &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
 {
+#if !defined(PLATFORM_VITA)
+    if (ps2x_gs::directPictureActive())
+    {
+        UploadFrameDirect(rt, outWidth, outHeight);
+        return;
+    }
+#endif
     static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
     static bool s_hasLatchedInitialFrame = false;
     static uint32_t s_lastDisplayFbp = std::numeric_limits<uint32_t>::max();
@@ -599,7 +505,7 @@ static void UploadFrame(HostFrameTexture &tex, PS2Runtime *rt, uint32_t &outWidt
     static uint32_t s_lastWidth = 0u;
     static uint32_t s_lastHeight = 0u;
     static uint32_t s_lastOutputHeight = 0u;
-    static FieldDeinterlacer s_deinterlacer;
+    static GSFieldDeinterlacer s_deinterlacer;
     static bool s_hasUploadedFrame = false;
     static std::vector<uint8_t> s_scratch;
     static std::vector<uint8_t> s_uploadBuffer(DEFAULT_FB_SIZE, 0u);
@@ -1007,6 +913,10 @@ bool PS2Runtime::initialize(const char *title)
                 return false;
             }
         }
+        // The GS renderer: the CPU one the GS starts with, unless PS2X_GS_BACKEND=gpu (or a stats wrapper) asks for another.
+        // It needs the window's SDL_GPU device, so it is chosen here, after the window exists.
+        if (std::unique_ptr<GSRasterBackend> backend = ps2x_gs::createConfiguredBackend())
+            m_gs.setRasterBackend(std::move(backend));
         // The SPU2 is mixed on the host's audio thread and pulled at the device's pace.
         s_audioSubsystem.store(m_iopSubsystem.get());
         const bool audioStarted = ps2x_host::startAudioStream(mixSpu2Audio, nullptr);
@@ -2729,7 +2639,38 @@ void PS2Runtime::run()
 #endif
         uint32_t presentWidth = FB_WIDTH;
         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
-        UploadFrame(frameTex, this, presentWidth, presentHeight);
+        {
+            // PS2X_PRESENT_STATS=1: how long the main thread spends building the picture each host frame (the GS
+            // renderer's Present, the CPU deinterlacer and the upload, or with the GPU renderer's direct path just
+            // taking the newest field), once a second. The host's own present cost is in the [present:stats] line.
+            static const bool s_buildStats = []()
+            {
+                const char *value = std::getenv("PS2X_PRESENT_STATS");
+                return value && value[0] == '1';
+            }();
+            static uint64_t s_buildNs = 0, s_buildMaxNs = 0, s_buildFrames = 0;
+            static auto s_buildReport = std::chrono::steady_clock::now();
+            const auto buildStart = s_buildStats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            UploadFrame(frameTex, this, presentWidth, presentHeight);
+            if (s_buildStats)
+            {
+                const auto now = std::chrono::steady_clock::now();
+                const uint64_t ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - buildStart).count());
+                s_buildNs += ns;
+                s_buildMaxNs = std::max(s_buildMaxNs, ns);
+                ++s_buildFrames;
+                if (now - s_buildReport >= std::chrono::seconds(1))
+                {
+                    std::printf("[frame:stats] host_frames=%llu build_picture_ms avg=%.3f max=%.3f\n",
+                                static_cast<unsigned long long>(s_buildFrames),
+                                static_cast<double>(s_buildNs) / 1e6 / static_cast<double>(s_buildFrames),
+                                static_cast<double>(s_buildMaxNs) / 1e6);
+                    std::fflush(stdout);
+                    s_buildNs = s_buildMaxNs = s_buildFrames = 0;
+                    s_buildReport = now;
+                }
+            }
+        }
 
 #if defined(PLATFORM_VITA)
         BeginDrawing();
@@ -2801,6 +2742,9 @@ void PS2Runtime::run()
     UnloadTexture(frameTex);
     CloseWindow();
 #else
+    // A GPU renderer holds objects of the host's SDL_GPU device, which destroyWindow() destroys: let go of them first.
+    if (ps2x_gs::shutdown())
+        m_gs.setRasterBackend(nullptr); // back to the CPU renderer, which lets go of the GPU renderer
     ps2x_host::destroyWindow();
 #endif
 

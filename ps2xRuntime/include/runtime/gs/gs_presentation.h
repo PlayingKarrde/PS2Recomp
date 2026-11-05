@@ -32,4 +32,35 @@ namespace GSPresent
                              bool frameBaseIsPages, uint32_t sourceOriginX, uint32_t sourceOriginY);
 
     PresentationFrame Compose(const GSPresentationRequest &request, const CopyFrameFn &copyFrame);
+
+    // What the picture of a presentation request is, decided from the display registers alone (no
+    // pixels). GSGpuBackend's direct path (GPU renderer M3) uses it to copy the displayed region of a
+    // frame target on the GPU instead of reading pixels back:
+    //   None          neither display circuit is enabled and set up; Compose returns no picture.
+    //   DisplayFrame  the picture is exactly the `width` x `height` region of `frame` that starts at
+    //                 (originX, originY), copied as it is. Compose gives the same result for these
+    //                 requests: both circuits read the same pixels (so blending them changes nothing),
+    //                 or one circuit is on and the "preferred source" does not apply.
+    //   Complex       anything else (circuits that differ, blending over the background colour,
+    //                 SMODE2 field mode, a preferred source): only Compose with real pixels knows.
+    // Compose's fallback to another frame when the display frame is black (fbp 0) is not part of the
+    // plan; see the note in bringup.md ("M3").
+    struct Plan
+    {
+        enum class Kind : uint8_t
+        {
+            None,
+            DisplayFrame,
+            Complex
+        };
+        Kind kind = Kind::None;
+        GSFrameReg frame{};
+        uint32_t originX = 0, originY = 0, width = 0, height = 0;
+        bool dualCircuit = false;
+        bool interlaced = false; // SMODE2.INT: the picture is one field of an interlaced frame
+    };
+    Plan MakePlan(const GSPresentationRequest &request);
+
+    // Opt-in counters of what Compose does (PS2X_GS_PRESENT_STATS=1), printed every 300 pictures.
+    bool StatsEnabled();
 }

@@ -7,7 +7,8 @@
 // fallback) and by ps2_debug_panel.cpp (which draws its ImGui windows through the same device).
 //
 // What the presenter does, once per host frame, all on the main thread (the thread that created the
-// window; the game thread never touches the device):
+// window; with the GS GPU renderer (PS2X_GS_BACKEND=gpu) the game thread also records and submits its own
+// command buffers on this device, but never touches the window or the swapchain):
 //   1. stagePicture()   copies the CPU picture into a transfer buffer (cycled, so it never waits for the GPU).
 //   2. present()        acquires one command buffer and records, in order:
 //        - recordUpload()  a copy pass: transfer buffer -> the 640x512 RGBA8 picture texture (cycled),
@@ -30,6 +31,7 @@
 #include <SDL3/SDL_video.h>
 
 #include <string>
+#include <vector>
 
 namespace ps2x_host
 {
@@ -49,8 +51,27 @@ namespace ps2x_host
     };
     void setGpuOverlay(const GpuOverlay &overlay);
 
+    // The direct picture path (the GS GPU renderer's path B, gs_gpu_present.h). While a source is set, present()
+    // asks it for the picture texture instead of uploading the CPU picture. Everything is called on the main thread.
+    struct PictureSource
+    {
+        // Records the commands that produce the picture into `commandBuffer` (outside any pass) and returns the
+        // kPictureWidth x kPictureHeight RGBA8 texture to draw (the picture in its top-left corner), or null.
+        SDL_GPUTexture *(*record)(SDL_GPUCommandBuffer *commandBuffer, void *user) = nullptr;
+        // Called after that command buffer was submitted.
+        void (*submitted)(void *user) = nullptr;
+        // The picture texture's pixels, waiting for the GPU (PS2X_PRESENT_DUMP).
+        bool (*download)(void *user, std::vector<uint8_t> &rgba) = nullptr;
+        void *user = nullptr;
+    };
+
     namespace gpu_present
     {
+        void setPictureSource(const PictureSource &source);
+        bool hasPictureSource();
+        // The pixels of the picture texture the source made (kPictureWidth x kPictureHeight RGBA8). False without a source.
+        bool downloadPicture(std::vector<uint8_t> &rgba);
+
         // Creates the device, claims the window and builds the pipeline. Returns false and fills
         // `failure` (and releases everything it made) when any step fails; the caller then falls back
         // to SDL_Renderer.

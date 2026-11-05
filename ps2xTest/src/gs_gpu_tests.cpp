@@ -1,7 +1,10 @@
 #include "MiniTest.h"
 #include "runtime/gs/gs_cpu_backend.h"
 #include "runtime/gs/gs_gpu_backend.h"
+#include "runtime/gs/gs_field_deinterlacer.h"
 #include "runtime/gs/gs_gpu_math.h"
+#include "runtime/gs/gs_gpu_present.h"
+#include "runtime/gs/gs_presentation.h"
 #include "runtime/gs/gs_texel.h"
 #include "runtime/gs/ps2_gs_memory.h"
 #include "runtime/gs/ps2_gs_transfer.h"
@@ -475,6 +478,408 @@ void register_gs_gpu_tests()
             t.Equals(host.size(), static_cast<size_t>(210 * 4), "bytes read");
             t.Equals(pos, static_cast<size_t>(0), "read position reset");
             t.IsTrue(std::memcmp(host.data(), px.data(), host.size()) == 0, "the same bytes come back");
+        });
+
+        tc.Run("GSPresent::MakePlan: which presentation requests are a plain copy of a frame region", [](TestCase &t)
+        {
+            using Kind = GSPresent::Plan::Kind;
+            const GSPresentationRequest usual = makeRequest(70);
+            GSPresent::Plan plan = GSPresent::MakePlan(usual);
+            t.IsTrue(plan.kind == Kind::DisplayFrame && plan.dualCircuit, "two circuits on the same frame");
+            t.Equals(plan.frame.fbp, 70u, "frame");
+            t.Equals(plan.frame.fbw, 10u, "buffer width");
+            t.Equals(plan.width, 640u, "width");
+            t.Equals(plan.height, 224u, "height");
+            t.IsTrue(plan.interlaced, "SMODE2.INT");
+
+            GSPresentationRequest r = usual;
+            r.dispfb2 = static_cast<uint64_t>(0) | (10ull << 9);
+            t.IsTrue(GSPresent::MakePlan(r).kind == Kind::Complex, "circuits on different frames");
+            r = usual;
+            r.pmode |= 0x80; // SLBG: the background colour shows through
+            t.IsTrue(GSPresent::MakePlan(r).kind == Kind::Complex, "SLBG");
+            r = usual;
+            r.display2 = (636ull) | (32ull << 12) | (639ull << 32) | (199ull << 44);
+            t.IsTrue(GSPresent::MakePlan(r).kind == Kind::Complex, "circuits of different sizes");
+            r = usual;
+            r.smode2 = 0x1; // INT on, FFMD off: field mode repeats lines
+            t.IsTrue(GSPresent::MakePlan(r).kind == Kind::Complex, "field mode");
+            r = usual;
+            r.pmode = 0x1; // one circuit
+            t.IsTrue(GSPresent::MakePlan(r).kind == Kind::DisplayFrame && !GSPresent::MakePlan(r).dualCircuit, "one circuit");
+            r.hasPreferredSource = true;
+            r.preferredDestFbp = 70;
+            r.preferredSource = {200, 10, GS_PSM_CT32, 0};
+            t.IsTrue(GSPresent::MakePlan(r).kind == Kind::Complex, "one circuit with a preferred source");
+            r.preferredDestFbp = 0; // not this frame
+            t.IsTrue(GSPresent::MakePlan(r).kind == Kind::DisplayFrame, "a preferred source for another frame does not apply");
+            r = usual;
+            r.pmode = 0;
+            t.IsTrue(GSPresent::MakePlan(r).kind == Kind::None, "no circuit");
+        });
+
+        tc.Run("the GPU renderer publishes a field per marker and Present shows the marker's field", [](TestCase &t)
+        {
+            if (!SDL_Init(SDL_INIT_VIDEO))
+            {
+                SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "offscreen");
+                if (!SDL_Init(SDL_INIT_VIDEO))
+                {
+                    std::cout << "    (skipped: no SDL video driver)" << std::endl;
+                    return;
+                }
+            }
+            const SDL_GPUShaderFormat formats = SDL_GPU_SHADERFORMAT_SPIRV | SDL_GPU_SHADERFORMAT_DXIL | SDL_GPU_SHADERFORMAT_MSL;
+            SDL_GPUDevice *device = SDL_CreateGPUDevice(formats, false, nullptr);
+            if (!device)
+            {
+                std::cout << "    (skipped: no GPU device: " << SDL_GetError() << ")" << std::endl;
+                return;
+            }
+            {
+                GSMem::InitLookupTables();
+                std::vector<uint8_t> vram(GSMem::MEMORY_SIZE, 0);
+                GSGpuBackend gpu(device, 1);
+                t.IsTrue(gpu.Ready() && gpu.SetFieldPublishing(true), "the GPU renderer sets up and publishes fields");
+                if (gpu.Ready() && gpu.FieldPublishing())
+                {
+                    gpu.Initialize(vram.data(), static_cast<uint32_t>(vram.size()));
+                    drawScene(gpu); // draws into frame 0 (fbp 0, 10 wide): flat background (40, 60, 90) and more
+                    const GSPresentationRequest request = makeRequest(0);
+                    gpu.MarkPresentation(request);
+
+                    GSGpuBackend::FieldInfo first;
+                    t.IsTrue(gpu.TakeNewestField(0, first), "a field was published");
+                    t.IsTrue(first.valid && first.slot >= 0 && first.width == 640 && first.height == 224 && first.seq == 1, "its size and slot");
+
+                    // The game draws the next field into the same buffer after the marker: the picture of the
+                    // marker must not change.
+                    GSContext ctx{};
+                    ctx.frame = {0, 10, GS_PSM_CT32, 0};
+                    ctx.zbuf = {140, GS_PSM_Z24, false};
+                    ctx.scissor = {0, 639, 0, 223};
+                    ctx.xyoffset = {static_cast<uint16_t>(1728u * 16u), static_cast<uint16_t>(1936u * 16u)};
+                    GSPrimitiveBatch overwrite = spriteBatch(0, 0, 640, 224);
+                    overwrite.state.context = ctx;
+                    overwrite.vertices[0].x = 1728.0f;
+                    overwrite.vertices[0].y = 1936.0f;
+                    overwrite.vertices[1].x = 1728.0f + 640.0f;
+                    overwrite.vertices[1].y = 1936.0f + 224.0f;
+                    overwrite.vertices[1].z = 90000.0;
+                    overwrite.vertices[1].r = 200;
+                    overwrite.vertices[1].g = 10;
+                    overwrite.vertices[1].b = 10;
+                    overwrite.vertices[1].a = 0x80;
+                    gpu.Submit(overwrite);
+                    gpu.Flush();
+                    PresentationFrame frame = gpu.Present(request);
+                    t.IsTrue(static_cast<bool>(frame) && frame.width == 640 && frame.height == 224, "Present returns the picture");
+                    if (frame)
+                    {
+                        const uint8_t *px = &frame.pixels[(200u * 640u + 600u) * 4u];
+                        t.IsTrue(std::abs(px[0] - 40) <= 2 && std::abs(px[1] - 60) <= 2 && std::abs(px[2] - 90) <= 2 && px[3] == 255,
+                                 "the pixel still has the marker's colour, not the colour drawn after it");
+                    }
+
+                    // The ring: a pinned slot is never handed to the GS thread again, and the newest field wins.
+                    std::vector<int> others;
+                    uint64_t seq = first.seq;
+                    bool pinnedReused = false;
+                    for (int i = 0; i < 30; ++i)
+                    {
+                        gpu.MarkPresentation(makeRequest(static_cast<uint32_t>(i % 2 ? 70 : 0)));
+                        GSGpuBackend::FieldInfo f;
+                        if (gpu.TakeNewestField(seq, f))
+                        {
+                            seq = f.seq;
+                            if (f.slot == first.slot)
+                                pinnedReused = true;
+                            gpu.UnpinField(f.slot);
+                            for (int c = 0; c < f.candidateCount; ++c)
+                                gpu.UnpinField(f.candidates[c]);
+                        }
+                    }
+                    t.IsFalse(pinnedReused, "a pinned slot is not overwritten");
+                    t.Equals(seq, 31ull, "every marker published a field");
+                    t.Equals(gpu.GetStats().fieldsDropped, 0ull, "no field was dropped");
+                    gpu.UnpinField(first.slot);
+                    for (int c = 0; c < first.candidateCount; ++c)
+                        gpu.UnpinField(first.candidates[c]);
+                    GSGpuBackend::FieldInfo nothing;
+                    t.IsFalse(gpu.TakeNewestField(seq, nothing), "nothing newer than the newest field");
+
+                    // The presenter: the placeholder before any field, then the deinterlaced picture of one.
+                    GSGpuPresenter presenter(gpu);
+                    t.IsTrue(presenter.Ready(), "the presenter sets up");
+                    if (presenter.Ready())
+                    {
+                        SDL_GPUCommandBuffer *cb = SDL_AcquireGPUCommandBuffer(device);
+                        presenter.Record(cb);
+                        SDL_SubmitGPUCommandBuffer(cb);
+                        presenter.Submitted();
+                        std::vector<uint8_t> shown;
+                        t.IsTrue(presenter.Download(shown), "the picture can be read");
+                        if (shown.size() == 640u * 512u * 4u)
+                            t.IsTrue(shown[0] == 255 && shown[1] == 0 && shown[2] == 255 && shown[3] == 255, "no field yet: the magenta placeholder");
+                        const GSGpuPresenter::Size size = presenter.Pull();
+                        t.IsTrue(size.width == 640 && size.height == 448, "an interlaced 640x224 field makes a 640x448 picture");
+                        cb = SDL_AcquireGPUCommandBuffer(device);
+                        presenter.Record(cb);
+                        SDL_SubmitGPUCommandBuffer(cb);
+                        presenter.Submitted();
+                        if (presenter.Download(shown) && shown.size() == 640u * 512u * 4u)
+                        {
+                            t.IsTrue(shown[3] == 255, "alpha is 255 inside the picture");
+                            t.IsTrue(shown[(460u * 640u + 10u) * 4u + 3u] == 0, "and 0 below it");
+                        }
+                    }
+                }
+            }
+            SDL_DestroyGPUDevice(device);
+        });
+
+        tc.Run("a black display frame at fbp 0 shows the other frame (Compose's fallback), and the GPU picture agrees", [](TestCase &t)
+        {
+            if (!SDL_Init(SDL_INIT_VIDEO))
+            {
+                SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "offscreen");
+                if (!SDL_Init(SDL_INIT_VIDEO))
+                {
+                    std::cout << "    (skipped: no SDL video driver)" << std::endl;
+                    return;
+                }
+            }
+            const SDL_GPUShaderFormat formats = SDL_GPU_SHADERFORMAT_SPIRV | SDL_GPU_SHADERFORMAT_DXIL | SDL_GPU_SHADERFORMAT_MSL;
+            SDL_GPUDevice *device = SDL_CreateGPUDevice(formats, false, nullptr);
+            if (!device)
+            {
+                std::cout << "    (skipped: no GPU device: " << SDL_GetError() << ")" << std::endl;
+                return;
+            }
+            {
+                GSMem::InitLookupTables();
+                std::vector<uint8_t> vram(GSMem::MEMORY_SIZE, 0);
+                GSGpuBackend gpu(device, 1);
+                t.IsTrue(gpu.Ready() && gpu.SetFieldPublishing(true), "the GPU renderer sets up and publishes fields");
+                if (gpu.Ready() && gpu.FieldPublishing())
+                {
+                    gpu.Initialize(vram.data(), static_cast<uint32_t>(vram.size()));
+                    GSPresentationRequest request = makeRequest(0);
+                    request.contextFrames[0] = {0, 10, GS_PSM_CT32, 0};
+                    request.contextFrames[1] = {70, 10, GS_PSM_CT32, 0};
+                    // a full-screen flat sprite into the frame buffer at `fbp`
+                    auto fill = [&](uint32_t fbp, uint8_t r, uint8_t g, uint8_t b)
+                    {
+                        GSContext ctx{};
+                        ctx.frame = {fbp, 10, GS_PSM_CT32, 0};
+                        ctx.zbuf = {140, GS_PSM_Z24, false};
+                        ctx.scissor = {0, 639, 0, 223};
+                        ctx.xyoffset = {static_cast<uint16_t>(1728u * 16u), static_cast<uint16_t>(1936u * 16u)};
+                        GSPrimitiveBatch p = spriteBatch(0, 0, 640, 224);
+                        p.state.context = ctx;
+                        p.vertices[0].x = 1728.0f;
+                        p.vertices[0].y = 1936.0f;
+                        p.vertices[1].x = 1728.0f + 640.0f;
+                        p.vertices[1].y = 1936.0f + 224.0f;
+                        p.vertices[1].z = 100.0;
+                        p.vertices[1].r = r;
+                        p.vertices[1].g = g;
+                        p.vertices[1].b = b;
+                        p.vertices[1].a = 0x80;
+                        gpu.Submit(p);
+                    };
+                    GSFieldDeinterlacer readback;
+                    GSGpuPresenter presenter(gpu);
+                    t.IsTrue(presenter.Ready(), "the presenter sets up");
+                    auto both = [&](const char *what, int expectR, int expectG, int expectB)
+                    {
+                        gpu.MarkPresentation(request);
+                        PresentationFrame frame = gpu.Present(request);
+                        t.IsTrue(static_cast<bool>(frame), std::string(what) + ": Present returns a picture");
+                        if (!frame || !presenter.Ready())
+                            return;
+                        const uint8_t *px = &frame.pixels[(100u * 640u + 300u) * 4u];
+                        t.IsTrue(std::abs(px[0] - expectR) <= 2 && std::abs(px[1] - expectG) <= 2 && std::abs(px[2] - expectB) <= 2,
+                                 std::string(what) + ": Present shows the expected colour");
+                        // the same through the runtime's CPU deinterlacer, and through the GPU presenter
+                        std::vector<uint8_t> packed(640u * 224u * 4u), expected(640u * 512u * 4u, 0u);
+                        for (uint32_t y = 0; y < 224u; ++y)
+                            std::memcpy(&packed[y * 640u * 4u], &frame.pixels[y * 640u * 4u], 640u * 4u);
+                        readback.process(packed.data(), 640u, 224u, expected.data(), 640u * 4u);
+                        presenter.Pull();
+                        SDL_GPUCommandBuffer *cb = SDL_AcquireGPUCommandBuffer(device);
+                        presenter.Record(cb);
+                        SDL_SubmitGPUCommandBuffer(cb);
+                        presenter.Submitted();
+                        std::vector<uint8_t> got;
+                        t.IsTrue(presenter.Download(got) && got.size() == expected.size(), std::string(what) + ": the GPU picture can be read");
+                        if (got.size() == expected.size())
+                            t.IsTrue(std::memcmp(got.data(), expected.data(), expected.size()) == 0,
+                                     std::string(what) + ": the GPU picture equals the CPU deinterlacer's on Present's pixels");
+                    };
+                    fill(70, 40, 60, 90);
+                    fill(0, 0, 0, 0);       // the displayed frame is black
+                    both("black display frame", 40, 60, 90);
+                    fill(70, 40, 60, 90);
+                    fill(0, 200, 10, 10);   // not black any more: no substitution
+                    both("non-black display frame", 200, 10, 10);
+                    fill(0, 0, 0, 0);
+                    fill(70, 0, 0, 0);      // both black: stays black
+                    both("both frames black", 0, 0, 0);
+                }
+            }
+            SDL_DestroyGPUDevice(device);
+        });
+
+        tc.Run("the GPU deinterlacer equals the CPU one on noise, on repeated fields (ties) and on black fields", [](TestCase &t)
+        {
+            if (!SDL_Init(SDL_INIT_VIDEO))
+            {
+                SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "offscreen");
+                if (!SDL_Init(SDL_INIT_VIDEO))
+                {
+                    std::cout << "    (skipped: no SDL video driver)" << std::endl;
+                    return;
+                }
+            }
+            const SDL_GPUShaderFormat formats = SDL_GPU_SHADERFORMAT_SPIRV | SDL_GPU_SHADERFORMAT_DXIL | SDL_GPU_SHADERFORMAT_MSL;
+            SDL_GPUDevice *device = SDL_CreateGPUDevice(formats, false, nullptr);
+            if (!device)
+            {
+                std::cout << "    (skipped: no GPU device: " << SDL_GetError() << ")" << std::endl;
+                return;
+            }
+            {
+                GSMem::InitLookupTables();
+                std::vector<uint8_t> vram(GSMem::MEMORY_SIZE, 0);
+                GSGpuBackend gpu(device, 1);
+                t.IsTrue(gpu.Ready() && gpu.SetFieldPublishing(true), "the GPU renderer sets up and publishes fields");
+                if (gpu.Ready() && gpu.FieldPublishing())
+                {
+                    gpu.Initialize(vram.data(), static_cast<uint32_t>(vram.size()));
+                    GSFieldDeinterlacer readback;
+                    GSGpuPresenter presenter(gpu);
+                    t.IsTrue(presenter.Ready(), "the presenter sets up");
+
+                    // A 640 x 224 field of `pattern` drawn 1:1 into the frame buffer at `fbp`: uploaded as a CT32
+                    // texture and drawn as a nearest-filtered, modulated sprite, which reproduces the texels exactly.
+                    // pattern 0: noise (seeded), 1: black, 2: the same noise as the last call.
+                    uint32_t seed = 12345u, lastSeed = seed;
+                    auto field = [&](uint32_t fbp, int pattern, uint32_t newSeed)
+                    {
+                        std::vector<uint32_t> texels(640u * 224u);
+                        if (pattern == 0)
+                            lastSeed = newSeed;
+                        uint32_t x = lastSeed * 2654435761u + 1u;
+                        for (uint32_t &px : texels)
+                        {
+                            x ^= x << 13;
+                            x ^= x >> 17;
+                            x ^= x << 5;
+                            // noise, with half of the picture smooth so that "nothing moved" and "moved" both occur
+                            px = pattern == 1 ? 0xFF000000u : ((x & 0x00FFFFFFu) | 0x80000000u);
+                        }
+                        if (pattern != 1)
+                            for (uint32_t i = 0; i < texels.size(); ++i)
+                                if ((i % 640u) < 320u)
+                                    texels[i] = (texels[i] & 0xFFF0F0F0u) | 0x80000000u; // coarser values on the left half
+                        GSTransferCommand cmd{};
+                        cmd.bitbltbuf.dbp = 8000;
+                        cmd.bitbltbuf.dbw = 10;
+                        cmd.bitbltbuf.dpsm = GS_PSM_CT32;
+                        cmd.trxreg = {640, 224};
+                        cmd.direction = 0;
+                        gpu.BeginTransfer(cmd);
+                        gpu.UploadImage(reinterpret_cast<const uint8_t *>(texels.data()), static_cast<uint32_t>(texels.size() * 4));
+                        gpu.TextureFlush();
+                        GSContext ctx{};
+                        ctx.frame = {fbp, 10, GS_PSM_CT32, 0};
+                        ctx.zbuf = {140, GS_PSM_Z24, false};
+                        ctx.scissor = {0, 639, 0, 223};
+                        ctx.xyoffset = {static_cast<uint16_t>(1728u * 16u), static_cast<uint16_t>(1936u * 16u)};
+                        ctx.tex0 = {8000, 10, GS_PSM_CT32, 10, 8, 1, 0, 0, 0, 0, 0, 0}; // 1024 x 256 declared, 640 wide in memory
+                        GSPrimitiveBatch p;
+                        p.vertexCount = 2;
+                        p.state.context = ctx;
+                        p.state.prim.type = GS_PRIM_SPRITE;
+                        p.state.prim.tme = true;
+                        p.state.prim.fst = true;
+                        p.state.textureWidth = 1024;
+                        p.state.textureHeight = 256;
+                        p.vertices[0].x = 1728.0f;
+                        p.vertices[0].y = 1936.0f;
+                        p.vertices[0].u = 0;
+                        p.vertices[0].v = 0;
+                        p.vertices[1].x = 1728.0f + 640.0f;
+                        p.vertices[1].y = 1936.0f + 224.0f;
+                        p.vertices[1].u = 640 * 16;
+                        p.vertices[1].v = 224 * 16;
+                        p.vertices[1].z = 100.0;
+                        p.vertices[1].r = p.vertices[1].g = p.vertices[1].b = p.vertices[1].a = 0x80;
+                        gpu.Submit(p);
+                    };
+
+                    uint64_t compared = 0, differing = 0, ties = 0;
+                    auto step = [&](const char *what, uint32_t fbp, int pattern, uint32_t newSeed)
+                    {
+                        field(fbp, pattern, newSeed);
+                        GSPresentationRequest request = makeRequest(fbp);
+                        gpu.MarkPresentation(request);
+                        PresentationFrame frame = gpu.Present(request);
+                        t.IsTrue(static_cast<bool>(frame) && frame.width == 640 && frame.height == 224, std::string(what) + ": Present returns the field");
+                        if (!frame)
+                            return;
+                        std::vector<uint8_t> packed(640u * 224u * 4u), expected(640u * 512u * 4u, 0u);
+                        for (uint32_t y = 0; y < 224u; ++y)
+                            std::memcpy(&packed[y * 640u * 4u], &frame.pixels[y * 640u * 4u], 640u * 4u);
+                        readback.process(packed.data(), 640u, 224u, expected.data(), 640u * 4u);
+                        if (readback.lastDecision().measured && readback.lastDecision().lowerError == readback.lastDecision().upperError)
+                            ++ties;
+                        presenter.Pull();
+                        SDL_GPUCommandBuffer *cb = SDL_AcquireGPUCommandBuffer(device);
+                        presenter.Record(cb);
+                        SDL_SubmitGPUCommandBuffer(cb);
+                        presenter.Submitted();
+                        std::vector<uint8_t> got;
+                        if (!presenter.Download(got) || got.size() != expected.size())
+                        {
+                            t.Fail(std::string(what) + ": the GPU picture could not be read");
+                            return;
+                        }
+                        ++compared;
+                        if (std::memcmp(got.data(), expected.data(), expected.size()) != 0)
+                        {
+                            ++differing;
+                            t.Fail(std::string(what) + ": the GPU picture differs from the CPU deinterlacer's");
+                        }
+                    };
+
+                    // alternating buffers like the game; noise, a repeated field (a tie), black, noise again
+                    uint32_t fbp = 0;
+                    for (int i = 0; i < 6; ++i)
+                    {
+                        step("noise", fbp, 0, 100u + static_cast<uint32_t>(i));
+                        fbp = fbp == 0 ? 70 : 0;
+                    }
+                    step("repeat", fbp, 2, 0);   // the same noise as the last field, drawn into the other buffer: identical fields
+                    fbp = fbp == 0 ? 70 : 0;
+                    step("repeat", fbp, 2, 0);
+                    fbp = fbp == 0 ? 70 : 0;
+                    step("black", fbp, 1, 0);
+                    fbp = fbp == 0 ? 70 : 0;
+                    step("black", fbp, 1, 0);    // black after black: another tie
+                    fbp = fbp == 0 ? 70 : 0;
+                    for (int i = 0; i < 4; ++i)
+                    {
+                        step("noise again", fbp, 0, 200u + static_cast<uint32_t>(i));
+                        fbp = fbp == 0 ? 70 : 0;
+                    }
+                    t.Equals(differing, 0ull, "no picture differs");
+                    t.IsTrue(compared == 14u, "14 pictures were compared (" + std::to_string(compared) + ")");
+                    t.IsTrue(ties >= 2u, "the sequence contained ties (" + std::to_string(ties) + ")");
+                }
+            }
+            SDL_DestroyGPUDevice(device);
         });
 
         tc.Run("the GPU renderer draws a small scene like the CPU renderer", [](TestCase &t)

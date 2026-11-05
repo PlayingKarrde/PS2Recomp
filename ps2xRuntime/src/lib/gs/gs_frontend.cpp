@@ -1,5 +1,9 @@
 #include "runtime/gs/gs_frontend.h"
+#include "runtime/gs/gs_backend_probe.h"
 #include "runtime/gs/gs_cpu_backend.h"
+#if !defined(PLATFORM_VITA)
+#include "runtime/gs/gs_gpu_backend.h"
+#endif
 #include "ps2_log.h"
 #include "runtime/ps2_memory.h"
 #include <atomic>
@@ -501,17 +505,55 @@ uint32_t GS::getLastDisplayBaseBytes() const
 void GS::refreshDisplaySnapshot()
 {
     // FPWR: the EE scheduler calls this at each VBlankStart. The CPU backend then presents VRAM as
-    // of this point in the command stream (GSCpuBackend::MarkPresentation); other backends keep
-    // the old full snapshot.
+    // of this point in the command stream (GSCpuBackend::MarkPresentation); the GPU backend submits its
+    // draws and, on its direct path, publishes the displayed field; other backends keep the old full
+    // snapshot. A GSBackendProbe (PS2X_GS_STATS=1) is looked through, and times the call.
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     if (!m_backend || !m_privRegs)
         return;
-    if (auto *cpu = dynamic_cast<GSCpuBackend *>(m_backend.get()))
+    GSBackendProbe *probe = dynamic_cast<GSBackendProbe *>(m_backend.get());
+    GSRasterBackend *backend = probe ? probe->Inner() : m_backend.get();
+    bool marked = false;
+    const auto mark = [&]()
     {
-        cpu->MarkPresentation(buildPresentationRequestUnlocked());
-        return;
-    }
-    snapshotVRAM();
+        if (auto *cpu = dynamic_cast<GSCpuBackend *>(backend))
+        {
+            cpu->MarkPresentation(buildPresentationRequestUnlocked());
+            marked = true;
+            return;
+        }
+#if !defined(PLATFORM_VITA)
+        if (auto *gpu = dynamic_cast<GSGpuBackend *>(backend))
+        {
+            const GSGpuBackend::MarkResult result = gpu->MarkPresentation(buildPresentationRequestUnlocked());
+            marked = true;
+            if (result.direct)
+            {
+                // The host draws the fields itself and never calls latchHostPresentationFrame; keep the numbers the
+                // debug panel shows ("Host presentation") and its Present history current. (On the readback path the
+                // latch fills them, and the picture buffer it keeps must not be touched from here.)
+                {
+                    std::lock_guard<std::mutex> presentationLock(m_presentationMutex);
+                    m_hostPresentationFrame.clear();
+                    m_hostPresentationWidth = result.width;
+                    m_hostPresentationHeight = result.height;
+                    m_hostPresentationDisplayFbp = result.displayFbp;
+                    m_hostPresentationSourceFbp = result.sourceFbp;
+                    m_hostPresentationUsedPreferred = result.usedPreferred;
+                    m_hasHostPresentationFrame = result.valid;
+                }
+                if (result.valid)
+                    recordPresentDebugEventUnlocked(result.displayFbp, result.sourceFbp, result.width, result.height, result.usedPreferred);
+            }
+        }
+#endif
+    };
+    if (probe)
+        probe->TimedMark(mark);
+    else
+        mark();
+    if (!marked)
+        snapshotVRAM();
 }
 
 GSPresentationRequest GS::buildPresentationRequestUnlocked() const

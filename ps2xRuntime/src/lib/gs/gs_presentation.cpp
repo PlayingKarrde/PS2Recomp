@@ -4,6 +4,9 @@
 #include "runtime/gs/ps2_gs_transfer.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 // Moved from gs_cpu_backend.cpp: the part of Present() that turns display registers into a picture
@@ -129,6 +132,25 @@ namespace
         return GSInternal::clampU8(static_cast<int>(dst) + ((delta * static_cast<int>(factor)) / 255));
     }
 
+    // Counters for PS2X_GS_PRESENT_STATS=1: which of Compose's branches the game takes.
+    struct Counters
+    {
+        std::atomic<uint64_t> composes{0}, none{0}, dual{0}, dualSame{0}, dualSlbg{0}, dualDifferent{0}, single{0}, singlePreferred{0},
+            fieldMode{0}, blackChecked{0}, blackFrames{0}, blackFallbackUsed{0};
+    } g_counters;
+
+    void printCounters()
+    {
+        const auto n = [](const std::atomic<uint64_t> &a) { return static_cast<unsigned long long>(a.load()); };
+        std::printf("[gs:present-stats] composes=%llu none=%llu dual=%llu (same source %llu, SLBG %llu, different %llu) single=%llu "
+                    "(preferred source used %llu) field-mode=%llu | black check (fbp 0, no preferred source): checked %llu, display black %llu, "
+                    "other frame substituted %llu\n",
+                    n(g_counters.composes), n(g_counters.none), n(g_counters.dual), n(g_counters.dualSame), n(g_counters.dualSlbg),
+                    n(g_counters.dualDifferent), n(g_counters.single), n(g_counters.singlePreferred), n(g_counters.fieldMode),
+                    n(g_counters.blackChecked), n(g_counters.blackFrames), n(g_counters.blackFallbackUsed));
+        std::fflush(stdout);
+    }
+
     uint32_t countNonBlackPixels(const std::vector<uint8_t> &pixels, uint32_t width, uint32_t height)
     {
         uint32_t count = 0u;
@@ -225,9 +247,106 @@ bool CopyFrameFromMemory(uint8_t *vram,
     return true;
 }
 
+bool StatsEnabled()
+{
+    static const bool on = []()
+    {
+        const char *value = std::getenv("PS2X_GS_PRESENT_STATS");
+        return value && value[0] == '1';
+    }();
+    return on;
+}
+
+Plan MakePlan(const GSPresentationRequest &request)
+{
+    Plan plan;
+    const GSPmodeState pmode = decodePmode(request.pmode);
+    const GSSmode2State smode2 = decodeSMode2(request.smode2);
+    plan.interlaced = smode2.interlaced;
+    const GSFrameReg displayFrame1 = decodeDisplayFrame(request.dispfb1);
+    const GSFrameReg displayFrame2 = decodeDisplayFrame(request.dispfb2);
+    const GSDisplayReadOrigin origin1 = decodeDisplayReadOrigin(request.dispfb1);
+    const GSDisplayReadOrigin origin2 = decodeDisplayReadOrigin(request.dispfb2);
+    uint32_t width1 = 0u, height1 = 0u, width2 = 0u, height2 = 0u;
+    decodeDisplaySize(request.display1, width1, height1);
+    decodeDisplaySize(request.display2, width2, height2);
+    const bool valid1 = pmode.enableCrt1 && hasDisplaySetup(request.display1, displayFrame1);
+    const bool valid2 = pmode.enableCrt2 && hasDisplaySetup(request.display2, displayFrame2);
+    if (!valid1 && !valid2)
+        return plan;
+
+    plan.kind = Plan::Kind::Complex;
+    if (smode2.interlaced && !smode2.frameMode)
+        return plan; // field mode: Compose repeats lines (applyFieldPresentation)
+
+    if (valid1 && valid2)
+    {
+        // Two circuits reading the same pixels: the blend of a pixel with itself is the pixel, whatever
+        // the blend factor, and with SLBG off the background colour is covered completely.
+        if (displayFrame1.fbp == displayFrame2.fbp && displayFrame1.fbw == displayFrame2.fbw && displayFrame1.psm == displayFrame2.psm &&
+            origin1.x == origin2.x && origin1.y == origin2.y && width1 == width2 && height1 == height2 && !pmode.slbg)
+        {
+            plan.kind = Plan::Kind::DisplayFrame;
+            plan.frame = displayFrame1;
+            plan.originX = origin1.x;
+            plan.originY = origin1.y;
+            plan.width = width1;
+            plan.height = height1;
+            plan.dualCircuit = true;
+        }
+        return plan;
+    }
+
+    const GSFrameReg &displayFrame = valid1 ? displayFrame1 : displayFrame2;
+    const GSDisplayReadOrigin &origin = valid1 ? origin1 : origin2;
+    const bool preferred = request.hasPreferredSource && request.preferredDestFbp == displayFrame.fbp &&
+                           (request.preferredSource.fbw != 0u || request.preferredSource.fbp != displayFrame.fbp);
+    if (preferred)
+        return plan;
+    plan.kind = Plan::Kind::DisplayFrame;
+    plan.frame = displayFrame;
+    plan.originX = origin.x;
+    plan.originY = origin.y;
+    plan.width = valid1 ? width1 : width2;
+    plan.height = valid1 ? height1 : height2;
+    return plan;
+}
+
 PresentationFrame Compose(const GSPresentationRequest &request, const CopyFrameFn &copyFrame)
 {
     PresentationFrame result{};
+    const bool stats = StatsEnabled();
+    if (stats)
+    {
+        const Plan plan = MakePlan(request);
+        const uint64_t count = g_counters.composes.fetch_add(1) + 1u;
+        const GSPmodeState pm = decodePmode(request.pmode);
+        const GSSmode2State sm = decodeSMode2(request.smode2);
+        if (plan.kind == Plan::Kind::None)
+        {
+            g_counters.none.fetch_add(1);
+        }
+        else if (sm.interlaced && !sm.frameMode)
+        {
+            g_counters.fieldMode.fetch_add(1);
+        }
+        else if (pm.enableCrt1 && pm.enableCrt2)
+        {
+            g_counters.dual.fetch_add(1);
+            if (plan.kind == Plan::Kind::DisplayFrame)
+                g_counters.dualSame.fetch_add(1);
+            else
+                (pm.slbg ? g_counters.dualSlbg : g_counters.dualDifferent).fetch_add(1);
+        }
+        else
+        {
+            g_counters.single.fetch_add(1);
+            if (plan.kind == Plan::Kind::Complex)
+                g_counters.singlePreferred.fetch_add(1);
+        }
+        if (count % 300u == 1u)
+            printCounters();
+    }
     const GSPmodeState pmode = decodePmode(request.pmode);
     const GSSmode2State smode2 = decodeSMode2(request.smode2);
     const bool fieldMode = smode2.interlaced && !smode2.frameMode;
@@ -267,7 +386,15 @@ PresentationFrame Compose(const GSPresentationRequest &request, const CopyFrameF
         if (pixels.empty() && !copyFrame(displayFrame, width, height, pixels, preserveAlpha, true, true, origin.x, origin.y))
             return false;
 
-        if (!usedPreferred && displayFrame.fbp == 0u && countNonBlackPixels(pixels, width, height) == 0u)
+        const bool blackCheck = !usedPreferred && displayFrame.fbp == 0u;
+        const bool displayBlack = blackCheck && countNonBlackPixels(pixels, width, height) == 0u;
+        if (stats && blackCheck)
+        {
+            g_counters.blackChecked.fetch_add(1);
+            if (displayBlack)
+                g_counters.blackFrames.fetch_add(1);
+        }
+        if (displayBlack)
         {
             for (const GSFrameReg &candidate : request.contextFrames)
             {
@@ -280,6 +407,8 @@ PresentationFrame Compose(const GSPresentationRequest &request, const CopyFrameF
                     continue;
                 selected = candidate;
                 pixels.swap(candidatePixels);
+                if (stats)
+                    g_counters.blackFallbackUsed.fetch_add(1);
                 break;
             }
         }

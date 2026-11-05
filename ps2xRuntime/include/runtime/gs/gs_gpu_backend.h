@@ -1,10 +1,9 @@
 #pragma once
 
-// FPWR: GSGpuBackend, a GS renderer on SDL_GPU (GPU renderer milestone M2; design in docs/gpu-renderer.md).
+// FPWR: GSGpuBackend, a GS renderer on SDL_GPU (GPU renderer milestones M2 and M3; design in docs/gpu-renderer.md).
 //
 // It implements GSRasterBackend like GSCpuBackend, so the same recorded clips can be replayed through
-// either one (ps2x_gs_replay --backend gpu). In M2 it is only used by the replayer; the game still draws
-// with GSCpuBackend.
+// either one (ps2x_gs_replay --backend gpu). The game uses it when PS2X_GS_BACKEND=gpu (gs_gpu_host.h).
 //
 // How it works:
 //   - The 4 MiB GS memory image the backend is given (Initialize) is kept up to date by every host to
@@ -17,7 +16,23 @@
 //   - Draws are recorded into one command buffer at Flush, Sync, Present or MarkPresentation (and when a
 //     list gets large) and submitted at once.
 //
-// The device is not created here: the replayer creates a headless one, and the game will pass the host's
+// Field publishing (SetFieldPublishing(true), what the game uses): at each guest VBlank (MarkPresentation)
+// the GS thread copies the displayed region of the frame target into one of kFieldSlots field textures on
+// the GPU, in the same command buffer as the draws, and publishes it. The frame target keeps changing as the
+// game draws the next field, so this copy, taken at the VBlank, is what the picture of that VBlank is. Two
+// ways to get the picture out of it:
+//   Path A, readback: Present() downloads the field and returns CPU pixels, exactly as
+//     GSCpuBackend::Present does (the same GSPresent::Compose rules, run on the pixels). The runtime then
+//     deinterlaces them on the CPU and uploads them to the window's texture. It is the reference and the
+//     fallback (PS2X_GS_GPU_READBACK=1).
+//   Path B, direct: the host's main thread takes the newest field (TakeNewestField), builds the 448-line
+//     picture from the last three fields on the GPU (gs_gpu_present.h) and draws it into the window.
+//     Nothing is read back. See "Field ring" in gs_gpu_backend.cpp for why the hand-over between the two
+//     threads is safe without waiting.
+// Without field publishing (the replayer's M2 mode, unit tests) Present() reads the frame targets as they are
+// when it is called.
+//
+// The device is not created here: the replayer creates a headless one, and the game passes the host's
 // (ps2x_host::gpuDevice()). This header does not include SDL.
 
 #include "runtime/gs/gs_backend.h"
@@ -26,6 +41,7 @@
 #include <memory>
 
 struct SDL_GPUDevice;
+struct SDL_GPUTexture;
 
 namespace GSRec
 {
@@ -66,6 +82,53 @@ public:
         uint64_t ignoredFeatures = 0;     // prims using a GS feature the backend does not implement (see the log)
         uint64_t presents = 0;
         uint64_t downloadBytes = 0;
+        // Direct presentation (path B)
+        uint64_t presentsFromFields = 0;  // Present() calls answered from the published field
+        uint64_t backlogWaits = 0;        // markers at which the GS thread waited for the GPU to catch up (see kMaxFramesInFlight)
+        uint64_t backlogWaitNanos = 0;    // ... and how long it waited in all
+        uint64_t fieldsFast = 0;          // fields copied on the GPU
+        uint64_t fieldsWithCandidates = 0; // ... of which also copied the fallback frames (display frame at fbp 0)
+        uint64_t fieldsSlow = 0;          // fields that needed pixels on the CPU (Compose with real pixels)
+        uint64_t fieldsInvalid = 0;       // markers with no picture (the display is not set up)
+        uint64_t fieldsDropped = 0;       // fields not published because every slot was in use
+        uint64_t signaturesLive = 0;      // entries of the texture signature map now (not cleared by ResetStats)
+        uint64_t textureBytesLive = 0;    // bytes of cached GPU textures now (not cleared by ResetStats)
+    };
+
+    // One field published by the GS thread for the host (path B). A field uses one slot for the displayed
+    // region, and up to two more for the frame buffers Compose falls back to when the displayed one is
+    // black (see GSPresent::Compose); the host tests for black and chooses on the GPU. In the worst case
+    // 3 slots are pinned by the host, 3 are the latest field's and 3 are being written.
+    static constexpr int kFieldSlots = 9;
+    static constexpr uint32_t kFieldTextureWidth = 640;
+    static constexpr uint32_t kFieldTextureHeight = 512;
+    struct FieldInfo
+    {
+        uint64_t seq = 0;             // 1, 2, 3 ... in publication order; 0 = nothing published yet
+        int slot = -1;                // index of the field texture; -1 when !valid
+        int candidates[2] = {-1, -1}; // slots holding the fallback frames' regions (same size), in Compose's order
+        int candidateCount = 0;
+        // What the slots hold, so Present() can run Compose on them: the displayed frame buffer and the region
+        // read from it, and the fallback frames (read from their top-left corner).
+        GSFrameReg displayFrame{};
+        uint32_t originX = 0, originY = 0;
+        GSFrameReg candidateFrames[2]{};
+        bool valid = false;           // false: this marker had no picture (the display is not set up)
+        bool composed = false;        // the slot holds Compose's finished picture (it needed real pixels), not a frame region
+        uint32_t width = 0, height = 0; // the picture, in the top-left corner of the slot texture
+        bool interlaced = false;      // SMODE2.INT: the picture is one field of an interlaced frame
+        uint32_t displayFbp = 0, sourceFbp = 0;
+        bool usedPreferred = false;
+    };
+
+    // What MarkPresentation did, for the frontend's debug view.
+    struct MarkResult
+    {
+        bool published = false;       // field publishing is on
+        bool direct = false;          // and the host draws the fields itself (path B): nothing calls Present()
+        bool valid = false;
+        uint32_t width = 0, height = 0, displayFbp = 0, sourceFbp = 0;
+        bool usedPreferred = false;
     };
 
     // `scale` multiplies the render target size; only 1 is supported in M2.
@@ -104,8 +167,29 @@ public:
     GSTransferSnapshot GetTransferSnapshot() const override;
 
     // Called at each guest vertical blank (GSCpuBackend::MarkPresentation does the same job): submits
-    // the draws recorded so far, which are what the displayed frame buffers hold at this point.
-    void MarkPresentation(const GSPresentationRequest &request);
+    // the draws recorded so far, which are what the displayed frame buffers hold at this point. With
+    // field publishing on it also copies the displayed region into a field texture and publishes it.
+    // Call it from the one thread that draws (the game's GS thread).
+    MarkResult MarkPresentation(const GSPresentationRequest &request);
+
+    // ---- Field publishing (paths A and B) ----
+    // Turns it on (creates the field textures). False, with a log line, when the device cannot do it.
+    // Do this before the game starts drawing. Present() then answers from the newest published field.
+    // `directConsumer` says the host takes the fields itself (GSGpuPresenter) and never calls Present(); the
+    // frontend then keeps its debug view of the presentation current from MarkResult.
+    bool SetFieldPublishing(bool enabled, bool directConsumer = false);
+    bool FieldPublishing() const;
+
+    // Consumer side, any thread, never waits for the GS thread or the GPU (only a lock held for a few
+    // instructions). Takes the newest field published after `afterSeq` and pins its slots (see UnpinField);
+    // false when there is none. An invalid field (no picture) pins nothing.
+    bool TakeNewestField(uint64_t afterSeq, FieldInfo &out);
+    // A pinned slot is never overwritten. The consumer holds a pin for as long as it still has to submit
+    // commands that read the slot (and for as long as it wants the field as history), then unpins.
+    void PinField(int slot);
+    void UnpinField(int slot);
+    SDL_GPUTexture *FieldTexture(int slot) const;
+    SDL_GPUDevice *Device() const;
 
     // The backend state a recording starts from (CLUT, transfer in progress, pending local-to-host
     // bytes). The recording's texture page cache has no equivalent here.

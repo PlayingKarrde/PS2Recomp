@@ -9,8 +9,9 @@
 // Threads:
 //  - The main thread owns the window and the renderer (or the GPU device). It runs pumpEvents(),
 //    updatePicture(), drawPicture() and presentAndPace() once per host frame.
-//  - The game thread (the PS2's CPU) reads the pad while it runs. It never calls SDL: the main
-//    thread copies keyboard and controller state into atomics, and the game thread reads those.
+//  - The game thread (the PS2's CPU) reads the pad while it runs. It never calls SDL for input: the main
+//    thread copies keyboard and controller state into atomics, and the game thread reads those. (With the GS GPU
+//    renderer it does use the SDL_GPU device for drawing; the window and swapchain stay on the main thread.)
 //  - SDL's audio thread calls audioCallback(), which asks the SPU2 emulation for samples.
 //
 // Short presses: a key that goes down and up between two reads by the game would be invisible
@@ -322,6 +323,10 @@ namespace ps2x_host
             int lastWidth = 0, lastHeight = 0;
             float lastAspect = 0.0f;
             bool havePixels = false;
+            // GPU source (path B): the dump is written after the next present(), from the picture texture.
+            bool dumpPending = false;
+            int pendingWidth = 0, pendingHeight = 0;
+            float pendingAspect = 0.0f;
 
             bool fixed = false;
             std::vector<uint8_t> fixedPixels;
@@ -363,17 +368,9 @@ namespace ps2x_host
                         static_cast<double>(g_pictureHooks.fixedAspect));
         }
 
-        // Called from drawPicture(): writes the dump if its trigger file is there.
-        void maybeDumpPicture(int srcWidth, int srcHeight, float aspect)
+        // Writes the picture file described above.
+        void writePictureFile(int srcWidth, int srcHeight, float aspect, const std::vector<uint8_t> &pixels)
         {
-            if (g_pictureHooks.dumpPath.empty() || !g_pictureHooks.havePixels)
-                return;
-            const std::string trigger = g_pictureHooks.dumpPath + ".go";
-            std::FILE *probe = std::fopen(trigger.c_str(), "rb");
-            if (!probe)
-                return;
-            std::fclose(probe);
-            std::remove(trigger.c_str());
             std::FILE *file = std::fopen(g_pictureHooks.dumpPath.c_str(), "wb");
             if (!file)
                 return;
@@ -384,10 +381,51 @@ namespace ps2x_host
             std::memcpy(&withAspect[2], &aspect, sizeof(float));
             std::fwrite(kPictureFileMagic, 1, 8, file);
             std::fwrite(withAspect, sizeof(uint32_t), 5, file);
-            std::fwrite(g_pictureHooks.lastPixels.data(), 1, g_pictureHooks.lastPixels.size(), file);
+            std::fwrite(pixels.data(), 1, pixels.size(), file);
             std::fclose(file);
             std::printf("[host] picture written to %s (%dx%d)\n", g_pictureHooks.dumpPath.c_str(), srcWidth, srcHeight);
             std::fflush(stdout);
+        }
+
+        // Called from drawPicture(): writes the dump if its trigger file is there. With the GS GPU renderer's
+        // direct path there are no CPU pixels: the dump is then written after this frame's present(), by
+        // writePendingDump(), from a download of the picture texture (opt-in, so the wait is fine).
+        void maybeDumpPicture(int srcWidth, int srcHeight, float aspect)
+        {
+            if (g_pictureHooks.dumpPath.empty())
+                return;
+            const bool fromGpu = gpu_present::hasPictureSource();
+            if (!fromGpu && !g_pictureHooks.havePixels)
+                return;
+            const std::string trigger = g_pictureHooks.dumpPath + ".go";
+            std::FILE *probe = std::fopen(trigger.c_str(), "rb");
+            if (!probe)
+                return;
+            std::fclose(probe);
+            std::remove(trigger.c_str());
+            if (fromGpu)
+            {
+                g_pictureHooks.dumpPending = true;
+                g_pictureHooks.pendingWidth = srcWidth;
+                g_pictureHooks.pendingHeight = srcHeight;
+                g_pictureHooks.pendingAspect = aspect;
+                return;
+            }
+            writePictureFile(srcWidth, srcHeight, aspect, g_pictureHooks.lastPixels);
+        }
+
+        void writePendingDump()
+        {
+            if (!g_pictureHooks.dumpPending)
+                return;
+            g_pictureHooks.dumpPending = false;
+            std::vector<uint8_t> pixels;
+            if (!gpu_present::downloadPicture(pixels))
+            {
+                std::fprintf(stderr, "[host] could not download the picture for PS2X_PRESENT_DUMP\n");
+                return;
+            }
+            writePictureFile(g_pictureHooks.pendingWidth, g_pictureHooks.pendingHeight, g_pictureHooks.pendingAspect, pixels);
         }
         std::atomic<bool> g_quitRequested{false};
         std::atomic<void (*)(const void *)> g_eventHook{nullptr};
@@ -895,7 +933,7 @@ namespace ps2x_host
 
     void drawPicture(int srcWidth, int srcHeight, float aspect)
     {
-        if (g_pictureHooks.fixed)
+        if (g_pictureHooks.fixed && !gpu_present::hasPictureSource())
         {
             srcWidth = g_pictureHooks.fixedWidth;
             srcHeight = g_pictureHooks.fixedHeight;
@@ -935,12 +973,26 @@ namespace ps2x_host
     void presentAndPace()
     {
         {
+            // Test hook (opt-in): PS2X_TEST_MAIN_STALL_MS=N makes the main thread sleep N ms every 120th host frame, to
+            // show that nothing the game thread does waits for the main thread (the GS GPU renderer's direct path
+            // hands pictures over without a wait; see gs_gpu_backend.cpp, "Field ring").
+            static const int stallMs = []()
+            {
+                const char *value = std::getenv("PS2X_TEST_MAIN_STALL_MS");
+                return value ? std::atoi(value) : 0;
+            }();
+            static uint64_t stallFrames = 0;
+            if (stallMs > 0 && ++stallFrames % 120u == 0)
+                SDL_Delay(static_cast<Uint32>(stallMs));
+        }
+        {
             ScopedPhase timing(g_presentStats.present);
             if (g_video.gpu)
                 gpu_present::present();
             else if (g_video.renderer)
                 SDL_RenderPresent(g_video.renderer);
         }
+        writePendingDump();
         reportStats();
         pace();
     }

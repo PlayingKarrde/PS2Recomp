@@ -409,6 +409,7 @@ add_library(ps2_runtime STATIC
     src/lib/gs/gs_recording.cpp
     src/lib/gs/ps2_gs_transfer.cpp
     src/lib/gs/gs_presentation.cpp
+    src/lib/gs/gs_backend_probe.cpp
     src/lib/ps2_iop_host.cpp
     src/lib/ps2_memory.cpp
     src/lib/ps2_pad.cpp
@@ -438,7 +439,11 @@ if(NOT PS2X_IS_VITA)
     target_sources(ps2_runtime PRIVATE src/lib/ps2_host_gpu.cpp)
     # The GS GPU renderer (GSGpuBackend, M2) takes the same two include directories, for the same reason.
     target_sources(ps2_runtime PRIVATE src/lib/gs/gs_gpu_backend.cpp)
-    set_source_files_properties(src/lib/ps2_host_gpu.cpp src/lib/gs/gs_gpu_backend.cpp PROPERTIES
+    # M3: the main-thread presenter of the direct picture path (its compiled shaders) and the code that chooses and
+    # wires up the GPU renderer for the game (it asks the host presenter for its device).
+    target_sources(ps2_runtime PRIVATE src/lib/gs/gs_gpu_present.cpp src/lib/gs/gs_gpu_host.cpp)
+    set_source_files_properties(src/lib/ps2_host_gpu.cpp src/lib/gs/gs_gpu_backend.cpp src/lib/gs/gs_gpu_present.cpp
+        src/lib/gs/gs_gpu_host.cpp PROPERTIES
         INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/src/lib;${CMAKE_CURRENT_SOURCE_DIR}")
 endif()
 
