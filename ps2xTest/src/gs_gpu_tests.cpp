@@ -317,6 +317,62 @@ void register_gs_gpu_tests()
             t.Equals(s.maxX, 5, "covers the one pixel");
         });
 
+        tc.Run("progressive mapping removes the half line between fields and samples rows at j / sy", [](TestCase &t)
+        {
+            // The game sends the same vertices in both kinds of field and offsets alternate fields by half a line in OFY.
+            GSPrimitiveBatch a = triangleBatch(10.0f, 20.75f, 50.0f, 20.75f, 10.0f, 60.75f);
+            GSPrimitiveBatch b = a;
+            b.state.context.xyoffset.ofy = static_cast<uint16_t>(1936u * 16u + 8u); // OFY 1936.5
+            const TargetMapping progressive{1, 2, true}, weave{1, 1, false};
+            Setup sa, sb;
+            t.IsTrue(BuildTriangle(a, progressive, sa) && BuildTriangle(b, progressive, sb), "progressive triangles convert");
+            for (int i = 0; i < 3; ++i)
+            {
+                t.Equals(sa.v[i].y, sb.v[i].y, "the two kinds of field have the same geometry");
+                t.Equals(sa.v[i].x, sb.v[i].x, "... in x too");
+            }
+            t.Equals(sa.v[0].x, 10.5f, "x keeps the pixel-centre shift at scale 1");
+            t.Equals(sa.v[0].y, 20.75f * 2.0f + 0.5f, "row j of the target samples the field at y = j / 2");
+            t.Equals(sa.v[2].y, 60.75f * 2.0f + 0.5f, "vertex 2");
+            t.Equals(sa.minY, sb.minY, "same bounding box (min y)");
+            t.Equals(sa.maxY, sb.maxY, "same bounding box (max y)");
+            // weave mode keeps the half line
+            Setup wa, wb;
+            t.IsTrue(BuildTriangle(a, weave, wa) && BuildTriangle(b, weave, wb), "weave triangles convert");
+            t.Equals(wa.v[0].y, 20.75f + 0.5f, "weave: the first kind of field");
+            t.Equals(wb.v[0].y, 20.75f + 0.5f - 0.5f, "weave: the second kind of field is half a line higher on the target");
+            // the existing scale parameter still means the same in both axes
+            Setup w2;
+            t.IsTrue(BuildTriangle(a, 2, w2), "scale 2");
+            t.Equals(w2.v[0].y, (20.75f + 0.5f) * 2.0f, "scale 2 keeps the half pixel in GS units");
+            // sprites: the rectangle is the same in both kinds of field and twice as tall
+            GSPrimitiveBatch sprite = spriteBatch(10.0f, 20.0f, 30.0f, 50.0f);
+            GSPrimitiveBatch spriteB = sprite;
+            spriteB.state.context.xyoffset.ofy = static_cast<uint16_t>(1936u * 16u + 8u);
+            Setup pa, pb;
+            t.IsTrue(BuildSprite(sprite, progressive, pa) && BuildSprite(spriteB, progressive, pb), "progressive sprites convert");
+            t.Equals(pa.v[0].y, 40.0f, "top edge: twice the GS row");
+            t.Equals(pa.v[2].y, 100.0f, "bottom edge");
+            t.Equals(pa.v[0].x, 10.0f, "x is not scaled");
+            t.Equals(pb.v[0].y, pa.v[0].y, "the second kind of field puts the sprite in the same place");
+            t.Equals(pb.v[2].y, pa.v[2].y, "bottom edge too");
+            t.Equals(pa.minY, 20, "the box stays in GS pixels (min y)");
+            t.Equals(pa.maxY, 49, "the box stays in GS pixels (max y)");
+            // a textured sprite on a larger target is sampled at the centre of its GS pixel
+            GSDrawState textured{};
+            textured.prim.type = GS_PRIM_SPRITE;
+            textured.prim.tme = true;
+            textured.prim.fst = true;
+            textured.textureWidth = 64;
+            textured.textureHeight = 32;
+            FragUniforms snapped = BuildFragUniforms(textured, true, false, 1u, 2u);
+            t.IsTrue((snapped.flags[0] & kFlagSnapToGsPixel) != 0u, "the snap flag is set for a sprite with a target scale above 1");
+            t.Equals(snapped.flags[1], 2u, "target rows per GS pixel");
+            t.Equals(snapped.flags[2], 1u, "target columns per GS pixel");
+            t.IsTrue((BuildFragUniforms(textured, true, false).flags[0] & kFlagSnapToGsPixel) == 0u, "no snapping at scale 1 (the M3 shader path)");
+            t.IsTrue((BuildFragUniforms(textured, false, false, 1u, 2u).flags[0] & kFlagSnapToGsPixel) == 0u, "S, T, Q coordinates are never snapped");
+        });
+
         tc.Run("blend equations map to fixed-function blending", [](TestCase &t)
         {
             BlendState a = BlendFromAlpha(true, alphaReg(0, 1, 0, 1)); // (Cs-Cd)*As+Cd
@@ -837,6 +893,92 @@ void register_gs_gpu_tests()
                         {
                             t.IsTrue(shown[3] == 255, "alpha is 255 inside the picture");
                             t.IsTrue(shown[(460u * 640u + 10u) * 4u + 3u] == 0, "and 0 below it");
+                        }
+                    }
+                }
+            }
+            SDL_DestroyGPUDevice(device);
+        });
+
+        tc.Run("progressive fields: a 640x224 field is drawn as a 640x448 picture, shown as it is, with identical row pairs", [](TestCase &t)
+        {
+            if (!SDL_Init(SDL_INIT_VIDEO))
+            {
+                SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "offscreen");
+                if (!SDL_Init(SDL_INIT_VIDEO))
+                {
+                    std::cout << "    (skipped: no SDL video driver)" << std::endl;
+                    return;
+                }
+            }
+            const SDL_GPUShaderFormat formats = SDL_GPU_SHADERFORMAT_SPIRV | SDL_GPU_SHADERFORMAT_DXIL | SDL_GPU_SHADERFORMAT_MSL;
+            SDL_GPUDevice *device = SDL_CreateGPUDevice(formats, false, nullptr);
+            if (!device)
+            {
+                std::cout << "    (skipped: no GPU device: " << SDL_GetError() << ")" << std::endl;
+                return;
+            }
+            {
+                GSMem::InitLookupTables();
+                std::vector<uint8_t> vram(GSMem::MEMORY_SIZE, 0);
+                GSGpuBackend gpu(device, 1, GSGpuBackend::FieldMode::Progressive);
+                t.IsTrue(gpu.Ready() && gpu.SetFieldPublishing(true), "the progressive GPU renderer sets up and publishes fields");
+                if (gpu.Ready() && gpu.FieldPublishing())
+                {
+                    t.Equals(gpu.TargetScaleX(), 1u, "X scale 1");
+                    t.Equals(gpu.TargetScaleY(), 2u, "Y scale 2");
+                    gpu.Initialize(vram.data(), static_cast<uint32_t>(vram.size()));
+                    drawScene(gpu); // flat background (40, 60, 90) and more, as in the test above
+                    const GSPresentationRequest request = makeRequest(0);
+                    gpu.MarkPresentation(request);
+
+                    GSGpuBackend::FieldInfo field;
+                    t.IsTrue(gpu.TakeNewestField(0, field), "a field was published");
+                    t.IsTrue(field.valid && field.width == 640 && field.height == 448 && field.scaleY == 2 && field.progressive,
+                             "the field is 640 x 448 texels");
+                    t.IsFalse(field.interlaced, "and nothing for the presenter to weave");
+
+                    // Path A: the picture of the marker, 448 lines.
+                    PresentationFrame frame = gpu.Present(request);
+                    t.IsTrue(static_cast<bool>(frame) && frame.width == 640 && frame.height == 448, "Present returns a 640x448 picture");
+                    if (frame && frame.height == 448)
+                    {
+                        auto px = [&](uint32_t x, uint32_t y) { return &frame.pixels[(static_cast<size_t>(y) * 640u + x) * 4u]; };
+                        const auto nearTo = [](const uint8_t *p, int r, int g, int b) { return std::abs(p[0] - r) <= 2 && std::abs(p[1] - g) <= 2 && std::abs(p[2] - b) <= 2; };
+                        t.IsTrue(nearTo(px(600, 400), 40, 60, 90) && px(600, 400)[3] == 255, "the flat background, alpha 255");
+                        // the textured sprite (300, 20)-(364, 84): rows 40 .. 167 of the picture. Texel (2, 0) is (32, 0, 184).
+                        t.IsTrue(nearTo(px(310, 39), 40, 60, 90), "the row above the sprite's first row is background");
+                        t.IsTrue(nearTo(px(310, 40), 32, 0, 184), "the sprite's first row is row 2 * 20");
+                        t.IsTrue(nearTo(px(310, 41), 32, 0, 184), "and its second row has the same texel");
+                        t.IsTrue(nearTo(px(310, 167), px(310, 166)[0], px(310, 166)[1], px(310, 166)[2]), "the last row pair is one texel");
+                        t.IsTrue(nearTo(px(310, 168), 40, 60, 90), "the row below the sprite is background");
+                    }
+
+                    // The presenter shows the field as it is.
+                    GSGpuPresenter presenter(gpu);
+                    t.IsTrue(presenter.Ready(), "the presenter sets up");
+                    if (presenter.Ready())
+                    {
+                        const GSGpuPresenter::Size size = presenter.Pull();
+                        t.IsTrue(size.width == 640 && size.height == 448, "a progressive field makes a 640x448 picture");
+                        SDL_GPUCommandBuffer *cb = SDL_AcquireGPUCommandBuffer(device);
+                        presenter.Record(cb);
+                        SDL_SubmitGPUCommandBuffer(cb);
+                        presenter.Submitted();
+                        std::vector<uint8_t> shown;
+                        t.IsTrue(presenter.Download(shown) && shown.size() == 640u * 512u * 4u, "the picture can be read");
+                        if (shown.size() == 640u * 512u * 4u && frame && frame.height == 448)
+                        {
+                            bool same = true;
+                            for (uint32_t y = 0; y < 448 && same; ++y)
+                                for (uint32_t x = 0; x < 640; ++x)
+                                    if (std::memcmp(&shown[(static_cast<size_t>(y) * 640u + x) * 4u], &frame.pixels[(static_cast<size_t>(y) * 640u + x) * 4u], 4) != 0)
+                                    {
+                                        same = false;
+                                        break;
+                                    }
+                            t.IsTrue(same, "the direct picture is exactly what Present returns (448 lines, no weaving)");
+                            t.IsTrue(shown[(460u * 640u + 10u) * 4u + 3u] == 0, "and nothing below the picture");
                         }
                     }
                 }

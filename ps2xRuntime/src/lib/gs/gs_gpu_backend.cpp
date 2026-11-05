@@ -9,6 +9,13 @@
 //   Impl::Present            reads the displayed frame buffers back and composes the picture (path A)
 //   Impl::produceField       copies the displayed region into a field texture and publishes it (path B)
 //
+// Target size. A frame target is `scaleX` times 640 wide and `scaleY` times 512 high, where the GS rows are 224 per field
+// in use. In weave mode both scales are the `scale` argument; in progressive mode (M4a) scaleY is twice scaleX, so a
+// 640 x 224 field is drawn as a 640 x 448 picture (see GSGpu::TargetMapping for the geometry, and gs_gpu_backend.h,
+// "Field modes"). Everything that crosses between GS pixels and target pixels goes through the two scales: vertices
+// (gs_gpu_math.h), scissor rectangles, the Z copy from the memory image (each memory row covers scaleY target rows),
+// the seeding of a new target from the memory image, and the regions copied into field textures.
+//
 // Field ring (path B). Two threads share five field textures, and neither may wait for the other (nor for
 // the GPU): the GS thread (the game's thread, which calls MarkPresentation) writes them, the host's main
 // thread reads them.
@@ -279,7 +286,9 @@ namespace
 struct GSGpuBackend::Impl
 {
     SDL_GPUDevice *dev = nullptr;
-    uint32_t scale = 1;
+    uint32_t scale = 1;                 // the constructor's scale
+    uint32_t scaleX = 1, scaleY = 1;    // target pixels per GS pixel along each axis (see the comment at the top)
+    GSGpuBackend::FieldMode mode = GSGpuBackend::FieldMode::Weave;
     mutable std::mutex mutex;
     Stats stats;
     bool ready = false;
@@ -399,7 +408,9 @@ struct GSGpuBackend::Impl
     uint64_t lastHashNs = 0; // the content hash of the lookup that is being resolved (for the census)
 
     ~Impl();
-    bool init(SDL_GPUDevice *device, uint32_t s);
+    bool init(SDL_GPUDevice *device, uint32_t s, GSGpuBackend::FieldMode fieldMode);
+    bool progressive() const { return mode == GSGpuBackend::FieldMode::Progressive; }
+    GSGpu::TargetMapping mapping() const { return GSGpu::TargetMapping{scaleX, scaleY, progressive()}; }
 
     // memory
     void touchSpan(const PageSpan &span);
@@ -446,10 +457,13 @@ struct GSGpuBackend::Impl
 // ------------------------------------------------------------------------------------------------
 // setup and teardown
 
-bool GSGpuBackend::Impl::init(SDL_GPUDevice *device, uint32_t s)
+bool GSGpuBackend::Impl::init(SDL_GPUDevice *device, uint32_t s, GSGpuBackend::FieldMode fieldMode)
 {
     dev = device;
     scale = std::max(1u, s);
+    mode = fieldMode;
+    scaleX = scale;
+    scaleY = progressive() ? scale * 2u : scale;
     {
         const char *value = std::getenv("PS2X_GS_GPU_STATS");
         statsOn = value && value[0] == '1';
@@ -627,7 +641,7 @@ void GSGpuBackend::Impl::markDepthDirty(const PageSpan &touched)
 void GSGpuBackend::Impl::restoreDepth(uint32_t depthIdx, uint32_t frameIdx, uint32_t rows)
 {
     DepthTarget &d = depths[depthIdx];
-    rows = std::min(rows, d.h / scale);
+    rows = std::min(rows, d.h / scaleY);
     if (rows > d.coveredRows)
     {
         for (uint32_t tr = d.coveredRows / 32u; tr < (rows + 31u) / 32u; ++tr)
@@ -692,7 +706,7 @@ void GSGpuBackend::Impl::restoreDepth(uint32_t depthIdx, uint32_t frameIdx, uint
     draw.sy = 0;
     draw.sw = static_cast<int32_t>(target.w);
     draw.sh = static_cast<int32_t>(target.h);
-    const float fs = static_cast<float>(scale);
+    const float fsx = static_cast<float>(scaleX), fsy = static_cast<float>(scaleY);
     for (const auto &t : tiles)
     {
         const float x0 = static_cast<float>(t.second * 64u), y0 = static_cast<float>(t.first * 32u);
@@ -701,8 +715,8 @@ void GSGpuBackend::Impl::restoreDepth(uint32_t depthIdx, uint32_t frameIdx, uint
         auto make = [&](float x, float y, float u, float v)
         {
             Vertex r;
-            r.x = x * fs;
-            r.y = y * fs;
+            r.x = x * fsx;
+            r.y = y * fsy;
             r.z = 0.0f;
             r.rgba = 0xFFFFFFFFu;
             r.u = u;
@@ -744,8 +758,8 @@ uint32_t GSGpuBackend::Impl::frameIndex(const GSFrameReg &frame)
     t.fbp = frame.fbp;
     t.fbw = fbw;
     t.psm = frame.psm;
-    t.w = fbw * 64u * scale;
-    t.h = kTargetRows * scale;
+    t.w = fbw * 64u * scaleX;
+    t.h = kTargetRows * scaleY;
     SDL_GPUTextureCreateInfo ci = {};
     ci.type = SDL_GPU_TEXTURETYPE_2D;
     ci.format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
@@ -769,12 +783,20 @@ uint32_t GSGpuBackend::Impl::frameIndex(const GSFrameReg &frame)
     uint32_t *px = reinterpret_cast<uint32_t *>(stage.data() + offset);
     const uint32_t basePtr = frame.fbp << 5u;
     const bool sixteen = frame.psm == GS_PSM_CT16 || frame.psm == GS_PSM_CT16S;
-    for (uint32_t y = 0; y < t.h; ++y)
-        for (uint32_t x = 0; x < t.w; ++x)
+    for (uint32_t gy = 0; gy < kTargetRows; ++gy)
+    {
+        // One memory row covers scaleY target rows, and one memory pixel scaleX target pixels.
+        uint32_t *first = px + static_cast<size_t>(gy) * scaleY * t.w;
+        for (uint32_t gx = 0; gx < fbw * 64u; ++gx)
         {
-            const uint32_t raw = GSTransfer::ReadPixel(vram, frame.psm, basePtr, fbw, x / scale, y / scale);
-            px[static_cast<size_t>(y) * t.w + x] = sixteen ? Rgba5551ToRgba8888(static_cast<uint16_t>(raw)) : raw;
+            const uint32_t raw = GSTransfer::ReadPixel(vram, frame.psm, basePtr, fbw, gx, gy);
+            const uint32_t value = sixteen ? Rgba5551ToRgba8888(static_cast<uint16_t>(raw)) : raw;
+            for (uint32_t k = 0; k < scaleX; ++k)
+                first[gx * scaleX + k] = value;
         }
+        for (uint32_t k = 1; k < scaleY; ++k)
+            std::memcpy(first + static_cast<size_t>(k) * t.w, first, static_cast<size_t>(t.w) * 4u);
+    }
     pendingUploads.push_back({t.color, t.w, t.h, offset});
     frames.push_back(t);
     return static_cast<uint32_t>(frames.size() - 1u);
@@ -782,7 +804,7 @@ uint32_t GSGpuBackend::Impl::frameIndex(const GSFrameReg &frame)
 
 uint32_t GSGpuBackend::Impl::depthIndex(const GSZbufReg &zbuf, uint32_t fbw)
 {
-    const uint32_t w = std::max(fbw, 1u) * 64u * scale;
+    const uint32_t w = std::max(fbw, 1u) * 64u * scaleX;
     for (uint32_t i = 0; i < depths.size(); ++i)
         if (depths[i].zbp == zbuf.zbp && depths[i].w == w)
             return i;
@@ -791,7 +813,7 @@ uint32_t GSGpuBackend::Impl::depthIndex(const GSZbufReg &zbuf, uint32_t fbw)
     d.zbp = zbuf.zbp;
     d.fbw = std::max(fbw, 1u);
     d.w = w;
-    d.h = kTargetRows * scale;
+    d.h = kTargetRows * scaleY;
     SDL_GPUTextureCreateInfo ci = {};
     ci.type = SDL_GPU_TEXTURETYPE_2D;
     ci.format = SDL_GPU_TEXTUREFORMAT_D32_FLOAT;
@@ -1325,7 +1347,10 @@ void GSGpuBackend::Impl::submitSetup(const GSDrawState &state, const Setup &setu
     d.frame = frame;
     d.depth = depth;
     d.pipeline = pipelineKey(blend, compare, depthWrite);
-    d.uniforms = BuildFragUniforms(state, setup.texelCoords, blend.coefficientFromFix);
+    // A sprite is drawn on whole GS pixels, so on a larger target its texture is sampled at the centre of the GS pixel
+    // (see GSGpu::kFlagSnapToGsPixel); other primitives sample at the target pixel's own position.
+    const bool snap = state.prim.type == GS_PRIM_SPRITE;
+    d.uniforms = BuildFragUniforms(state, setup.texelCoords, blend.coefficientFromFix, snap ? scaleX : 0u, snap ? scaleY : 0u);
     d.texture = nullptr;
     if (state.prim.tme)
     {
@@ -1338,11 +1363,11 @@ void GSGpuBackend::Impl::submitSetup(const GSDrawState &state, const Setup &setu
             noteTextureUse(d.texture, state, setup);
     }
     const FrameTarget &target = frames[frame];
-    const int32_t s = static_cast<int32_t>(scale);
-    d.sx = std::min<int32_t>(static_cast<int32_t>(ctx.scissor.x0) * s, static_cast<int32_t>(target.w));
-    d.sy = std::min<int32_t>(static_cast<int32_t>(ctx.scissor.y0) * s, static_cast<int32_t>(target.h));
-    d.sw = std::min<int32_t>((static_cast<int32_t>(ctx.scissor.x1) + 1) * s, static_cast<int32_t>(target.w)) - d.sx;
-    d.sh = std::min<int32_t>((static_cast<int32_t>(ctx.scissor.y1) + 1) * s, static_cast<int32_t>(target.h)) - d.sy;
+    const int32_t mx = static_cast<int32_t>(scaleX), my = static_cast<int32_t>(scaleY);
+    d.sx = std::min<int32_t>(static_cast<int32_t>(ctx.scissor.x0) * mx, static_cast<int32_t>(target.w));
+    d.sy = std::min<int32_t>(static_cast<int32_t>(ctx.scissor.y0) * my, static_cast<int32_t>(target.h));
+    d.sw = std::min<int32_t>((static_cast<int32_t>(ctx.scissor.x1) + 1) * mx, static_cast<int32_t>(target.w)) - d.sx;
+    d.sh = std::min<int32_t>((static_cast<int32_t>(ctx.scissor.y1) + 1) * my, static_cast<int32_t>(target.h)) - d.sy;
     if (d.sw <= 0 || d.sh <= 0)
     {
         ++stats.primitivesCulled;
@@ -1373,7 +1398,7 @@ void GSGpuBackend::Impl::submit(const GSPrimitiveBatch &batch)
     switch (batch.state.prim.type)
     {
     case GS_PRIM_SPRITE:
-        if (batch.vertexCount < 2u || !BuildSprite(batch, scale, setup))
+        if (batch.vertexCount < 2u || !BuildSprite(batch, mapping(), setup))
             return;
         break;
     case GS_PRIM_TRIANGLE:
@@ -1381,7 +1406,7 @@ void GSGpuBackend::Impl::submit(const GSPrimitiveBatch &batch)
     case GS_PRIM_TRIFAN:
         if (batch.vertexCount < 3u)
             return;
-        if (!BuildTriangle(batch, scale, setup))
+        if (!BuildTriangle(batch, mapping(), setup))
         {
             ++stats.primitives;
             ++stats.primitivesCulled;
@@ -1705,6 +1730,9 @@ bool GSGpuBackend::Impl::downloadRegion(SDL_GPUTexture *tex, uint32_t x, uint32_
 // What GSCpuBackend::CopyFrameToHostRgba does, for a frame buffer that lives in a render target: the
 // displayed region goes into the top-left corner of a kHostFrameWidth x kHostFrameHeight RGBA8 buffer.
 // A frame buffer that was never drawn to is read from the memory image like the CPU renderer does.
+// The picture is in GS pixels: a target that is larger than the GS frame (scale above 1, or progressive mode) is
+// averaged down, each GS pixel from the scaleX x scaleY target pixels it covers. This is the slow, rarely used way to
+// get pixels (path A for plans the field copies do not cover, the replayer's picture comparisons without field copies).
 bool GSGpuBackend::Impl::copyFrame(const GSFrameReg &frame, uint32_t width, uint32_t height, std::vector<uint8_t> &out,
                                    bool preserveAlpha, bool useLocalMemoryLayout, bool frameBaseIsPages,
                                    uint32_t originX, uint32_t originY)
@@ -1715,24 +1743,38 @@ bool GSGpuBackend::Impl::copyFrame(const GSFrameReg &frame, uint32_t width, uint
         for (const FrameTarget &f : frames)
             if (f.fbp == frame.fbp && f.fbw == fbw && f.psm == frame.psm)
                 target = &f;
-    if (!target || (originX + width) * scale > target->w || (originY + height) * scale > target->h || scale != 1u)
+    if (!target || (originX + width) * scaleX > target->w || (originY + height) * scaleY > target->h)
         return GSPresent::CopyFrameFromMemory(vram, vramSize, frame, width, height, out, preserveAlpha, useLocalMemoryLayout,
                                               frameBaseIsPages, originX, originY);
 
     std::vector<uint8_t> region;
-    if (!downloadRegion(target->color, originX, originY, width, height, region))
+    if (!downloadRegion(target->color, originX * scaleX, originY * scaleY, width * scaleX, height * scaleY, region))
         return false;
     out.assign(static_cast<size_t>(GSPresent::kHostFrameWidth) * GSPresent::kHostFrameHeight * 4u, 0u);
+    const uint32_t regionWidth = width * scaleX;
+    const uint32_t blockPixels = scaleX * scaleY;
     for (uint32_t y = 0; y < height; ++y)
     {
         uint8_t *dst = out.data() + static_cast<size_t>(y) * GSPresent::kHostFrameWidth * 4u;
-        const uint8_t *src = region.data() + static_cast<size_t>(y) * width * 4u;
-        std::memcpy(dst, src, static_cast<size_t>(width) * 4u);
+        const uint8_t *src = region.data() + static_cast<size_t>(y) * scaleY * regionWidth * 4u;
+        if (blockPixels == 1u)
+            std::memcpy(dst, src, static_cast<size_t>(width) * 4u);
         for (uint32_t x = 0; x < width; ++x)
         {
+            if (blockPixels != 1u)
+            {
+                for (uint32_t c = 0; c < 4u; ++c)
+                {
+                    uint32_t sum = 0;
+                    for (uint32_t ky = 0; ky < scaleY; ++ky)
+                        for (uint32_t kx = 0; kx < scaleX; ++kx)
+                            sum += src[(static_cast<size_t>(ky) * regionWidth + x * scaleX + kx) * 4u + c];
+                    dst[x * 4u + c] = static_cast<uint8_t>((sum + blockPixels / 2u) / blockPixels);
+                }
+            }
             // The target's alpha is the blend coefficient with 0x80 = 1.0 (0..255 in a unorm byte);
             // give it back the GS meaning (0..0x80), or 0xFF when the picture does not use alpha.
-            dst[x * 4u + 3u] = preserveAlpha ? static_cast<uint8_t>((static_cast<uint32_t>(src[x * 4u + 3u]) * 128u + 127u) / 255u) : 255u;
+            dst[x * 4u + 3u] = preserveAlpha ? static_cast<uint8_t>((static_cast<uint32_t>(dst[x * 4u + 3u]) * 128u + 127u) / 255u) : 255u;
         }
     }
     return true;
@@ -1810,12 +1852,15 @@ GSGpuBackend::MarkResult GSGpuBackend::Impl::produceField(const GSPresentationRe
     result.direct = directConsumer;
     const GSPresent::Plan plan = GSPresent::MakePlan(request);
     FieldInfo info;
-    info.interlaced = plan.interlaced;
-    auto fill = [&]()
+    // In progressive mode a field is already a full-height picture: nothing for the presenter to weave.
+    info.interlaced = plan.interlaced && !progressive();
+    info.progressive = progressive();
+    // The debug view of the frontend gets the size of the displayed region in GS pixels, as with the CPU renderer.
+    auto fill = [&](uint32_t gsWidth, uint32_t gsHeight)
     {
         result.valid = info.valid;
-        result.width = info.width;
-        result.height = info.height;
+        result.width = gsWidth;
+        result.height = gsHeight;
         result.displayFbp = info.displayFbp;
         result.sourceFbp = info.sourceFbp;
         result.usedPreferred = info.usedPreferred;
@@ -1830,17 +1875,21 @@ GSGpuBackend::MarkResult GSGpuBackend::Impl::produceField(const GSPresentationRe
         return result;
     }
 
-    if (plan.kind == GSPresent::Plan::Kind::DisplayFrame && scale == 1u)
+    if (plan.kind == GSPresent::Plan::Kind::DisplayFrame)
     {
-        // The usual case: both circuits show one region of one frame buffer. Copy it on the GPU.
+        // The usual case: both circuits show one region of one frame buffer. Copy it on the GPU. The region is
+        // `copyWidth` x `copyHeight` target pixels (the GS size times the scales: 640 x 448 for a field in progressive
+        // mode), at (copyX, copyY).
         const uint32_t fbw = plan.frame.fbw ? plan.frame.fbw : GSPresent::kHostFrameWidth / 64u;
+        const uint32_t copyWidth = plan.width * scaleX, copyHeight = plan.height * scaleY;
+        const uint32_t copyX = plan.originX * scaleX, copyY = plan.originY * scaleY;
         const FrameTarget *target = nullptr;
         for (const FrameTarget &f : frames)
             if (f.fbp == plan.frame.fbp && f.fbw == fbw && f.psm == plan.frame.psm)
                 target = &f;
         if (target && target->psm == GS_PSM_CT32 && plan.width > 0 && plan.height > 0 &&
-            plan.width <= GSGpuBackend::kFieldTextureWidth && plan.height <= GSGpuBackend::kFieldTextureHeight &&
-            plan.originX + plan.width <= target->w && plan.originY + plan.height <= target->h)
+            copyWidth <= GSGpuBackend::kFieldTextureWidth && copyHeight <= GSGpuBackend::kFieldTextureHeight &&
+            copyX + copyWidth <= target->w && copyY + copyHeight <= target->h)
         {
             // Compose swaps a black display frame at fbp 0 for the first non-black one of the two context
             // frames (those that differ from it), read from the top-left corner. The host decides on the GPU;
@@ -1859,7 +1908,7 @@ GSGpuBackend::MarkResult GSGpuBackend::Impl::produceField(const GSPresentationRe
                     for (const FrameTarget &f : frames)
                         if (f.fbp == c.fbp && f.fbw == cfbw && f.psm == c.psm)
                             ct = &f;
-                    if (!ct || ct->psm != GS_PSM_CT32 || plan.width > ct->w || plan.height > ct->h)
+                    if (!ct || ct->psm != GS_PSM_CT32 || copyWidth > ct->w || copyHeight > ct->h)
                     {
                         candidatesOk = false; // a fallback frame that is not a drawn target: only Compose with pixels can say
                         break;
@@ -1877,9 +1926,9 @@ GSGpuBackend::MarkResult GSGpuBackend::Impl::produceField(const GSPresentationRe
                     return result;
                 }
                 FieldCopy copies[3];
-                copies[0] = {target->color, plan.originX, plan.originY, plan.width, plan.height, slots[static_cast<size_t>(got[0])].tex};
+                copies[0] = {target->color, copyX, copyY, copyWidth, copyHeight, slots[static_cast<size_t>(got[0])].tex};
                 for (int i = 0; i < candidateCount; ++i)
-                    copies[1 + i] = {candidates[i]->color, 0u, 0u, plan.width, plan.height, slots[static_cast<size_t>(got[1 + i])].tex};
+                    copies[1 + i] = {candidates[i]->color, 0u, 0u, copyWidth, copyHeight, slots[static_cast<size_t>(got[1 + i])].tex};
                 flushLocked(false, copies, 1 + candidateCount);
                 ++stats.fieldsFast;
                 if (candidateCount != 0)
@@ -1900,12 +1949,14 @@ GSGpuBackend::MarkResult GSGpuBackend::Impl::produceField(const GSPresentationRe
                 }
                 for (int i = 0; i < candidateCount; ++i)
                     info.candidates[i] = got[1 + i];
-                info.width = plan.width;
-                info.height = plan.height;
+                info.width = copyWidth;
+                info.height = copyHeight;
+                info.scaleX = scaleX;
+                info.scaleY = scaleY;
                 info.displayFbp = plan.frame.fbp;
                 info.sourceFbp = plan.frame.fbp;
                 publish(info, request);
-                fill();
+                fill(plan.width, plan.height);
                 return result;
             }
         }
@@ -1931,11 +1982,15 @@ GSGpuBackend::MarkResult GSGpuBackend::Impl::produceField(const GSPresentationRe
         ++stats.fieldsDropped;
         return result;
     }
-    const uint32_t w = frame.width, h = frame.height;
+    const uint32_t gsWidth = frame.width, gsHeight = frame.height;
+    // Compose's picture is in GS pixels. In progressive mode a field must come out as a full-height picture, so the
+    // picture of an interlaced display is given each row twice (nothing is known about its sub-line detail).
+    const uint32_t rowRepeat = (progressive() && plan.interlaced && gsHeight * 2u <= GSGpuBackend::kFieldTextureHeight) ? 2u : 1u;
+    const uint32_t w = gsWidth, h = gsHeight * rowRepeat;
     const size_t offset = allocateStage(static_cast<size_t>(w) * h * 4u);
     for (uint32_t y = 0; y < h; ++y) // Compose's rows are kHostFrameWidth pixels apart; the upload wants them packed
         std::memcpy(stage.data() + offset + static_cast<size_t>(y) * w * 4u,
-                    frame.pixels.data() + static_cast<size_t>(y) * GSPresent::kHostFrameWidth * 4u, static_cast<size_t>(w) * 4u);
+                    frame.pixels.data() + static_cast<size_t>(y / rowRepeat) * GSPresent::kHostFrameWidth * 4u, static_cast<size_t>(w) * 4u);
     pendingUploads.push_back({slots[static_cast<size_t>(slot)].tex, w, h, offset});
     flushLocked(false);
     ++stats.fieldsSlow;
@@ -1944,11 +1999,13 @@ GSGpuBackend::MarkResult GSGpuBackend::Impl::produceField(const GSPresentationRe
     info.slot = slot;
     info.width = w;
     info.height = h;
+    info.scaleX = 1u;
+    info.scaleY = rowRepeat;
     info.displayFbp = frame.displayFbp;
     info.sourceFbp = frame.sourceFbp;
     info.usedPreferred = frame.usedPreferred;
     publish(info, request);
-    fill();
+    fill(gsWidth, gsHeight);
     return result;
 }
 
@@ -1992,6 +2049,41 @@ PresentationFrame GSGpuBackend::Impl::presentFromField(const FieldInfo &field, c
         frame.displayFbp = field.displayFbp;
         frame.sourceFbp = field.sourceFbp;
         frame.usedPreferred = field.usedPreferred;
+        return frame;
+    }
+    if (field.progressive)
+    {
+        // The slots hold the displayed region (and the fallback frames') at the size of the target, 448 lines for a
+        // field. Compose works in GS pixels, so it cannot be used; this is what it does for these plans: the region,
+        // or when the display frame is fbp 0 and entirely black the first fallback frame that is not, with alpha 255.
+        const auto nonBlack = [](const std::vector<uint8_t> &pixels, uint32_t w, uint32_t h)
+        {
+            for (uint32_t y = 0; y < h; ++y)
+            {
+                const uint8_t *row = pixels.data() + static_cast<size_t>(y) * GSPresent::kHostFrameWidth * 4u;
+                for (uint32_t x = 0; x < w; ++x)
+                    if (row[x * 4u] != 0u || row[x * 4u + 1u] != 0u || row[x * 4u + 2u] != 0u)
+                        return true;
+            }
+            return false;
+        };
+        PresentationFrame frame;
+        if (!downloadSlot(field.slot, field.width, field.height, frame.pixels, false))
+            return {};
+        frame.width = field.width;
+        frame.height = field.height;
+        frame.displayFbp = field.displayFbp;
+        frame.sourceFbp = field.sourceFbp;
+        if (field.displayFbp == 0u && !nonBlack(frame.pixels, field.width, field.height))
+            for (int i = 0; i < field.candidateCount; ++i)
+            {
+                std::vector<uint8_t> candidate;
+                if (!downloadSlot(field.candidates[i], field.width, field.height, candidate, false) || !nonBlack(candidate, field.width, field.height))
+                    continue;
+                frame.pixels.swap(candidate);
+                frame.sourceFbp = field.candidateFrames[i].fbp;
+                break;
+            }
         return frame;
     }
     const auto sameFrame = [](const GSFrameReg &a, const GSFrameReg &b) { return a.fbp == b.fbp && a.fbw == b.fbw && a.psm == b.psm; };
@@ -2153,10 +2245,10 @@ void GSGpuBackend::Impl::writeMissLog()
 // ------------------------------------------------------------------------------------------------
 // GSGpuBackend
 
-GSGpuBackend::GSGpuBackend(SDL_GPUDevice *device, uint32_t scale) : m_impl(std::make_unique<Impl>())
+GSGpuBackend::GSGpuBackend(SDL_GPUDevice *device, uint32_t scale, FieldMode fields) : m_impl(std::make_unique<Impl>())
 {
     GSMem::InitLookupTables(); // the swizzle tables: textures and uploads need them even when no CPU renderer exists
-    m_impl->ready = m_impl->init(device, scale);
+    m_impl->ready = m_impl->init(device, scale, fields);
 }
 
 GSGpuBackend::~GSGpuBackend() = default;
@@ -2164,6 +2256,21 @@ GSGpuBackend::~GSGpuBackend() = default;
 bool GSGpuBackend::Ready() const
 {
     return m_impl->ready;
+}
+
+GSGpuBackend::FieldMode GSGpuBackend::Fields() const
+{
+    return m_impl->mode;
+}
+
+uint32_t GSGpuBackend::TargetScaleX() const
+{
+    return m_impl->scaleX;
+}
+
+uint32_t GSGpuBackend::TargetScaleY() const
+{
+    return m_impl->scaleY;
 }
 
 void GSGpuBackend::Initialize(uint8_t *vram, uint32_t vramSize)

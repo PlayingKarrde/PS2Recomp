@@ -37,7 +37,9 @@ cbuffer Draw : register(b0, space3)
     float4 TexInfo; // x: width, y: height, z: 1/width, w: 1/height (the texture size in texels)
     uint4 Flags;    // x: bit0 textured, bit1 coordinates are texels (UV or sprite) rather than S,T,Q,
                     //    bit2 bilinear, bit3 TCC (texture alpha used), bits 4-5 TFX, bit6 alpha test on,
-                    //    bit7 round texel coordinates to 1/16 (sprite with UV), bit8 truncate them (triangle with UV)
+                    //    bit7 round texel coordinates to 1/16 (sprite with UV), bit8 truncate them (triangle with UV),
+                    //    bit9 sample at the centre of the GS pixel (a sprite on a target larger than the GS frame)
+                    // y: target rows per GS pixel, z: target columns per GS pixel (used with bit9)
     uint4 Wrap;     // x: WMS, y: WMT, z: MINU | MAXU << 16, w: MINV | MAXV << 16 (REGION modes)
     uint4 Test;     // x: ATST, y: AREF, z: blend coefficient (0 = source alpha, 1 = FIX), w: FIX
 };
@@ -46,6 +48,7 @@ struct PSInput
 {
     LOCATION(0) float4 Color : TEXCOORD0;
     LOCATION(1) float3 UVQ : TEXCOORD1;
+    float4 Position : SV_Position; // last, as in the vertex shader's output
 };
 
 int wrapCoord(int c, int size, uint mode, uint lo, uint hi)
@@ -76,6 +79,12 @@ float4 bilerp8(float4 c00, float4 c10, float4 c01, float4 c11, float fx, float f
 
 float4 main(PSInput input) : SV_Target0
 {
+    // The change of the texel coordinates from one target pixel to the next, for bit9 below. Taken here, outside any branch,
+    // because derivatives need every pixel of a 2 x 2 block to run the same code. A sprite's coordinates change at a constant
+    // rate, so these are exact.
+    const float dudx = ddx(input.UVQ.x);
+    const float dvdy = ddy(input.UVQ.y);
+
     // The CPU renderer truncates interpolated colours to whole steps; the small offset keeps a flat colour
     // (all three vertices equal) from falling to the step below through float rounding.
     float4 vtx = floor(input.Color * 255.0f + 0.01f);
@@ -91,6 +100,25 @@ float4 main(PSInput input) : SV_Target0
         {
             u = input.UVQ.x;
             v = input.UVQ.y;
+            if ((Flags.x & 512u) != 0u)
+            {
+                // A sprite covers whole GS pixels and the GS samples its texture once per pixel, at the pixel's centre. On a
+                // larger target a GS pixel is several target pixels (progressive field mode: two rows), and sampling each at
+                // its own centre would use other texel positions than the GS does: half-texel steps in a magnified or
+                // minified sprite, and a vertical blur in a bilinear one. So every target pixel takes the texel
+                // coordinates the centre of its GS pixel has. The coordinates are linear in the target position, so that is
+                // the coordinate here plus the distance to that centre times the rate of change.
+                if (Flags.y > 1u)
+                {
+                    const float scaleY = (float)Flags.y;
+                    v += ((floor(input.Position.y / scaleY) + 0.5f) * scaleY - input.Position.y) * dvdy;
+                }
+                if (Flags.z > 1u)
+                {
+                    const float scaleX = (float)Flags.z;
+                    u += ((floor(input.Position.x / scaleX) + 0.5f) * scaleX - input.Position.x) * dudx;
+                }
+            }
         }
         else
         {

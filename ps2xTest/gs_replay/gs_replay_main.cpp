@@ -4,7 +4,7 @@
 //   ps2x_gs_replay <file> [--backend cpu|gpu] [--compare] [--driver D] [--scale N] [--gpu-debug]
 //                         [--png-dir D] [--png-every N] [--diff-dir D] [--diff-worst N] [--diff-every N]
 //                         [--json F] [--threads N] [--defer 0|1] [--hashes F] [--max-markers N]
-//                         [--drop-state LIST] [--info] [--presents]
+//                         [--drop-state LIST] [--info] [--presents] [--offsets] [--fields weave|progressive]
 //                         [--direct [--direct-every N] [--direct-dir D]]
 //
 // How it works. The recording starts at a presentation marker with the whole GS memory and the
@@ -19,6 +19,14 @@
 // same records and, for every picture, measures the share of pixels where any channel differs by more
 // than 2 (and the largest difference); it reports mean, median, 95th percentile and the worst frame per
 // clip, and writes the CPU, GPU and an amplified difference picture for the worst frames (--diff-dir).
+//
+// --fields weave|progressive (default weave) is the GPU renderer's field mode (GSGpuBackend::FieldMode). Weave draws each
+// 224-line field as it is and weaves the last three into 448 lines, so its pictures compare with the CPU renderer's.
+// Progressive draws every field as a 640 x 448 picture. With --compare the GPU's 448-line picture is first averaged
+// down to the CPU picture's 224 lines (pairs of rows), which is only a rough check: the CPU renderer samples the
+// field at integer positions and a progressive row pair at y and y + 1/2, so edges and textures differ by up to a
+// quarter of a line.
+// --offsets lists where the half-line offset between the game's alternate fields is applied (investigation, task g4a).
 //
 // --direct (with --backend gpu) also runs the GPU renderer's direct presentation path (path B, see
 // gs_gpu_present.h) next to its readback path (path A): at each marker the picture the runtime would get
@@ -41,7 +49,9 @@
 #include <SDL3/SDL_gpu.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -78,6 +88,8 @@ namespace
     {
         std::string file;
         std::string backend = "cpu";
+        std::string fields = "weave";
+        std::string compareRows = "parity";
         bool compare = false;
         std::string driver;
         uint32_t scale = 1;
@@ -100,6 +112,7 @@ namespace
         uint32_t directEvery = 1;
         std::string directDir;
         bool states = false;
+        bool offsets = false;   // investigation: how the half-line field offset is applied (see reportOffsets)
         int onlyState = -1;     // debugging: draw only primitives of this recorded state id
         int skipState = -1;     // debugging: skip primitives of this recorded state id
     };
@@ -110,12 +123,17 @@ namespace
                      "usage: ps2x_gs_replay <file> [--backend cpu|gpu] [--compare] [--driver D] [--scale N] [--gpu-debug]\n"
                      "                             [--png-dir D] [--png-every N] [--diff-dir D] [--diff-worst N] [--diff-every N]\n"
                      "                             [--json F] [--threads N] [--defer 0|1] [--hashes F] [--max-markers N]\n"
-                     "                             [--drop-state LIST] [--info] [--presents]\n"
+                     "                             [--drop-state LIST] [--info] [--presents] [--offsets] [--fields weave|progressive]\n"
                      "                             [--direct [--direct-every N] [--direct-dir D]] [--no-fields]\n"
                      "  --backend B     the renderer to replay through: cpu (default) or gpu (SDL_GPU, headless)\n"
                      "  --compare       replay through both and measure how the pictures differ\n"
                      "  --driver D      SDL_GPU driver for the gpu renderer: vulkan, direct3d12 or metal (default: SDL picks)\n"
                      "  --scale N       render scale of the gpu renderer (only 1 is supported)\n"
+                     "  --compare-rows R  with --compare --fields progressive: how the 448-line GPU picture is reduced to the cpu picture's 224 lines:\n"
+                     "                  parity (default): the rows that sample the field the way the cpu renderer does (even rows for a field whose OFY is a\n"
+                     "                  whole number, odd rows for the half-line one), or average: pairs of rows averaged\n"
+                     "  --fields F      the gpu renderer's field mode: weave (default; the M3 picture, comparable with the cpu renderer) or\n"
+                     "                  progressive (every field a 640x448 picture; --compare then averages row pairs down first)\n"
                      "  --gpu-debug     ask SDL_GPU for its validation layers\n"
                      "  --png-dir D     write the picture of every Nth marker to D/marker_NNNNN.png (with --compare: also D/gpu_marker_NNNNN.png)\n"
                      "  --png-every N   with --png-dir: every Nth marker (default 30)\n"
@@ -134,8 +152,10 @@ namespace
                      "                  using the field copies it takes at each marker\n"
                      "  --direct-every N  consume only every Nth marker, as a slow host would (default 1)\n"
                      "  --direct-dir D  write the pictures of the first differing markers to D\n"
+                     "                  (with --direct, --png-dir also gets direct_marker_NNNNN.png: the picture path B builds, at its own size)\n"
                      "  --info          list the records in the file and stop\n"
-                     "  --presents      list the distinct presentation requests in the file and stop\n");
+                     "  --presents      list the distinct presentation requests in the file and stop\n"
+                     "  --offsets       list how the half-line field offset is applied in the file and stop\n");
     }
 
     bool parse(int argc, char **argv, Options &o)
@@ -172,6 +192,28 @@ namespace
                 if (o.backend != "cpu" && o.backend != "gpu")
                 {
                     std::fprintf(stderr, "--backend must be cpu or gpu\n");
+                    return false;
+                }
+            }
+            else if (arg == "--fields")
+            {
+                const char *v = value("--fields");
+                if (!v) return false;
+                o.fields = v;
+                if (o.fields != "weave" && o.fields != "progressive")
+                {
+                    std::fprintf(stderr, "--fields must be weave or progressive\n");
+                    return false;
+                }
+            }
+            else if (arg == "--compare-rows")
+            {
+                const char *v = value("--compare-rows");
+                if (!v) return false;
+                o.compareRows = v;
+                if (o.compareRows != "parity" && o.compareRows != "average")
+                {
+                    std::fprintf(stderr, "--compare-rows must be parity or average\n");
                     return false;
                 }
             }
@@ -280,6 +322,10 @@ namespace
             else if (arg == "--states")
             {
                 o.states = true;
+            }
+            else if (arg == "--offsets")
+            {
+                o.offsets = true;
             }
             else if (arg == "--only-state")
             {
@@ -500,6 +546,38 @@ namespace
         return d;
     }
 
+    // The GPU renderer's progressive picture has twice the rows of the CPU renderer's field picture: average each pair of rows.
+    Picture halveRows(const Picture &p)
+    {
+        Picture r;
+        r.width = p.width;
+        r.height = p.height / 2u;
+        r.pixels.assign(p.pixels.size(), 0u);
+        for (uint32_t y = 0; y < r.height; ++y)
+        {
+            const uint8_t *a = p.pixels.data() + static_cast<size_t>(2u * y) * kStride * 4u;
+            const uint8_t *b = a + static_cast<size_t>(kStride) * 4u;
+            uint8_t *d = r.pixels.data() + static_cast<size_t>(y) * kStride * 4u;
+            for (uint32_t i = 0; i < p.width * 4u; ++i)
+                d[i] = static_cast<uint8_t>((static_cast<unsigned>(a[i]) + b[i] + 1u) / 2u);
+        }
+        return r;
+    }
+
+    // The rows 2y + parity of a progressive picture: with parity 0 the rows that sample the field at whole GS lines (what the CPU
+    // renderer does for a field whose OFY is a whole number), with parity 1 the half-line lower ones (the other kind of field).
+    Picture pickRows(const Picture &p, unsigned parity)
+    {
+        Picture r;
+        r.width = p.width;
+        r.height = p.height / 2u;
+        r.pixels.assign(p.pixels.size(), 0u);
+        for (uint32_t y = 0; y < r.height; ++y)
+            std::memcpy(r.pixels.data() + static_cast<size_t>(y) * kStride * 4u,
+                        p.pixels.data() + static_cast<size_t>(2u * y + parity) * kStride * 4u, static_cast<size_t>(p.width) * 4u);
+        return r;
+    }
+
     Picture toPicture(const PresentationFrame &frame)
     {
         Picture p;
@@ -545,6 +623,322 @@ namespace
         uint32_t marker = 0;
         Picture cpu, gpu;
     };
+
+    // --offsets (investigation for the progressive-field mode, task g4a): where does the half-line difference between the
+    // game's two fields live? The game draws one 224-line field per VBlank into fbp 0 or fbp 70, and every other field is
+    // "half a line lower" (OFY 1936 against 1936.5, according to bringup.md). This reads the Submit records and reports
+    //   1. the XYOFFSET of every primitive, by frame buffer, primitive kind and context (CTXT);
+    //   2. the scissor boxes, by frame buffer;
+    //   3. the fractional part (in 1/16) of every vertex Y before and after the offset is subtracted, by frame buffer;
+    //   4. for the segments between markers (one segment = one field): the frame buffer and offsets they draw with, and which
+    //      frame buffer the marker after them displays;
+    //   5. for consecutive fields with the same number of primitives, which members of the draw state differ between the
+    //      primitives at the same position, and how the geometry differs (identical after the offset is subtracted, shifted
+    //      by exactly half a line, or something else).
+    struct OffsetPrim
+    {
+        GSDrawState st;
+        int kind = 0;              // 0 sprite, 1 triangle
+        int32_t rawY16[3] = {};    // vertex Y in 1/16 pixel as the game sent it (includes the offset)
+        int32_t effY16[3] = {};    // ... after the offset is subtracted
+        int32_t effX16[3] = {};
+        int count = 0;
+        std::array<GSVertex, 3> vertices{};
+    };
+
+    int reportOffsets(GSRec::Reader &reader)
+    {
+        using Key4 = std::tuple<uint32_t, uint32_t, uint32_t, int, int>;
+        std::map<Key4, uint64_t> offsets; // fbp, ofx, ofy, kind, ctxt
+        std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, uint32_t>, uint64_t> scissors;
+        std::map<std::tuple<uint32_t, int, int, int>, uint64_t> fracs; // fbp, kind, 0 raw / 1 effective, fraction in 1/16
+        struct Segment
+        {
+            std::vector<OffsetPrim> prims;
+            std::map<uint32_t, uint64_t> fbps;
+            std::map<std::pair<uint32_t, uint32_t>, uint64_t> offs;
+            int displayedFbp = -1; // the marker after the segment
+        };
+        std::vector<Segment> segments(1);
+        std::map<std::string, uint64_t> memberDiffs;
+        uint64_t pairsCompared = 0, pairsSkipped = 0, primPairs = 0, geomSame = 0, geomHalf = 0, geomOther = 0, geomHalfXs = 0, geomRawSame = 0;
+        std::map<int, uint64_t> deltaHist; // effective-Y delta (1/16 units) of the first vertex, between consecutive fields, for prims whose X is unchanged
+        uint64_t displayedIsPrevSegment = 0, displayedIsNextSegment = 0, displayedOther = 0;
+        std::vector<std::string> tbpSamples;
+        std::string pairFlags; // one character per pair of consecutive fields: '=' nothing but the frame buffer and OFY differs, '~' something else, '.' different primitive counts
+        const auto sameVertex = [](const GSVertex &a, const GSVertex &b)
+        {
+            return a.x == b.x && a.y == b.y && a.z == b.z && a.r == b.r && a.g == b.g && a.b == b.b && a.a == b.a && a.q == b.q && a.s == b.s && a.t == b.t &&
+                   a.u == b.u && a.v == b.v;
+        };
+
+        GSRec::Record r;
+        while (reader.next(r) == GSRec::Reader::Status::Ok)
+        {
+            if (r.type == GSRec::RT_Marker)
+            {
+                segments.back().displayedFbp = static_cast<int>(r.request.dispfb1 & 0x1FFu);
+                segments.emplace_back();
+                continue;
+            }
+            if (r.type != GSRec::RT_Submit)
+                continue;
+            const GSDrawState &st = r.batch.state;
+            const GSContext &c = st.context;
+            OffsetPrim p;
+            p.st = st;
+            p.vertices = r.batch.vertices;
+            p.kind = st.prim.type == GS_PRIM_SPRITE ? 0 : 1;
+            p.count = p.kind == 0 ? 2 : 3;
+            for (int i = 0; i < p.count; ++i)
+            {
+                p.rawY16[i] = static_cast<int32_t>(std::lround(r.batch.vertices[static_cast<size_t>(i)].y * 16.0f));
+                p.effY16[i] = p.rawY16[i] - static_cast<int32_t>(c.xyoffset.ofy);
+                p.effX16[i] = static_cast<int32_t>(std::lround(r.batch.vertices[static_cast<size_t>(i)].x * 16.0f)) - static_cast<int32_t>(c.xyoffset.ofx);
+                ++fracs[{c.frame.fbp, p.kind, 0, p.rawY16[i] & 15}];
+                ++fracs[{c.frame.fbp, p.kind, 1, p.effY16[i] & 15}];
+            }
+            ++offsets[{c.frame.fbp, c.xyoffset.ofx, c.xyoffset.ofy, p.kind, st.prim.ctxt ? 1 : 0}];
+            ++scissors[{c.frame.fbp, c.scissor.x0, c.scissor.x1, c.scissor.y0, c.scissor.y1}];
+            Segment &seg = segments.back();
+            ++seg.fbps[c.frame.fbp];
+            ++seg.offs[{c.xyoffset.ofx, c.xyoffset.ofy}];
+            seg.prims.push_back(std::move(p));
+        }
+
+        std::printf("== XYOFFSET by frame buffer (OFX/OFY are 12.4 fixed point: value / 16 = pixels)\n");
+        for (const auto &e : offsets)
+        {
+            const auto &[fbp, ofx, ofy, kind, ctxt] = e.first;
+            std::printf("  fbp %3u  OFX %5u (%.4f)  OFY %5u (%.4f)  %-8s ctxt %d : %llu prims\n", fbp, ofx, ofx / 16.0, ofy, ofy / 16.0,
+                        kind == 0 ? "sprite" : "triangle", ctxt, static_cast<unsigned long long>(e.second));
+        }
+        std::printf("== scissor by frame buffer (x0 x1 y0 y1)\n");
+        for (const auto &e : scissors)
+        {
+            const auto &[fbp, x0, x1, y0, y1] = e.first;
+            std::printf("  fbp %3u  scissor %u %u %u %u : %llu prims\n", fbp, x0, x1, y0, y1, static_cast<unsigned long long>(e.second));
+        }
+        std::printf("== fraction of vertex Y in 1/16 pixel (raw = as sent, eff = minus OFY): fbp kind -> {fraction: count}\n");
+        {
+            std::map<std::tuple<uint32_t, int, int>, std::string> lines;
+            for (const auto &e : fracs)
+            {
+                const auto &[fbp, kind, eff, frac] = e.first;
+                lines[{fbp, kind, eff}] += " " + std::to_string(frac) + ":" + std::to_string(e.second);
+            }
+            for (const auto &l : lines)
+                std::printf("  fbp %3u %-8s %s %s\n", std::get<0>(l.first), std::get<1>(l.first) == 0 ? "sprite" : "triangle",
+                            std::get<2>(l.first) ? "eff" : "raw", l.second.c_str());
+        }
+
+        std::printf("== the first 10 fields (segments between markers): frame buffers and offsets drawn with, then the frame buffer the next marker shows\n");
+        for (size_t k = 0; k + 1 < segments.size() && k < 10; ++k)
+        {
+            const Segment &s = segments[k];
+            std::printf("  segment %zu: %zu prims; fbp", k, s.prims.size());
+            for (const auto &f : s.fbps)
+                std::printf(" %u(%llu)", f.first, static_cast<unsigned long long>(f.second));
+            std::printf("; (OFX,OFY)");
+            for (const auto &o : s.offs)
+                std::printf(" (%.4f,%.4f)x%llu", o.first.first / 16.0, o.first.second / 16.0, static_cast<unsigned long long>(o.second));
+            std::printf("; marker shows fbp %d\n", s.displayedFbp);
+        }
+        for (size_t k = 0; k + 2 < segments.size(); ++k)
+        {
+            const Segment &s = segments[k];
+            if (s.fbps.empty() || s.displayedFbp < 0)
+                continue;
+            const uint32_t drawn = s.fbps.begin()->first;
+            const uint32_t drawnNext = segments[k + 1].fbps.empty() ? 0xFFFFFFFFu : segments[k + 1].fbps.begin()->first;
+            if (static_cast<uint32_t>(s.displayedFbp) == drawn)
+                ++displayedIsPrevSegment;
+            else if (static_cast<uint32_t>(s.displayedFbp) == drawnNext)
+                ++displayedIsNextSegment;
+            else
+                ++displayedOther;
+        }
+        std::printf("== marker k shows the frame buffer drawn (first fbp) in the field before it: %llu, in the field after it: %llu, neither: %llu\n",
+                    static_cast<unsigned long long>(displayedIsPrevSegment), static_cast<unsigned long long>(displayedIsNextSegment),
+                    static_cast<unsigned long long>(displayedOther));
+
+        // 5. consecutive fields
+        const auto diffState = [&](const GSDrawState &a, const GSDrawState &b)
+        {
+            const GSContext &x = a.context;
+            const GSContext &y = b.context;
+            const auto note = [&](bool differs, const char *name)
+            {
+                if (differs)
+                    ++memberDiffs[name];
+            };
+            note(x.frame.fbp != y.frame.fbp, "frame.fbp");
+            note(x.frame.fbw != y.frame.fbw, "frame.fbw");
+            note(x.frame.psm != y.frame.psm, "frame.psm");
+            note(x.frame.fbmsk != y.frame.fbmsk, "frame.fbmsk");
+            note(x.zbuf.zbp != y.zbuf.zbp, "zbuf.zbp");
+            note(x.zbuf.zmask != y.zbuf.zmask, "zbuf.zmask");
+            note(x.scissor.x0 != y.scissor.x0 || x.scissor.x1 != y.scissor.x1, "scissor.x");
+            note(x.scissor.y0 != y.scissor.y0 || x.scissor.y1 != y.scissor.y1, "scissor.y");
+            note(x.xyoffset.ofx != y.xyoffset.ofx, "xyoffset.ofx");
+            note(x.xyoffset.ofy != y.xyoffset.ofy, "xyoffset.ofy");
+            note(x.tex0.tbp0 != y.tex0.tbp0, "tex0.tbp0");
+            note(x.tex0.tbw != y.tex0.tbw || x.tex0.psm != y.tex0.psm, "tex0.tbw/psm");
+            note(x.tex0.tw != y.tex0.tw || x.tex0.th != y.tex0.th, "tex0.tw/th");
+            note(x.tex0.tcc != y.tex0.tcc || x.tex0.tfx != y.tex0.tfx, "tex0.tcc/tfx");
+            note(x.tex0.cbp != y.tex0.cbp || x.tex0.cpsm != y.tex0.cpsm || x.tex0.csm != y.tex0.csm || x.tex0.csa != y.tex0.csa, "tex0.clut");
+            note(x.tex1 != y.tex1, "tex1");
+            note(x.clamp != y.clamp, "clamp");
+            note(x.alpha != y.alpha, "alpha");
+            note(x.test != y.test, "test");
+            note(x.fba != y.fba, "fba");
+            note(a.prim.type != b.prim.type || a.prim.iip != b.prim.iip || a.prim.tme != b.prim.tme || a.prim.abe != b.prim.abe || a.prim.fst != b.prim.fst,
+                 "prim");
+            note(a.texa.ta0 != b.texa.ta0 || a.texa.ta1 != b.texa.ta1 || a.texa.aem != b.texa.aem, "texa");
+            note(a.textureWidth != b.textureWidth || a.textureHeight != b.textureHeight, "textureWidth/Height");
+            note(a.linearFilter != b.linearFilter, "linearFilter");
+        };
+        for (size_t k = 0; k + 2 < segments.size(); ++k)
+        {
+            const Segment &a = segments[k];
+            const Segment &b = segments[k + 1];
+            if (a.prims.empty() || a.prims.size() != b.prims.size())
+            {
+                ++pairsSkipped;
+                pairFlags.push_back('.');
+                continue;
+            }
+            ++pairsCompared;
+            bool pairStatic = true;
+            for (size_t i = 0; i < a.prims.size(); ++i)
+            {
+                const OffsetPrim &p = a.prims[i];
+                const OffsetPrim &q = b.prims[i];
+                if (p.kind != q.kind)
+                {
+                    ++geomOther;
+                    pairStatic = false;
+                    continue;
+                }
+                ++primPairs;
+                if (p.st.context.tex0.tbp0 != q.st.context.tex0.tbp0 && tbpSamples.size() < 16)
+                {
+                    char text[96];
+                    std::snprintf(text, sizeof(text), "field pair %zu, primitive %zu: TBP0 %u -> %u", k, i, p.st.context.tex0.tbp0, q.st.context.tex0.tbp0);
+                    tbpSamples.push_back(text);
+                }
+                const std::map<std::string, uint64_t> before = memberDiffs;
+                diffState(p.st, q.st);
+                for (const auto &m : memberDiffs)
+                {
+                    const auto was = before.find(m.first);
+                    if (m.first != "frame.fbp" && m.first != "xyoffset.ofy" && (was == before.end() || was->second != m.second))
+                        pairStatic = false;
+                }
+                for (int v = 0; v < p.count; ++v)
+                    if (!sameVertex(p.vertices[static_cast<size_t>(v)], q.vertices[static_cast<size_t>(v)]))
+                        pairStatic = false;
+                bool rawSame = true, effSame = true, half = true, xSame = true;
+                for (int v = 0; v < p.count; ++v)
+                {
+                    rawSame = rawSame && p.rawY16[v] == q.rawY16[v];
+                    effSame = effSame && p.effY16[v] == q.effY16[v];
+                    const int d = q.effY16[v] - p.effY16[v];
+                    half = half && (d == 8 || d == -8);
+                    xSame = xSame && p.effX16[v] == q.effX16[v];
+                }
+                geomRawSame += rawSame ? 1u : 0u;
+                if (effSame)
+                    ++geomSame;
+                else if (half && xSame)
+                    ++geomHalf;
+                else
+                    ++geomOther;
+                if (xSame)
+                    ++deltaHist[std::max(-64, std::min(64, q.effY16[0] - p.effY16[0]))];
+            }
+            pairFlags.push_back(pairStatic ? '=' : '~');
+        }
+        {
+            // How the alternation of the two kinds of field runs: OFY and the frame buffer of each non-empty field.
+            uint64_t fields = 0, ofyAlternates = 0, ofySame = 0, fbpAlternates = 0, fbpSame = 0, pairingChanges = 0;
+            const OffsetPrim *prevFirst = nullptr;
+            for (const Segment &seg : segments)
+            {
+                if (seg.prims.empty())
+                    continue;
+                const OffsetPrim &first = seg.prims.front();
+                ++fields;
+                if (prevFirst)
+                {
+                    (prevFirst->st.context.xyoffset.ofy != first.st.context.xyoffset.ofy ? ofyAlternates : ofySame)++;
+                    (prevFirst->st.context.frame.fbp != first.st.context.frame.fbp ? fbpAlternates : fbpSame)++;
+                    const bool prevLowerPairing = (prevFirst->st.context.xyoffset.ofy & 8u) != 0u;
+                    const bool curLowerPairing = (first.st.context.xyoffset.ofy & 8u) != 0u;
+                    const bool fbpChanged = prevFirst->st.context.frame.fbp != first.st.context.frame.fbp;
+                    // the pairing (fbp, OFY) flips when one of the two alternates and the other does not
+                    if ((prevLowerPairing != curLowerPairing) != fbpChanged)
+                        ++pairingChanges;
+                }
+                prevFirst = &first;
+            }
+            std::printf("== alternation of consecutive non-empty fields (%llu fields): OFY differs %llu times, equal %llu; frame buffer differs %llu, equal %llu; "
+                        "the (frame buffer, OFY) pairing flips %llu times\n",
+                        static_cast<unsigned long long>(fields), static_cast<unsigned long long>(ofyAlternates), static_cast<unsigned long long>(ofySame),
+                        static_cast<unsigned long long>(fbpAlternates), static_cast<unsigned long long>(fbpSame), static_cast<unsigned long long>(pairingChanges));
+        }
+        std::printf("== consecutive fields: %llu pairs compared (same primitive count), %llu skipped (different count)\n",
+                    static_cast<unsigned long long>(pairsCompared), static_cast<unsigned long long>(pairsSkipped));
+        std::printf("  primitive pairs at the same position: %llu\n", static_cast<unsigned long long>(primPairs));
+        std::printf("    vertices identical as sent (raw Y): %llu; identical after the offset is subtracted: %llu; every vertex exactly half a line (+-8/16) apart with the same X: %llu; anything else: %llu\n",
+                    static_cast<unsigned long long>(geomRawSame), static_cast<unsigned long long>(geomSame), static_cast<unsigned long long>(geomHalf),
+                    static_cast<unsigned long long>(geomOther));
+        std::printf("    draw-state members that differ between the two fields (pairs that differ, of %llu):\n", static_cast<unsigned long long>(primPairs));
+        for (const auto &m : memberDiffs)
+            std::printf("      %-22s %llu\n", m.first.c_str(), static_cast<unsigned long long>(m.second));
+        {
+            // Runs of pairs in which the game sends the same draw list twice (nothing but the frame buffer and OFY differs):
+            // the scenes that do not move. Pair k is fields k and k + 1; the picture shown at marker m comes from field m - 1.
+            std::printf("== runs of at least 20 consecutive field pairs with an identical draw list (pair k = fields k, k+1):");
+            size_t runStart = 0;
+            bool any = false;
+            for (size_t k = 0; k <= pairFlags.size(); ++k)
+                if (k == pairFlags.size() || pairFlags[k] != '=')
+                {
+                    if (k - runStart >= 20 && runStart < k && pairFlags[runStart] == '=')
+                    {
+                        std::printf(" [%zu..%zu]", runStart, k - 1);
+                        any = true;
+                    }
+                    runStart = k + 1;
+                }
+            std::printf("%s\n", any ? "" : " none");
+            uint64_t statics = 0;
+            for (char c : pairFlags)
+                statics += c == '=' ? 1u : 0u;
+            std::printf("== pairs with an identical draw list: %llu of %zu\n", static_cast<unsigned long long>(statics), pairFlags.size());
+            std::printf("== pair flags (= identical draw list, ~ it changed, . different primitive count), one per pair k = fields k, k+1:\n");
+            for (size_t k = 0; k < pairFlags.size(); k += 100)
+                std::printf("  [%zu] %s\n", k, pairFlags.substr(k, 100).c_str());
+        }
+        if (!tbpSamples.empty())
+        {
+            std::printf("    the first primitives whose texture address (TBP0) differs between two consecutive fields:\n");
+            for (const std::string &t : tbpSamples)
+                std::printf("      %s\n", t.c_str());
+        }
+        std::printf("    effective-Y change of the first vertex in 1/16 pixel (prims with unchanged X), most common:");
+        {
+            std::vector<std::pair<uint64_t, int>> sorted;
+            for (const auto &h : deltaHist)
+                sorted.emplace_back(h.second, h.first);
+            std::sort(sorted.rbegin(), sorted.rend());
+            for (size_t i = 0; i < sorted.size() && i < 10; ++i)
+                std::printf(" %+d:%llu", sorted[i].second, static_cast<unsigned long long>(sorted[i].first));
+            std::printf("\n");
+        }
+        return 0;
+    }
 
     SDL_GPUDevice *makeGpuDevice(const Options &opt, std::string &driverName, std::string &deviceName)
     {
@@ -667,6 +1061,9 @@ int main(int argc, char **argv)
         return 0;
     }
 
+    if (opt.offsets)
+        return reportOffsets(reader);
+
     if (opt.states)
     {
         // The distinct draw states of the clip as a GPU renderer sees them (what would pick a pipeline,
@@ -780,10 +1177,11 @@ int main(int argc, char **argv)
         gpuDevice = makeGpuDevice(opt, gpuDriver, gpuDeviceName);
         if (!gpuDevice)
             return 2;
-        std::printf("gpu: driver %s, device \"%s\", scale %u\n", gpuDriver.c_str(), gpuDeviceName.c_str(), opt.scale);
+        std::printf("gpu: driver %s, device \"%s\", scale %u, fields %s\n", gpuDriver.c_str(), gpuDeviceName.c_str(), opt.scale, opt.fields.c_str());
         gpuSide.name = "gpu";
         gpuSide.vram = vram;
-        gpuBackend = std::make_unique<GSGpuBackend>(gpuDevice, opt.scale);
+        gpuBackend = std::make_unique<GSGpuBackend>(gpuDevice, opt.scale,
+                                                    opt.fields == "progressive" ? GSGpuBackend::FieldMode::Progressive : GSGpuBackend::FieldMode::Weave);
         if (!gpuBackend->Ready())
         {
             std::fprintf(stderr, "the GPU renderer could not be set up\n");
@@ -826,6 +1224,7 @@ int main(int argc, char **argv)
         }
     }
 
+    std::map<uint32_t, uint32_t> ofyOfFbp; // the OFY of the latest primitive drawn into each frame buffer (--compare-rows parity)
     std::vector<Replayed> replayed; // the CPU side's when there is one, else the GPU's
     std::map<uint32_t, LiveFrame> liveFrames;
     std::map<uint32_t, uint64_t> liveDisplays;
@@ -865,7 +1264,10 @@ int main(int argc, char **argv)
                                              (opt.skipState >= 0 && static_cast<int>(rec.stateId) == opt.skipState)))
             continue; // debugging filter
         if (rec.type == GSRec::RT_Submit)
+        {
             ++submits;
+            ofyOfFbp[rec.batch.state.context.frame.fbp] = rec.batch.state.context.xyoffset.ofy;
+        }
         else if (rec.type == GSRec::RT_UploadImage)
             uploadBytes += rec.size;
 
@@ -939,7 +1341,7 @@ int main(int argc, char **argv)
 
                 // Path B: the picture built on the GPU from the field the marker published.
                 const auto d0 = Clock::now();
-                presenter->Pull();
+                const GSGpuPresenter::Size directSize = presenter->Pull();
                 const auto d1 = Clock::now();
                 SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(gpuDevice);
                 presenter->Record(cmd);
@@ -955,6 +1357,18 @@ int main(int argc, char **argv)
                     return 2;
                 }
                 ++directCompared;
+                if (!opt.pngDir.empty() && rec.marker % opt.pngEvery == 0)
+                {
+                    // The picture the host would show (path B), at its own size: with --png-dir, direct_marker_NNNNN.png.
+                    Picture shownDirect;
+                    shownDirect.pixels = got;
+                    shownDirect.width = directSize.width;
+                    shownDirect.height = directSize.height;
+                    char directName[64];
+                    std::snprintf(directName, sizeof(directName), "direct_marker_%05u.png", rec.marker);
+                    if (!writePicture(opt.pngDir + "/" + directName, shownDirect))
+                        std::fprintf(stderr, "cannot write %s/%s (does the folder exist?)\n", opt.pngDir.c_str(), directName);
+                }
                 if (std::getenv("PS2X_REPLAY_TRACE_DECISION"))
                 {
                     const GSFieldDeinterlacer::Decision &cpuDecision = readbackDeinterlacer.lastDecision();
@@ -1026,9 +1440,17 @@ int main(int argc, char **argv)
                 }
                 else
                 {
-                    if (pictures[0].width != pictures[1].width || pictures[0].height != pictures[1].height)
+                    // A progressive GPU picture is compared at the CPU picture's size.
+                    // (the field on display at this marker was drawn with the OFY last used for its frame buffer)
+                    const uint32_t shownFbp = static_cast<uint32_t>(rec.request.dispfb1 & 0x1FFu);
+                    const unsigned parity = (ofyOfFbp.count(shownFbp) && (ofyOfFbp[shownFbp] & 8u) != 0u) ? 1u : 0u;
+                    const Picture reduced = pictures[1].height == pictures[0].height * 2u && pictures[1].width == pictures[0].width
+                                                ? (opt.compareRows == "average" ? halveRows(pictures[1]) : pickRows(pictures[1], parity))
+                                                : Picture{};
+                    const Picture &gpuPicture = reduced.pixels.empty() ? pictures[1] : reduced;
+                    if (pictures[0].width != gpuPicture.width || pictures[0].height != gpuPicture.height)
                         ++sizeMismatches;
-                    const DiffResult d = diffPictures(pictures[0], pictures[1]);
+                    const DiffResult d = diffPictures(pictures[0], gpuPicture);
                     shares.push_back(d.share * 100.0);
                     maxDiffs.push_back(d.maxDiff);
                     shareMarkers.push_back(rec.marker);
@@ -1039,7 +1461,7 @@ int main(int argc, char **argv)
                             char name[96];
                             std::snprintf(name, sizeof(name), "%s_m%05u_", clip.c_str(), rec.marker);
                             const std::string base = opt.diffDir + "/" + name;
-                            const Picture diff = makeDiffPicture(pictures[0], pictures[1]);
+                            const Picture diff = makeDiffPicture(pictures[0], gpuPicture);
                             if (writePicture(base + "cpu.png", pictures[0]) && writePicture(base + "gpu.png", pictures[1]) &&
                                 writePicture(base + "diff.png", diff))
                                 diffPngCount += 3;
@@ -1058,7 +1480,7 @@ int main(int argc, char **argv)
                                 w.maxDiff = d.maxDiff;
                                 w.marker = rec.marker;
                                 w.cpu = pictures[0];
-                                w.gpu = pictures[1];
+                                w.gpu = gpuPicture;
                                 if (room)
                                     worst.push_back(std::move(w));
                                 else
@@ -1347,8 +1769,8 @@ int main(int argc, char **argv)
     {
         if (FILE *f = std::fopen(opt.jsonFile.c_str(), "w"))
         {
-            std::fprintf(f, "{\n  \"clip\": \"%s\",\n  \"driver\": \"%s\",\n  \"device\": \"%s\",\n  \"scale\": %u,\n  \"mode\": \"%s\",\n  \"markers\": %llu,\n",
-                         clip.c_str(), gpuDriver.c_str(), gpuDeviceName.c_str(), opt.scale, opt.compare ? "compare" : "gpu",
+            std::fprintf(f, "{\n  \"clip\": \"%s\",\n  \"driver\": \"%s\",\n  \"device\": \"%s\",\n  \"scale\": %u,\n  \"fields\": \"%s\",\n  \"mode\": \"%s\",\n  \"markers\": %llu,\n",
+                         clip.c_str(), gpuDriver.c_str(), gpuDeviceName.c_str(), opt.scale, opt.fields.c_str(), opt.compare ? "compare" : "gpu",
                          static_cast<unsigned long long>(markers));
             std::fprintf(f, "  \"speed_markers_per_s\": {\"gpu\": %.2f, \"cpu\": %.2f},\n", gpuRate, useCpu ? cpuRate : 0.0);
             if (opt.compare)

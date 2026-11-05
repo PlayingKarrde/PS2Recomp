@@ -24,6 +24,7 @@ namespace ps2x_gs
             GSGpuBackend *backend = nullptr; // owned by the GS (GS::setRasterBackend), valid until shutdown()
             std::unique_ptr<GSGpuPresenter> presenter;
             bool readback = false;
+            GSGpuBackend::FieldMode fields = GSGpuBackend::FieldMode::Progressive;
         } g;
 
         bool envFlag(const char *name)
@@ -70,6 +71,14 @@ namespace ps2x_gs
             if (const char *scale = std::getenv("PS2X_GS_SCALE"))
                 if (std::strcmp(scale, "1") != 0)
                     std::fprintf(stderr, "[gs] PS2X_GS_SCALE=%s is not supported yet (only 1), using 1\n", scale);
+            g.fields = GSGpuBackend::FieldMode::Progressive;
+            if (const char *fields = std::getenv("PS2X_GS_FIELDS"))
+            {
+                if (std::strcmp(fields, "weave") == 0)
+                    g.fields = GSGpuBackend::FieldMode::Weave;
+                else if (std::strcmp(fields, "progressive") != 0)
+                    std::fprintf(stderr, "[gs] PS2X_GS_FIELDS=%s is not progressive or weave, using progressive\n", fields);
+            }
             SDL_GPUDevice *device = ps2x_host::gpuDevice();
             if (!device)
             {
@@ -77,7 +86,7 @@ namespace ps2x_gs
             }
             else
             {
-                auto candidate = std::make_unique<GSGpuBackend>(device, 1);
+                auto candidate = std::make_unique<GSGpuBackend>(device, 1, g.fields);
                 if (!candidate->Ready())
                 {
                     say("[gs] the GPU renderer could not be set up (see above); keeping the CPU renderer");
@@ -114,10 +123,13 @@ namespace ps2x_gs
                         candidate.reset();
                     if (candidate)
                         g.backend = candidate.get();
-                    char line[256];
-                    std::snprintf(line, sizeof(line), "[gs] GS renderer: gpu, scale 1, %s, SDL_GPU driver %s",
-                                  direct ? "path B (direct: field textures on the GPU, deinterlaced in a shader, no readback)"
-                                         : "path A (readback: CPU pixels, CPU deinterlacer)",
+                    char line[384];
+                    const bool progressive = g.fields == GSGpuBackend::FieldMode::Progressive;
+                    std::snprintf(line, sizeof(line), "[gs] GS renderer: gpu, scale 1, fields %s, %s, SDL_GPU driver %s",
+                                  progressive ? "progressive (each field drawn as a 640x448 picture, newest field shown)" : "weave (fields woven into 448 lines)",
+                                  direct ? (progressive ? "path B (direct: field textures on the GPU, no readback)"
+                                                        : "path B (direct: field textures on the GPU, deinterlaced in a shader, no readback)")
+                                         : (progressive ? "path A (readback: CPU pixels)" : "path A (readback: CPU pixels, CPU deinterlacer)"),
                                   ps2x_host::gpu_present::driverName().c_str());
                     if (candidate)
                     {

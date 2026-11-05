@@ -11,6 +11,8 @@
 //     fill rule is the same on both. Sprites cover whole pixels [x0, x0+w) x [y0, y0+h) after the
 //     coordinates are truncated to integers, so their corners are used as they are.
 //   - Z is the 24-bit GS value divided by 2^24, which a 32-bit float holds exactly.
+//   - The target can be larger than the GS frame by a factor per axis (TargetMapping); in progressive field mode
+//     (GPU renderer M4a) it is twice as tall and the half line by which the game offsets alternate fields is removed.
 // Nothing here includes SDL, and no header that generated game code includes refers to this one.
 
 #include "runtime/gs/gs_types.h"
@@ -64,23 +66,46 @@ namespace GSGpu
                s.maxY < static_cast<int32_t>(sc.y0) || s.minY > static_cast<int32_t>(sc.y1);
     }
 
+    // How GS pixels map to target pixels: `sx` and `sy` target pixels per GS pixel along each axis.
+    //
+    // Weave mode (progressive == false) draws each of the game's 640 x 224 fields as it is, at `scale` times that size
+    // (sx == sy == scale), and a later pass weaves the fields into 448 lines.
+    //
+    // Progressive mode draws every field as a full-height picture: the target is twice as tall (sy == 2 * scale) and the
+    // two kinds of field of the game come out identical, which needs one thing here. The game draws alternate fields with
+    // the XYOFFSET Y offset (OFY) half a line apart (1936.0 and 1936.5; bringup.md "GPU renderer", M4a) and sends the same
+    // vertices in both. The fraction of OFY is the half line, so it is dropped: a field then has the geometry of the
+    // first kind of field, and the second kind's half-line lower sampling grid becomes the odd lines of the target.
+    // That is the 448-line grid a TV lays the two fields on, so the sample of target row j is at GS position j / sy
+    // (rows 2k and 2k+1 sample the field at y = k and y = k + 1/2), where weave mode samples target pixel centres.
+    // Sprites need no such step: their coordinates are truncated to whole pixels (BuildSprite), which already ignores
+    // the fraction of OFY.
+    struct TargetMapping
+    {
+        uint32_t sx = 1, sy = 1;
+        bool progressive = false;
+    };
+
     // TRIANGLE / TRISTRIP / TRIFAN: the batch holds one triangle. Returns false for a triangle with no
     // area (the CPU renderer draws nothing for it either).
-    inline bool BuildTriangle(const GSPrimitiveBatch &batch, uint32_t scale, Setup &out)
+    inline bool BuildTriangle(const GSPrimitiveBatch &batch, const TargetMapping &map, Setup &out)
     {
         const GSDrawState &state = batch.state;
         const GSContext &ctx = state.context;
+        // Progressive mode: the same geometry in both kinds of field (see TargetMapping).
+        const int64_t ofy = map.progressive ? static_cast<int64_t>(ctx.xyoffset.ofy & ~15u) : static_cast<int64_t>(ctx.xyoffset.ofy);
         int64_t ix[3], iy[3];
         for (int i = 0; i < 3; ++i)
         {
             ix[i] = std::lround(batch.vertices[static_cast<size_t>(i)].x * 16.0f) - ctx.xyoffset.ofx;
-            iy[i] = std::lround(batch.vertices[static_cast<size_t>(i)].y * 16.0f) - ctx.xyoffset.ofy;
+            iy[i] = std::lround(batch.vertices[static_cast<size_t>(i)].y * 16.0f) - ofy;
         }
         const int64_t denom = (iy[1] - iy[2]) * (ix[0] - ix[2]) + (ix[2] - ix[1]) * (iy[0] - iy[2]);
         if (denom == 0)
             return false;
 
-        const float fscale = static_cast<float>(scale);
+        const float fscaleX = static_cast<float>(map.sx);
+        const float fscaleY = static_cast<float>(map.sy);
         float fx[3], fy[3];
         for (int i = 0; i < 3; ++i)
         {
@@ -98,9 +123,10 @@ namespace GSGpu
         {
             const GSVertex &src = batch.vertices[static_cast<size_t>(i)];
             Vertex &dst = out.v[i];
-            // The GS samples at integer positions; the GPU at pixel centres, half a pixel further.
-            dst.x = (fx[i] + 0.5f) * fscale;
-            dst.y = (fy[i] + 0.5f) * fscale;
+            // The GS samples at integer positions; the GPU at pixel centres, half a pixel further. In progressive
+            // mode the rows of the target are the lines of the 448-line grid, which sample at j / sy (TargetMapping).
+            dst.x = (fx[i] + 0.5f) * fscaleX;
+            dst.y = map.progressive ? fy[i] * fscaleY + 0.5f : (fy[i] + 0.5f) * fscaleY;
             dst.z = static_cast<float>(src.z * static_cast<double>(kDepthScale));
             const GSVertex &colour = state.prim.iip ? src : last; // flat shading takes the last vertex
             dst.rgba = PackRgba(colour.r, colour.g, colour.b, colour.a);
@@ -121,11 +147,16 @@ namespace GSGpu
         return true;
     }
 
+    inline bool BuildTriangle(const GSPrimitiveBatch &batch, uint32_t scale, Setup &out)
+    {
+        return BuildTriangle(batch, TargetMapping{scale, scale, false}, out);
+    }
+
     // SPRITE: two corners, drawn as two triangles. Coordinates are truncated to whole pixels like the CPU
     // renderer; a zero-sized side counts as one pixel. The colour and Z of the second vertex apply to
     // the whole sprite. The texture coordinates run from the first vertex (left/top edge) to the second
     // (right/bottom edge) even when the corners are given the other way round, as in the CPU renderer.
-    inline bool BuildSprite(const GSPrimitiveBatch &batch, uint32_t scale, Setup &out)
+    inline bool BuildSprite(const GSPrimitiveBatch &batch, const TargetMapping &map, Setup &out)
     {
         const GSDrawState &state = batch.state;
         const GSContext &ctx = state.context;
@@ -173,11 +204,12 @@ namespace GSGpu
         }
         out.texelCoords = true; // sprites interpolate texel coordinates, never S/T/Q
 
-        const float fscale = static_cast<float>(scale);
-        const float left = static_cast<float>(x0) * fscale;
-        const float top = static_cast<float>(y0) * fscale;
-        const float right = static_cast<float>(x0 + spanX) * fscale;
-        const float bottom = static_cast<float>(y0 + spanY) * fscale;
+        const float fscaleX = static_cast<float>(map.sx);
+        const float fscaleY = static_cast<float>(map.sy);
+        const float left = static_cast<float>(x0) * fscaleX;
+        const float top = static_cast<float>(y0) * fscaleY;
+        const float right = static_cast<float>(x0 + spanX) * fscaleX;
+        const float bottom = static_cast<float>(y0 + spanY) * fscaleY;
         const float z = static_cast<float>(v1.z * static_cast<double>(kDepthScale));
         const uint32_t rgba = PackRgba(v1.r, v1.g, v1.b, v1.a);
         auto make = [&](float x, float y, float u, float v)
@@ -204,6 +236,11 @@ namespace GSGpu
         out.v[5] = bl;
         out.count = 6;
         return true;
+    }
+
+    inline bool BuildSprite(const GSPrimitiveBatch &batch, uint32_t scale, Setup &out)
+    {
+        return BuildSprite(batch, TargetMapping{scale, scale, false}, out);
     }
 
     // ------------------------------------------------------------------------------------------
@@ -294,8 +331,14 @@ namespace GSGpu
     constexpr uint32_t kFlagAlphaTest = 1u << 6;
     constexpr uint32_t kFlagQuantizeRound = 1u << 7; // texel coordinates rounded to 1/16 (a sprite with UV, as the CPU renderer does)
     constexpr uint32_t kFlagQuantizeFloor = 1u << 8; // truncated to 1/16 (a triangle with UV: the GS interpolates 12.4 fixed point)
+    // A sprite on a target larger than the GS frame (flags[1] target rows and flags[2] target columns per GS pixel): the shader
+    // samples the texture at the centre of the GS pixel the target pixel belongs to, like the GS does, instead of at the
+    // target pixel's own centre. See gs.frag.hlsl.
+    constexpr uint32_t kFlagSnapToGsPixel = 1u << 9;
 
-    inline FragUniforms BuildFragUniforms(const GSDrawState &state, bool texelCoords, bool blendUsesFix)
+    // `snapX` and `snapY` are the target pixels per GS pixel along each axis for a sprite (0 or 1: no snapping, see
+    // kFlagSnapToGsPixel); other primitives pass 0.
+    inline FragUniforms BuildFragUniforms(const GSDrawState &state, bool texelCoords, bool blendUsesFix, uint32_t snapX = 0u, uint32_t snapY = 0u)
     {
         FragUniforms u;
         std::memset(&u, 0, sizeof(u));
@@ -313,6 +356,12 @@ namespace GSGpu
                 u.flags[0] |= kFlagTexelCoords;
             if (state.prim.fst)
                 u.flags[0] |= (state.prim.type == GS_PRIM_SPRITE) ? kFlagQuantizeRound : kFlagQuantizeFloor;
+            if (texelCoords && (snapX > 1u || snapY > 1u))
+            {
+                u.flags[0] |= kFlagSnapToGsPixel;
+                u.flags[1] = snapY;
+                u.flags[2] = snapX;
+            }
             if (state.linearFilter)
                 u.flags[0] |= kFlagBilinear;
             if (ctx.tex0.tcc != 0u)

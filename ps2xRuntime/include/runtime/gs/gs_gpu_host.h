@@ -9,9 +9,19 @@
 //   PS2X_GS_BACKEND=cpu|gpu     the GS renderer; cpu is the default and behaves exactly as before.
 //   PS2X_GS_SCALE=1             internal resolution multiplier; only 1 exists so far (other values are
 //                               refused with a log line and 1 is used).
+//   PS2X_GS_FIELDS=progressive|weave
+//                               how the game's 224-line fields are drawn and shown (GSGpuBackend::FieldMode).
+//                               progressive (the default) draws every field as a 640x448 picture, without the
+//                               half line the game offsets alternate fields by, and shows the newest field as it
+//                               is. weave keeps each field 224 lines high and weaves the last three into 448
+//                               lines, like the CPU renderer's picture.
 //   PS2X_GS_GPU_READBACK=1      path A: the GPU renderer returns CPU pixels (GSGpuBackend::Present) and the
 //                               runtime's CPU deinterlacer works on them, as with the CPU renderer. Without
 //                               it the GPU renderer uses path B, the direct path (see gs_gpu_present.h).
+//                               Both paths follow PS2X_GS_FIELDS (in progressive mode path A's pictures are
+//                               448 lines, which the CPU deinterlacer leaves alone).
+//   PS2X_GS_STABILITY=<file>    test aid, path B: after each new picture, append a CSV row with the share of pixels
+//                               that differ from the previous picture (waits for the GPU; see gs_gpu_present.cpp).
 //   PS2X_GS_STATS=1             wrap the chosen renderer in GSBackendProbe: per-call timing and calling
 //                               threads, one line a second.
 //   PS2X_GS_GPU_STATS=1         GSGpuBackend's own counters, one line a second.

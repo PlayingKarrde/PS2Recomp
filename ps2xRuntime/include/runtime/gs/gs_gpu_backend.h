@@ -33,6 +33,17 @@
 // Without field publishing (the replayer's M2 mode, unit tests) Present() reads the frame targets as they are
 // when it is called.
 //
+// Field modes (GPU renderer M4a). The game draws one 640 x 224 field per VBlank, and alternate fields are drawn half
+// a line apart (by the Y offset OFY alone; bringup.md "GPU renderer").
+//   Weave: the targets are the size of a field (times the scale), each published field is one 224-line picture
+//     (FieldInfo::interlaced), and the presenter weaves the last three into 448 lines with a port of the CPU
+//     deinterlacer. This is the M3 picture, kept for comparison with the CPU renderer.
+//   Progressive: the targets are twice as tall (X scale `scale`, Y scale 2 * `scale`), the half line is removed from
+//     the geometry (gs_gpu_math.h, TargetMapping), and every published field is already a 448-line picture. Only the
+//     newest field is shown, nothing is woven, so a still scene gives the same picture every frame.
+// Path A in progressive mode returns those 448-line pictures; the runtime's CPU deinterlacer only acts on pictures of
+// at most 256 lines, so it leaves them alone.
+//
 // The device is not created here: the replayer creates a headless one, and the game passes the host's
 // (ps2x_host::gpuDevice()). This header does not include SDL.
 
@@ -121,6 +132,13 @@ public:
     static constexpr int kFieldSlots = 9;
     static constexpr uint32_t kFieldTextureWidth = 640;
     static constexpr uint32_t kFieldTextureHeight = 512;
+    // How the targets relate to the game's GS frames; see "Field modes" above.
+    enum class FieldMode : uint8_t
+    {
+        Weave,
+        Progressive
+    };
+
     struct FieldInfo
     {
         uint64_t seq = 0;             // 1, 2, 3 ... in publication order; 0 = nothing published yet
@@ -134,8 +152,15 @@ public:
         GSFrameReg candidateFrames[2]{};
         bool valid = false;           // false: this marker had no picture (the display is not set up)
         bool composed = false;        // the slot holds Compose's finished picture (it needed real pixels), not a frame region
-        uint32_t width = 0, height = 0; // the picture, in the top-left corner of the slot texture
-        bool interlaced = false;      // SMODE2.INT: the picture is one field of an interlaced frame
+        // The picture, in the top-left corner of the slot texture, in texels. In progressive mode a field of 640 x 224 GS
+        // pixels is 640 x 448 texels (times the scale): see scaleX and scaleY.
+        uint32_t width = 0, height = 0;
+        // Weave mode only: SMODE2.INT, the picture is one field of an interlaced frame that the presenter has to weave.
+        // Always false in progressive mode, where a field is already a full-height picture.
+        bool interlaced = false;
+        // Texels per GS pixel of the frame region the slot holds (1 for a composed picture, which is in GS pixels).
+        uint32_t scaleX = 1, scaleY = 1;
+        bool progressive = false;     // the field was published in progressive mode
         uint32_t displayFbp = 0, sourceFbp = 0;
         bool usedPreferred = false;
     };
@@ -150,14 +175,20 @@ public:
         bool usedPreferred = false;
     };
 
-    // `scale` multiplies the render target size; only 1 is supported in M2.
-    GSGpuBackend(SDL_GPUDevice *device, uint32_t scale = 1);
+    // `scale` multiplies the render target size (the game uses 1; only 1 has been exercised). `fields` says how the
+    // game's field pictures are drawn and shown (see "Field modes" above); weave is the M3 behaviour.
+    GSGpuBackend(SDL_GPUDevice *device, uint32_t scale = 1, FieldMode fields = FieldMode::Weave);
     ~GSGpuBackend() override;
     GSGpuBackend(const GSGpuBackend &) = delete;
     GSGpuBackend &operator=(const GSGpuBackend &) = delete;
 
     // False when the shaders or the sampler could not be created (the reason is logged).
     bool Ready() const;
+
+    FieldMode Fields() const;
+    // Target pixels per GS pixel along each axis: the scale in X, and in Y twice that in progressive mode.
+    uint32_t TargetScaleX() const;
+    uint32_t TargetScaleY() const;
 
     void Initialize(uint8_t *vram, uint32_t vramSize) override;
     void Reset() override;

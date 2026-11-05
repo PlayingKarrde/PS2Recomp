@@ -13,6 +13,18 @@
 // A progressive picture is copied from resolved[cur] into the picture texture (mode 1 of field_deint); a
 // marker without a picture clears the picture texture to magenta.
 // resolved[] is a ring of three: the last three fields' pictures, which is the deinterlacer's history.
+// In the backend's progressive field mode (GSGpuBackend::FieldMode, M4a) every field arrives as a full-height picture
+// (FieldInfo::interlaced is false), so each one goes down the progressive path: the newest field is the picture and
+// there is no history.
+//
+// PS2X_GS_STABILITY=<file> (opt-in, a test aid): after each new picture is submitted, download it and append one CSV row
+// that says how many pixels differ from the previous picture, and how many flicker. This is how "the picture does not
+// shimmer" is measured: on a scene that does not move, the pictures of consecutive fields should be the same. It waits
+// for the GPU each time. Columns: changed_any / changed_over2 are the pixels where any colour channel differs from the
+// previous picture (at all / by more than 2); flicker_any / flicker_over2 are the pixels that went A, B, A over the last
+// three pictures: the same as two pictures ago but not the same as the last one (the pattern of an alternating
+// half-line offset; strict: equal and not equal; over2: within 2 of two pictures ago and more than 2 from the last).
+// t_ns is std::chrono::steady_clock in nanoseconds (the same clock as Python's time.perf_counter_ns on Windows).
 
 #include "runtime/gs/gs_gpu_present.h"
 #include "runtime/gs/gs_gpu_threads.h"
@@ -30,7 +42,9 @@
 #include <SDL3/SDL_gpu.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace
@@ -113,7 +127,25 @@ struct GSGpuPresenter::Impl
 
     std::vector<GSGpuBackend::FieldInfo> unpinAfterSubmit;
 
-    explicit Impl(GSGpuBackend &b) : backend(b) {}
+    // PS2X_GS_STABILITY
+    std::FILE *stabilityLog = nullptr;
+    std::vector<uint8_t> stabilityPrev, stabilityCur, stabilityPrev2;
+    Size stabilityPrevSize, stabilityPrev2Size;
+    bool stabilityHavePrev = false, stabilityHavePrev2 = false;
+    bool newPicture = false; // Record() made a picture from a field since the last Submitted()
+    uint64_t newPictureSeq = 0;
+    uint64_t stabilityCount = 0;
+
+    explicit Impl(GSGpuBackend &b) : backend(b)
+    {
+        if (const char *path = std::getenv("PS2X_GS_STABILITY"))
+            if (path[0] != '\0')
+            {
+                stabilityLog = std::fopen(path, "w");
+                if (stabilityLog)
+                    std::fprintf(stabilityLog, "index,field_seq,width,height,changed_any,changed_over2,share_any,share_over2,mean_abs,flicker_any,flicker_over2,flicker_share_any,flicker_share_over2,t_ns\n");
+            }
+    }
     ~Impl();
     bool init();
     SDL_GPUGraphicsPipeline *makePipeline(SDL_GPUShader *fragmentShader, SDL_GPUTextureFormat format);
@@ -136,6 +168,8 @@ void GSGpuPresenter::Impl::unpinField(const GSGpuBackend::FieldInfo &f)
 
 GSGpuPresenter::Impl::~Impl()
 {
+    if (stabilityLog)
+        std::fclose(stabilityLog);
     for (const GSGpuBackend::FieldInfo &f : unpinAfterSubmit)
         unpinField(f);
     if (pending == Pending::Field)
@@ -445,6 +479,8 @@ SDL_GPUTexture *GSGpuPresenter::Record(SDL_GPUCommandBuffer *cb)
     // The field slots were read by the commands above: give them back once the command buffer is submitted.
     s.unpinAfterSubmit.push_back(f);
     s.pending = Impl::Pending::None;
+    s.newPicture = true;
+    s.newPictureSeq = f.seq;
     return s.picture;
 }
 
@@ -454,6 +490,59 @@ void GSGpuPresenter::Submitted()
     for (const GSGpuBackend::FieldInfo &f : s.unpinAfterSubmit)
         s.unpinField(f);
     s.unpinAfterSubmit.clear();
+    if (s.stabilityLog && s.newPicture)
+    {
+        s.newPicture = false;
+        if (Download(s.stabilityCur))
+        {
+            const Size size = s.shown;
+            uint64_t any = 0, over2 = 0, sumAbs = 0, flickerAny = 0, flickerOver2 = 0;
+            const bool comparable = s.stabilityHavePrev && s.stabilityPrevSize.width == size.width && s.stabilityPrevSize.height == size.height;
+            const bool threeComparable = comparable && s.stabilityHavePrev2 && s.stabilityPrev2Size.width == size.width && s.stabilityPrev2Size.height == size.height;
+            if (comparable)
+                for (uint32_t y = 0; y < size.height; ++y)
+                    for (uint32_t x = 0; x < size.width; ++x)
+                    {
+                        const size_t i = (static_cast<size_t>(y) * kPictureWidth + x) * 4u;
+                        int worst = 0, worst2 = 0;
+                        for (int c = 0; c < 3; ++c)
+                        {
+                            const int cur = s.stabilityCur[i + static_cast<size_t>(c)];
+                            const int d = std::abs(cur - static_cast<int>(s.stabilityPrev[i + static_cast<size_t>(c)]));
+                            worst = std::max(worst, d);
+                            sumAbs += static_cast<uint64_t>(d);
+                            if (threeComparable)
+                                worst2 = std::max(worst2, std::abs(cur - static_cast<int>(s.stabilityPrev2[i + static_cast<size_t>(c)])));
+                        }
+                        any += worst != 0 ? 1u : 0u;
+                        over2 += worst > 2 ? 1u : 0u;
+                        if (threeComparable)
+                        {
+                            flickerAny += (worst2 == 0 && worst != 0) ? 1u : 0u;
+                            flickerOver2 += (worst2 <= 2 && worst > 2) ? 1u : 0u;
+                        }
+                    }
+            const double pixels = static_cast<double>(size.width) * size.height;
+            if (comparable)
+                std::fprintf(s.stabilityLog, "%llu,%llu,%u,%u,%llu,%llu,%.8f,%.8f,%.6f,%llu,%llu,%.8f,%.8f,%llu\n", static_cast<unsigned long long>(s.stabilityCount),
+                             static_cast<unsigned long long>(s.newPictureSeq), size.width, size.height, static_cast<unsigned long long>(any),
+                             static_cast<unsigned long long>(over2), static_cast<double>(any) / pixels, static_cast<double>(over2) / pixels,
+                             static_cast<double>(sumAbs) / (pixels * 3.0), static_cast<unsigned long long>(flickerAny),
+                             static_cast<unsigned long long>(flickerOver2), static_cast<double>(flickerAny) / pixels,
+                             static_cast<double>(flickerOver2) / pixels,
+                             static_cast<unsigned long long>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()));
+            ++s.stabilityCount;
+            // cur -> prev -> prev2
+            s.stabilityPrev2.swap(s.stabilityPrev);
+            s.stabilityPrev.swap(s.stabilityCur);
+            s.stabilityPrev2Size = s.stabilityPrevSize;
+            s.stabilityHavePrev2 = s.stabilityHavePrev;
+            s.stabilityPrevSize = size;
+            s.stabilityHavePrev = true;
+            if (s.stabilityCount % 30u == 0u)
+                std::fflush(s.stabilityLog);
+        }
+    }
 }
 
 // Reads a small texture (w x h, bytesPerPixel) back, waiting for the GPU.
