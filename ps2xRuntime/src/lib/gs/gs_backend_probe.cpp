@@ -53,6 +53,7 @@ namespace
 
     // Which kinds the calling thread has already registered (bit per kind).
     thread_local uint32_t g_threadRegistered = 0;
+    thread_local int g_isGameThread = -1; // -1 not decided yet; the game's thread is the one named "GameThread"
 
     // The name a thread gave itself (ThreadNaming::SetCurrentThreadName), or "thread N".
     std::string currentThreadLabel()
@@ -94,6 +95,21 @@ struct GSBackendProbe::Impl
         std::atomic<uint64_t> calls{0}, ns{0}, maxNs{0};
     };
     std::array<Stat, kKindCount> stats;
+
+    // PS2X_GS_MARKER_LOG=<file>: one CSV row per VBlank marker (what the game thread spent in each kind of call since
+    // the previous marker, and how far apart the markers were). The cumulative counters below are never reset, so the
+    // per-second report and the log do not disturb each other.
+    std::array<std::atomic<uint64_t>, kKindCount> gameNs{};
+    std::array<std::atomic<uint64_t>, kKindCount> gameCalls{};
+    std::atomic<uint64_t> uploadBytes{0};
+    std::FILE *markerLog = nullptr;
+    uint64_t markerSeq = 0, markerPrevNs = 0;
+    std::array<uint64_t, kKindCount> prevGameNs{}, prevGameCalls{};
+    uint64_t prevUploadBytes = 0;
+    unsigned stallMs = 0; // PS2X_TEST_GS_STALL_MS: sleep this long after every marker, to slow the game on purpose (a test of the measure)
+    std::string stallFile; // PS2X_TEST_GS_STALL_FILE: ... or the number of ms is read from this file (polled every 10 markers)
+    unsigned stallPoll = 0;
+
     std::mutex threadsMutex;
     std::array<std::string, kKindCount> threads; // names of the threads that called this kind, comma separated
 
@@ -119,6 +135,13 @@ struct GSBackendProbe::Impl
         {
         }
         registerThread(kind);
+        if (g_isGameThread < 0)
+            g_isGameThread = currentThreadLabel().find("GameThread") != std::string::npos ? 1 : 0;
+        if (g_isGameThread == 1)
+        {
+            gameNs[kind].fetch_add(ns, std::memory_order_relaxed);
+            gameCalls[kind].fetch_add(1, std::memory_order_relaxed);
+        }
         const uint64_t now = nowNs();
         uint64_t last = lastReportNs.load(std::memory_order_relaxed);
         if (now - last >= 1000000000ull && lastReportNs.compare_exchange_strong(last, now))
@@ -134,6 +157,39 @@ struct GSBackendProbe::Impl
         Scope(Impl *i, Kind k) : impl(i), kind(k), start(nowNs()) {}
         ~Scope() { impl->add(kind, nowNs() - start); }
     };
+
+    void logMarker(uint64_t startNs, uint64_t markNs)
+    {
+        uint64_t sum[kKindCount];
+        uint64_t calls = 0, total = 0;
+        for (unsigned k = 0; k < kKindCount; ++k)
+        {
+            const uint64_t ns = gameNs[k].load(std::memory_order_relaxed), n = gameCalls[k].load(std::memory_order_relaxed);
+            sum[k] = ns - prevGameNs[k];
+            if (k != kMark)
+            {
+                calls += n - prevGameCalls[k];
+                total += sum[k];
+            }
+            prevGameNs[k] = ns;
+            prevGameCalls[k] = n;
+        }
+        const uint64_t up = uploadBytes.load(std::memory_order_relaxed);
+        const uint64_t other = total - sum[kSubmit] - sum[kBeginTransfer] - sum[kUploadImage] - sum[kLoadClut] - sum[kFlush] - sum[kSync];
+        std::fprintf(markerLog, "%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+                     static_cast<unsigned long long>(markerSeq), static_cast<unsigned long long>(startNs),
+                     static_cast<unsigned long long>(markerSeq ? (startNs - markerPrevNs) / 1000u : 0u), static_cast<unsigned long long>(markNs / 1000u),
+                     static_cast<unsigned long long>(total / 1000u), static_cast<unsigned long long>(sum[kSubmit] / 1000u),
+                     static_cast<unsigned long long>(sum[kBeginTransfer] / 1000u), static_cast<unsigned long long>(sum[kUploadImage] / 1000u),
+                     static_cast<unsigned long long>(sum[kLoadClut] / 1000u), static_cast<unsigned long long>(sum[kFlush] / 1000u),
+                     static_cast<unsigned long long>(sum[kSync] / 1000u), static_cast<unsigned long long>(other / 1000u),
+                     static_cast<unsigned long long>(calls), static_cast<unsigned long long>((up - prevUploadBytes) / 1024u));
+        if ((markerSeq % 30u) == 0u)
+            std::fflush(markerLog);
+        prevUploadBytes = up;
+        markerPrevNs = startNs;
+        ++markerSeq;
+    }
 
     void report(uint64_t now)
     {
@@ -176,9 +232,24 @@ GSBackendProbe::GSBackendProbe(std::unique_ptr<GSRasterBackend> inner, const cha
 {
     m_impl->inner = std::move(inner);
     m_impl->label = label ? label : "?";
+    if (const char *path = std::getenv("PS2X_GS_MARKER_LOG"))
+        if (path[0] != '\0')
+        {
+            m_impl->markerLog = std::fopen(path, "w");
+            if (m_impl->markerLog)
+                std::fprintf(m_impl->markerLog, "marker,t_ns,gap_us,mark_us,game_us,submit_us,begin_us,upload_us,clut_us,flush_us,sync_us,other_us,calls,upload_kb\n");
+        }
+    if (const char *stall = std::getenv("PS2X_TEST_GS_STALL_MS"))
+        m_impl->stallMs = static_cast<unsigned>(std::strtoul(stall, nullptr, 10));
+    if (const char *stallFile = std::getenv("PS2X_TEST_GS_STALL_FILE"))
+        m_impl->stallFile = stallFile;
 }
 
-GSBackendProbe::~GSBackendProbe() = default;
+GSBackendProbe::~GSBackendProbe()
+{
+    if (m_impl && m_impl->markerLog)
+        std::fclose(m_impl->markerLog);
+}
 
 GSRasterBackend *GSBackendProbe::Inner() const
 {
@@ -188,8 +259,28 @@ GSRasterBackend *GSBackendProbe::Inner() const
 void GSBackendProbe::TimedMark(const std::function<void()> &doMark)
 {
     m_impl->markers.fetch_add(1, std::memory_order_relaxed);
-    Impl::Scope t(m_impl.get(), kMark);
-    doMark();
+    const uint64_t start = nowNs();
+    {
+        Impl::Scope t(m_impl.get(), kMark);
+        doMark();
+    }
+    if (m_impl->markerLog)
+        m_impl->logMarker(start, nowNs() - start);
+    if (!m_impl->stallFile.empty() && (m_impl->stallPoll++ % 10u) == 0u)
+    {
+        // PS2X_TEST_GS_STALL_FILE=<file>: the stall in ms is read from the file (0 or no file: none), so a test can start
+        // slowing the game at a chosen moment instead of from the start
+        unsigned value = 0;
+        if (std::FILE *f = std::fopen(m_impl->stallFile.c_str(), "r"))
+        {
+            if (std::fscanf(f, "%u", &value) != 1)
+                value = 0;
+            std::fclose(f);
+        }
+        m_impl->stallMs = value;
+    }
+    if (m_impl->stallMs)
+        std::this_thread::sleep_for(std::chrono::milliseconds(m_impl->stallMs));
 }
 
 void GSBackendProbe::Initialize(uint8_t *vram, uint32_t vramSize)
@@ -225,6 +316,7 @@ void GSBackendProbe::BeginTransfer(const GSTransferCommand &command)
 void GSBackendProbe::UploadImage(const uint8_t *data, uint32_t sizeBytes)
 {
     Impl::Scope t(m_impl.get(), kUploadImage);
+    m_impl->uploadBytes.fetch_add(sizeBytes, std::memory_order_relaxed);
     m_impl->inner->UploadImage(data, sizeBytes);
 }
 

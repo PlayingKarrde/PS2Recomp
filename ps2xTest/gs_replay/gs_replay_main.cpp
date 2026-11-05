@@ -1326,6 +1326,15 @@ int main(int argc, char **argv)
                     static_cast<unsigned long long>(gs.texturesCreated), static_cast<double>(gs.textureBytesCreated) / 1.0e6,
                     static_cast<double>(gs.texDecodeNanos) / 1.0e6, static_cast<unsigned long long>(gs.texturesEvicted),
                     static_cast<unsigned long long>(gs.frameTargets), static_cast<unsigned long long>(gs.depthTargets));
+        std::printf("gpu cost (ms on the replaying thread): texture hashing %.1f (%.0f MB), creating %.1f, staging %.1f, decoding %.1f "
+                    "(%.2f M texels of %.2f M declared, %llu regions); flushing %.1f (map %.1f, record %.1f, submit %.1f, evict %.1f)\n",
+                    static_cast<double>(gs.texHashNanos) / 1.0e6, static_cast<double>(gs.texHashBytes) / 1048576.0,
+                    static_cast<double>(gs.texCreateNanos) / 1.0e6, static_cast<double>(gs.texStageNanos) / 1.0e6,
+                    static_cast<double>(gs.texDecodeNanos) / 1.0e6, static_cast<double>(gs.texTexelsDecoded) / 1.0e6,
+                    static_cast<double>(gs.texTexelsDeclared) / 1.0e6, static_cast<unsigned long long>(gs.texFillRegions),
+                    static_cast<double>(gs.flushTotalNanos) / 1.0e6, static_cast<double>(gs.flushMapNanos) / 1.0e6,
+                    static_cast<double>(gs.flushRecordNanos) / 1.0e6, static_cast<double>(gs.flushSubmitNanos) / 1.0e6,
+                    static_cast<double>(gs.flushEvictNanos) / 1.0e6);
         std::printf("gpu stats: %llu upload transfers (%.1f MB), %llu Z page copies into the depth target (%llu pages); %llu prims with a "
                     "blend equation that has no exact fixed-function form; %llu prims using unimplemented features; %.1f MB read back\n",
                     static_cast<unsigned long long>(gs.uploadTransfers), static_cast<double>(gs.uploadBytes) / 1.0e6,

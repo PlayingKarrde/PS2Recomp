@@ -412,6 +412,212 @@ void register_gs_gpu_tests()
             t.Equals(w.count, 3u, "three pages");
         });
 
+        tc.Run("TextureReach bounds the texels a draw can sample, for every wrap mode", [](TestCase &t)
+        {
+            const auto clampReg = [](uint64_t wms, uint64_t wmt, uint64_t minu, uint64_t maxu, uint64_t minv, uint64_t maxv)
+            { return wms | (wmt << 2) | (minu << 4) | (maxu << 14) | (minv << 24) | (maxv << 34); };
+            const auto sprite = [](float u0, float v0, float u1, float v1)
+            {
+                Setup s;
+                s.count = 6;
+                s.texelCoords = true;
+                const float us[6] = {u0, u1, u1, u0, u1, u0}, vs[6] = {v0, v0, v1, v0, v1, v1};
+                for (int i = 0; i < 6; ++i)
+                {
+                    s.v[i].u = us[i];
+                    s.v[i].v = vs[i];
+                    s.v[i].q = 1.0f;
+                }
+                return s;
+            };
+            // CLAMP: the range plus one texel on each side, limited to the texture
+            TexelRect r = TextureReach(sprite(10.0f, 20.0f, 50.5f, 30.0f), clampReg(1, 1, 0, 0, 0, 0), 256, 256);
+            t.IsTrue(r.x0 == 9 && r.x1 == 51 && r.y0 == 19 && r.y1 == 31, "CLAMP: 9..51 x 19..31");
+            r = TextureReach(sprite(-5.0f, -2.0f, 300.0f, 1000.0f), clampReg(1, 1, 0, 0, 0, 0), 256, 128);
+            t.IsTrue(r.x0 == 0 && r.x1 == 255 && r.y0 == 0 && r.y1 == 127, "CLAMP: limited to the texture");
+            r = TextureReach(sprite(400.0f, 400.0f, 500.0f, 500.0f), clampReg(1, 1, 0, 0, 0, 0), 256, 256);
+            t.IsTrue(r.x0 == 255 && r.x1 == 255 && r.y0 == 255 && r.y1 == 255, "CLAMP: a draw entirely past the edge reads the edge texel");
+            // REGION_CLAMP: clamped into the region (the portraits of the wrestler select use it)
+            r = TextureReach(sprite(0.0f, 4.0f, 100.0f, 90.0f), clampReg(2, 2, 16, 31, 8, 63), 512, 512);
+            t.IsTrue(r.x0 == 16 && r.x1 == 31 && r.y0 == 8 && r.y1 == 63, "REGION_CLAMP: 16..31 x 8..63");
+            r = TextureReach(sprite(20.0f, 20.0f, 40.0f, 40.0f), clampReg(2, 2, 16, 600, 8, 700), 512, 512);
+            t.IsTrue(r.x0 == 19 && r.x1 == 41 && r.y0 == 19 && r.y1 == 41, "REGION_CLAMP: a region wider than the texture still follows the draw");
+            // REPEAT: the range when it lies inside the texture, otherwise the whole axis
+            r = TextureReach(sprite(10.0f, 20.0f, 50.0f, 30.0f), clampReg(0, 0, 0, 0, 0, 0), 256, 256);
+            t.IsTrue(r.x0 == 9 && r.x1 == 51 && r.y0 == 19 && r.y1 == 31, "REPEAT inside the texture");
+            r = TextureReach(sprite(10.0f, 20.0f, 300.0f, 30.0f), clampReg(0, 0, 0, 0, 0, 0), 256, 256);
+            t.IsTrue(r.x0 == 0 && r.x1 == 255 && r.y0 == 19 && r.y1 == 31, "REPEAT past the edge: the whole axis");
+            r = TextureReach(sprite(0.0f, 20.0f, 50.0f, 30.0f), clampReg(0, 0, 0, 0, 0, 0), 256, 256);
+            t.IsTrue(r.x0 == 0 && r.x1 == 255, "REPEAT touching the edge: bilinear wraps to the far side, so the whole axis");
+            r = TextureReach(sprite(10.0f, 20.0f, 50.0f, 30.0f), clampReg(3, 3, 7, 16, 7, 16), 256, 256);
+            t.IsTrue(r.x0 == 0 && r.x1 == 255 && r.y0 == 0 && r.y1 == 255, "REGION_REPEAT: everything");
+            // S, T, Q: the ratio times the declared size; a Q that is not positive, NaN, or no vertices: everything
+            Setup stq;
+            stq.count = 3;
+            stq.texelCoords = false;
+            const float ss[3] = {0.25f, 0.5f, 0.25f}, ts[3] = {0.25f, 0.25f, 0.5f}, qs[3] = {1.0f, 2.0f, 4.0f};
+            for (int i = 0; i < 3; ++i)
+            {
+                stq.v[i].u = ss[i] * qs[i];
+                stq.v[i].v = ts[i] * qs[i];
+                stq.v[i].q = qs[i];
+            }
+            r = TextureReach(stq, clampReg(1, 1, 0, 0, 0, 0), 512, 512);
+            t.IsTrue(r.x0 == 127 && r.x1 == 257 && r.y0 == 127 && r.y1 == 257, "STQ: s / q x 512 between 128 and 256, plus a texel each side");
+            stq.v[1].q = 0.0f;
+            r = TextureReach(stq, clampReg(1, 1, 0, 0, 0, 0), 512, 512);
+            t.IsTrue(r.x0 == 0 && r.x1 == 511 && r.y1 == 511, "Q = 0: everything");
+            stq.v[1].q = -1.0f;
+            r = TextureReach(stq, clampReg(1, 1, 0, 0, 0, 0), 512, 512);
+            t.IsTrue(r.x1 == 511 && r.y1 == 511, "negative Q: everything");
+            stq.v[1].q = std::nanf("");
+            r = TextureReach(stq, clampReg(1, 1, 0, 0, 0, 0), 512, 512);
+            t.IsTrue(r.x1 == 511 && r.y1 == 511, "NaN Q: everything");
+            Setup none;
+            r = TextureReach(none, clampReg(1, 1, 0, 0, 0, 0), 64, 32);
+            t.IsTrue(r.x0 == 0 && r.x1 == 63 && r.y0 == 0 && r.y1 == 31, "no vertices: the whole texture");
+
+            // Every texel the shader would fetch must lie inside the rectangle: random draws, all wrap modes, nearest and
+            // bilinear, the 1/16 rounding of the coordinate, UV and STQ with perspective-correct interpolation.
+            const auto wrapCoord = [](int c, int size, uint32_t mode, int lo, int hi)
+            {
+                int v;
+                if (mode == 0u)
+                    v = c & (size - 1);
+                else if (mode == 1u)
+                    v = std::clamp(c, 0, size - 1);
+                else if (mode == 2u)
+                    v = std::min(std::max(c, lo), hi);
+                else
+                    v = (c & lo) | hi;
+                return std::clamp(v, 0, size - 1); // the sampler clamps what is left
+            };
+            uint32_t rng = 12345u;
+            const auto next = [&rng]() { rng = rng * 1664525u + 1013904223u; return (rng >> 8) / 16777216.0f; };
+            uint32_t checked = 0, outside = 0, narrower = 0;
+            for (int trial = 0; trial < 3000; ++trial)
+            {
+                const int sizes[2] = {16 << static_cast<int>(next() * 6.0f), 16 << static_cast<int>(next() * 6.0f)};
+                const uint32_t mode[2] = {static_cast<uint32_t>(next() * 4.0f), static_cast<uint32_t>(next() * 4.0f)};
+                const int rmin[2] = {static_cast<int>(next() * sizes[0]), static_cast<int>(next() * sizes[1])};
+                const int rmax[2] = {static_cast<int>(next() * sizes[0] * 1.2f), static_cast<int>(next() * sizes[1] * 1.2f)};
+                const uint64_t reg = clampReg(mode[0], mode[1], static_cast<uint64_t>(rmin[0]), static_cast<uint64_t>(rmax[0]),
+                                              static_cast<uint64_t>(rmin[1]), static_cast<uint64_t>(rmax[1]));
+                const bool stqMode = next() < 0.4f;
+                const int vertexCount = next() < 0.5f ? 3 : 6;
+                Setup s;
+                s.count = static_cast<uint32_t>(vertexCount);
+                s.texelCoords = !stqMode;
+                for (int i = 0; i < vertexCount; ++i)
+                {
+                    const float u = next() * (sizes[0] + 80.0f) - 40.0f, v = next() * (sizes[1] + 80.0f) - 40.0f;
+                    const float q = 0.2f + next() * 4.0f;
+                    s.v[i].q = stqMode ? q : 1.0f;
+                    s.v[i].u = stqMode ? u / sizes[0] * q : u;
+                    s.v[i].v = stqMode ? v / sizes[1] * q : v;
+                }
+                const TexelRect reach = TextureReach(s, reg, static_cast<uint32_t>(sizes[0]), static_cast<uint32_t>(sizes[1]));
+                if (reach.x1 - reach.x0 + 1 < sizes[0] || reach.y1 - reach.y0 + 1 < sizes[1])
+                    ++narrower;
+                for (int sample = 0; sample < 40; ++sample)
+                {
+                    // a point of the polygon: a convex combination of the first three vertices (or of all for the sprite quad)
+                    float w[6] = {};
+                    float sum = 0.0f;
+                    for (int i = 0; i < 3; ++i)
+                    {
+                        w[i] = next();
+                        sum += w[i];
+                    }
+                    float us = 0.0f, vs = 0.0f, qs2 = 0.0f;
+                    for (int i = 0; i < 3; ++i)
+                    {
+                        us += w[i] / sum * s.v[i].u;
+                        vs += w[i] / sum * s.v[i].v;
+                        qs2 += w[i] / sum * s.v[i].q;
+                    }
+                    float u = stqMode ? us / qs2 * sizes[0] : us;
+                    float v = stqMode ? vs / qs2 * sizes[1] : vs;
+                    u = std::floor(u * 16.0f + 0.5f) / 16.0f;
+                    v = std::floor(v * 16.0f + 0.5f) / 16.0f;
+                    const bool bilinear = (sample & 1) != 0;
+                    int px[2], py[2], count = 1;
+                    if (!bilinear)
+                    {
+                        px[0] = wrapCoord(static_cast<int>(u), sizes[0], mode[0], rmin[0], rmax[0]);
+                        py[0] = wrapCoord(static_cast<int>(v), sizes[1], mode[1], rmin[1], rmax[1]);
+                    }
+                    else
+                    {
+                        const int u0 = static_cast<int>(std::floor(u - 0.5f)), v0 = static_cast<int>(std::floor(v - 0.5f));
+                        px[0] = wrapCoord(u0, sizes[0], mode[0], rmin[0], rmax[0]);
+                        px[1] = wrapCoord(u0 + 1, sizes[0], mode[0], rmin[0], rmax[0]);
+                        py[0] = wrapCoord(v0, sizes[1], mode[1], rmin[1], rmax[1]);
+                        py[1] = wrapCoord(v0 + 1, sizes[1], mode[1], rmin[1], rmax[1]);
+                        count = 2;
+                    }
+                    for (int a = 0; a < count; ++a)
+                        for (int b = 0; b < count; ++b)
+                        {
+                            ++checked;
+                            if (px[a] < reach.x0 || px[a] > reach.x1 || py[b] < reach.y0 || py[b] > reach.y1)
+                                ++outside;
+                        }
+                }
+            }
+            t.Equals(outside, 0u, "no fetched texel lies outside the reach (" + std::to_string(checked) + " fetches checked)");
+            t.IsTrue(narrower > 500u, "the bound is usually narrower than the texture (" + std::to_string(narrower) + " of 3000 draws)");
+        });
+
+        tc.Run("TakeMissingTiles hands out each 16 x 16 tile once, in merged rectangles clipped to the texture", [](TestCase &t)
+        {
+            TileMap map;
+            std::vector<TexelRect> out;
+            TexelRect want;
+            want.x0 = 0;
+            want.y0 = 0;
+            want.x1 = 103;
+            want.y1 = 103;
+            TakeMissingTiles(map, want, 512, 512, out);
+            t.Equals(out.size(), 1u, "a fresh 104 x 104 reach is one rectangle");
+            t.IsTrue(out.size() == 1 && out[0] == TexelRect{0, 0, 111, 111}, "of 7 x 7 whole tiles: 0..111");
+            out.clear();
+            TakeMissingTiles(map, want, 512, 512, out);
+            t.IsTrue(out.empty(), "asking again hands out nothing");
+            want.x0 = 100;
+            want.y0 = 0;
+            want.x1 = 130;
+            want.y1 = 40;
+            TakeMissingTiles(map, want, 512, 512, out);
+            t.IsTrue(out.size() == 1 && out[0] == TexelRect{112, 0, 143, 47}, "an overlapping reach hands out only the new tiles, as one rectangle");
+            // a hole in a row splits it in two
+            TileMap holed;
+            holed.decoded.set(0u * kTilesPerSide + 1u);
+            out.clear();
+            want.x0 = 0;
+            want.y0 = 0;
+            want.x1 = 47;
+            want.y1 = 15;
+            TakeMissingTiles(holed, want, 512, 512, out);
+            t.IsTrue(out.size() == 2 && out[0] == TexelRect{0, 0, 15, 15} && out[1] == TexelRect{32, 0, 47, 15}, "a decoded tile in the middle splits the run");
+            // rectangles are clipped to a texture that is not a whole number of tiles
+            TileMap small;
+            out.clear();
+            want.x0 = 0;
+            want.y0 = 0;
+            want.x1 = 39;
+            want.y1 = 7;
+            TakeMissingTiles(small, want, 40, 8, out);
+            t.IsTrue(out.size() == 1 && out[0] == TexelRect{0, 0, 39, 7}, "40 x 8 texture: 40 x 8 texels");
+            out.clear();
+            TakeMissingTiles(small, want, 40, 8, out);
+            t.IsTrue(out.empty(), "and nothing the second time");
+            // an empty reach adds nothing
+            TexelRect none;
+            TakeMissingTiles(small, none, 40, 8, out);
+            t.IsTrue(out.empty(), "an empty rectangle hands out nothing");
+        });
+
         tc.Run("shared texel rules: TEXA, CLUT selection, CLD", [](TestCase &t)
         {
             using namespace GSTexel;

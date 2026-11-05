@@ -47,9 +47,13 @@
 //      touches with a new epoch).
 //   3. content: when the pages were written, hash their bytes (XXH64) together with the signature. The
 //      same bytes mean the same texture, so a re-upload of identical data costs a hash, not a decode.
-// Only a miss on all three decodes the texture on the CPU (GSMem::ReadTexture, then TEXA or the CLUT)
-// into RGBA8 and creates a GPU texture. Cached textures are evicted least recently used first once
-// they pass a memory budget, and never while the current draw list uses them.
+// Only a miss on all three creates a GPU texture. Its texels are decoded on the CPU (GSMem::ReadTexture,
+// then TEXA or the CLUT) into RGBA8 lazily, in 16 x 16 texel tiles and only where a draw can sample (see
+// decodeTexels and GSGpu::TextureReach): a wrestler's portrait is declared 512 x 512 texels and a draw shows
+// about a tenth of it, and decoding all of it on the game thread for every wrestler the random pick runs
+// through slowed the game down. PS2X_GS_GPU_FULL_DECODE=1 decodes whole textures like before.
+// Cached textures are evicted least recently used first once they pass a memory budget, and never
+// while the current draw list uses them.
 
 #include "runtime/gs/gs_gpu_backend.h"
 
@@ -79,6 +83,7 @@
 #include <cstring>
 #include <deque>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -91,6 +96,19 @@ namespace
     constexpr uint32_t kPageBytes = 8192u;
     constexpr uint32_t kTargetRows = 512u;                 // rows of a frame or depth target (GS limit used by the CPU renderer)
     constexpr uint64_t kTextureBudget = 384ull << 20;      // bytes of cached GPU textures before eviction starts
+    // Evicted textures are pooled for reuse. Creating one costs about the same whatever its size, so the many small ones
+    // are pooled by count (kSmallPoolEntries of up to kSmallTextureBytes: 64 MB at most) and the large ones by bytes
+    // (kTexturePoolBudget), or a few portraits would fill the pool and every small texture would still be created anew.
+    // At most 160 MB of GPU textures exist beyond the live budget.
+    constexpr uint64_t kTexturePoolBudget = kTextureBudget / 4u; // bytes of large evicted GPU textures kept for reuse
+    constexpr uint64_t kSmallTextureBytes = 32u << 10;
+    constexpr uint64_t kSmallPoolEntries = 2048;
+    // A texture is only pooled if a texture of its size was created in the last kPoolWantedFlushes flushes (about ten
+    // seconds), and a pooled one that nothing took for kPoolMaxAgeFlushes flushes is released: otherwise sizes the
+    // scene no longer uses (a 1024 x 512 movie texture) sit in the pool and leave no room for the ones it does.
+    constexpr uint64_t kPoolWantedFlushes = 600;
+    constexpr uint64_t kPoolMaxAgeFlushes = 600;
+    constexpr uint64_t kWholeTextureTexels = 64u * 64u;    // a texture this small is decoded whole when first drawn (it is 16 tiles)
     // A draw list this long is submitted early, and so is one with this much texture data waiting. The limits also
     // size the transfer buffer and the vertex buffer (the next power of two above what a flush needs, and the transfer
     // buffer is cycled once per frame in flight), so they set how much memory the backend holds: a scene change that
@@ -113,12 +131,20 @@ namespace
         return (v + a - 1u) & ~(a - 1u);
     }
 
+    // A cached GPU texture. It is created at the size the game declared, but its texels are decoded from GS memory
+    // only where a draw can reach them (see the texture cache comment at the top): `tiles` says which 16 x 16 texel
+    // tiles hold texels, and the rest of the GPU texture is undefined and never sampled.
     struct GpuTexture
     {
         SDL_GPUTexture *tex = nullptr;
         uint32_t w = 0, h = 0;
         uint64_t bytes = 0;
         uint64_t lastUsedFlush = 0;
+        TileMap tiles;
+        bool complete = false; // every tile is decoded
+        // A tile-aligned rectangle (inclusive) of which every tile is decoded: a draw whose reach lies inside it needs
+        // nothing, which is checked without looking at the tile map (most draws reuse an area some draw already decoded).
+        TexelRect validRect;
     };
 
     struct SigKey
@@ -147,11 +173,12 @@ namespace
         PageSpan span;
     };
 
-    struct PendingUpload // data waiting in the stage buffer to be copied into a texture
+    struct PendingUpload // data waiting in the stage buffer to be copied into a texture (the region x, y, w, h of it)
     {
         SDL_GPUTexture *tex;
         uint32_t w, h;
         size_t offset;
+        uint32_t x = 0, y = 0;
     };
 
     struct FrameTarget
@@ -288,11 +315,29 @@ struct GSGpuBackend::Impl
     std::unordered_map<uint64_t, GpuTexture> contentTextures; // by content hash
     std::unordered_map<SigKey, SigEntry, SigKeyHash> signatures;
     uint64_t textureBytes = 0;
+    // Evicted textures keep their GPU object here, to be used for the next texture of the same size (key w << 16 | h):
+    // SDL_CreateGPUTexture costs 0.3 to 0.9 ms on D3D12 whatever the size, releasing one costs about 0.1 ms in a later
+    // submit, and the wrestler select creates and evicts some 20 textures per frame while it picks at random. A pooled
+    // texture holds stale texels, which is fine: a new texture starts with every tile marked undecoded (GpuTexture{}).
+    struct PooledTexture
+    {
+        SDL_GPUTexture *tex;
+        uint64_t bytes;
+        uint64_t pooledAtFlush;
+    };
+    std::unordered_map<uint32_t, std::deque<PooledTexture>> texturePool;
+    std::unordered_map<uint32_t, uint64_t> poolWanted; // size key -> flush index of the latest texture created of that size
+    uint64_t poolBytes = 0;      // all pooled textures
+    uint64_t poolSmallBytes = 0; // ... of which the small ones, which count against kSmallPoolEntries rather than the byte budget
+    uint64_t poolSmallCount = 0;
+    bool poolEnabled = true; // PS2X_GS_GPU_TEXTURE_POOL=0 turns it off
     uint64_t flushIndex = 1;
     bool recentValid = false;
     SigKey recentKey{};
     uint64_t recentEpoch = 0;
-    SDL_GPUTexture *recentTexture = nullptr;
+    GpuTexture *recentEntry = nullptr; // an element of contentTextures: pointers to its elements stay valid until they are erased
+    bool fullDecode = false;           // PS2X_GS_GPU_FULL_DECODE=1: decode every texture whole when a draw first uses it
+    std::vector<TexelRect> fillRegions; // scratch for decodeTexels
     struct ClutMemo
     {
         bool valid = false;
@@ -332,6 +377,27 @@ struct GSGpuBackend::Impl
     uint64_t statsLastNs = 0, statsMarkers = 0;
     Stats statsPrev;
 
+    // ---- opt-in logs for finding where time goes (both off by default)
+    //   PS2X_GS_GPU_MARKER_LOG=<file>  one CSV row per VBlank marker: what the texture misses and the flushes cost since the last one
+    //   PS2X_GS_GPU_MISS_LOG=<file>    a census of the missed textures: declared size against the part the draws can reach
+    std::FILE *markerLog = nullptr;
+    Stats markerPrev;
+    uint64_t markerSeq = 0;
+    struct MissRecord
+    {
+        uint64_t marker = 0;
+        uint32_t w = 0, h = 0, psm = 0, tbp0 = 0, tbw = 0, pages = 0, indexed = 0;
+        uint32_t wms = 0, wmt = 0, bilinear = 0, reused = 0;
+        uint64_t uses = 0;
+        int32_t minU = 0x7FFFFFFF, maxU = -1, minV = 0x7FFFFFFF, maxV = -1; // bounding box of what the draws can sample
+        uint64_t createNs = 0, stageNs = 0, decodeNs = 0, hashNs = 0;
+        std::bitset<4096> tiles16; // 16 x 16 texel tiles the draws can reach (a 1024 x 1024 texture has 64 x 64)
+    };
+    std::string missLogPath;
+    std::vector<MissRecord> missRecords;
+    std::unordered_map<SDL_GPUTexture *, size_t> missIndex;
+    uint64_t lastHashNs = 0; // the content hash of the lookup that is being resolved (for the census)
+
     ~Impl();
     bool init(SDL_GPUDevice *device, uint32_t s);
 
@@ -350,12 +416,15 @@ struct GSGpuBackend::Impl
     void markDepthDirty(const PageSpan &touched);
     void restoreDepth(uint32_t depthIdx, uint32_t frameIdx, uint32_t rows);
     SDL_GPUGraphicsPipeline *pipeline(uint32_t key);
-    SDL_GPUTexture *resolveTexture(const GSDrawState &state);
+    GpuTexture *resolveTexture(const GSDrawState &state);
+    void decodeTexels(GpuTexture &g, const GSDrawState &state, const Setup &setup);
     uint64_t clutHash(const GSDrawState &state);
-    SDL_GPUTexture *createTexture(const GSDrawState &state, uint64_t contentHash, uint32_t w, uint32_t h);
+    GpuTexture *createTexture(const GSDrawState &state, uint64_t contentHash, uint32_t w, uint32_t h);
     size_t allocateStage(size_t bytes);
     void flushLocked(bool wait, const FieldCopy *fieldCopies = nullptr, int fieldCopyCount = 0);
     void evictTextures();
+    void trimTexturePool();
+    void releaseTexture(SDL_GPUTexture *tex);
     bool enableFields();
     bool acquireSlots(int count, int *out);
     void publish(FieldInfo info, const GSPresentationRequest &request);
@@ -363,6 +432,9 @@ struct GSGpuBackend::Impl
     bool downloadSlot(int slot, uint32_t width, uint32_t height, std::vector<uint8_t> &out, bool preserveAlpha);
     PresentationFrame presentFromField(const FieldInfo &field, const GSPresentationRequest &request);
     void printStats();
+    void logMarkerRow(uint64_t markNs);
+    void noteTextureUse(SDL_GPUTexture *tex, const GSDrawState &state, const Setup &setup);
+    void writeMissLog();
     bool ensureBuffers(size_t vertexBytes, size_t transferBytes);
 
     // readback
@@ -381,6 +453,21 @@ bool GSGpuBackend::Impl::init(SDL_GPUDevice *device, uint32_t s)
     {
         const char *value = std::getenv("PS2X_GS_GPU_STATS");
         statsOn = value && value[0] == '1';
+        const char *full = std::getenv("PS2X_GS_GPU_FULL_DECODE"); // the old behaviour, as a reference for A/B runs
+        fullDecode = full && full[0] == '1';
+        const char *pool = std::getenv("PS2X_GS_GPU_TEXTURE_POOL");
+        poolEnabled = !(pool && pool[0] == '0');
+        if (const char *path = std::getenv("PS2X_GS_GPU_MARKER_LOG"))
+            if (path[0] != '\0')
+            {
+                markerLog = std::fopen(path, "w");
+                if (markerLog)
+                    std::fprintf(markerLog, "marker,t_ns,mark_us,flushes,flush_us,map_us,record_us,submit_us,evict_us,backlog_us,misses,content_lookups,hash_us,"
+                                            "create_us,stage_us,decode_us,texels_declared,texels_decoded,created_kb,evicted,live_mb,upload_kb,reused,pool_mb\n");
+            }
+        if (const char *path = std::getenv("PS2X_GS_GPU_MISS_LOG"))
+            if (path[0] != '\0')
+                missLogPath = path;
     }
     if (!dev)
     {
@@ -437,6 +524,10 @@ bool GSGpuBackend::Impl::init(SDL_GPUDevice *device, uint32_t s)
 
 GSGpuBackend::Impl::~Impl()
 {
+    if (!missLogPath.empty())
+        writeMissLog();
+    if (markerLog)
+        std::fclose(markerLog);
     if (!dev)
         return;
     SDL_WaitForGPUIdle(dev);
@@ -446,6 +537,9 @@ GSGpuBackend::Impl::~Impl()
         SDL_ReleaseGPUGraphicsPipeline(dev, p.second);
     for (auto &t : contentTextures)
         SDL_ReleaseGPUTexture(dev, t.second.tex);
+    for (auto &bucket : texturePool)
+        for (const PooledTexture &p : bucket.second)
+            SDL_ReleaseGPUTexture(dev, p.tex);
     for (auto &f : frames)
         SDL_ReleaseGPUTexture(dev, f.color);
     for (auto &d : depths)
@@ -815,7 +909,7 @@ uint64_t GSGpuBackend::Impl::clutHash(const GSDrawState &state)
     return clutMemo.hash;
 }
 
-SDL_GPUTexture *GSGpuBackend::Impl::createTexture(const GSDrawState &state, uint64_t contentHash, uint32_t w, uint32_t h)
+GpuTexture *GSGpuBackend::Impl::createTexture(const GSDrawState &state, uint64_t contentHash, uint32_t w, uint32_t h)
 {
     const GSTex0Reg &t = state.context.tex0;
     SDL_GPUTextureCreateInfo ti = {};
@@ -827,20 +921,122 @@ SDL_GPUTexture *GSGpuBackend::Impl::createTexture(const GSDrawState &state, uint
     ti.layer_count_or_depth = 1;
     ti.num_levels = 1;
     ti.sample_count = SDL_GPU_SAMPLECOUNT_1;
-    SDL_GPUTexture *tex = SDL_CreateGPUTexture(dev, &ti);
+    const size_t bytes = static_cast<size_t>(w) * h * 4u;
+    const uint64_t createStart = nowNanos();
+    SDL_GPUTexture *tex = nullptr;
+    bool reusedFromPool = false;
+    if (poolEnabled)
+    {
+        poolWanted[(w << 16) | h] = flushIndex;
+        const auto bucket = texturePool.find((w << 16) | h);
+        if (bucket != texturePool.end() && !bucket->second.empty())
+        {
+            const PooledTexture pooled = bucket->second.back(); // the one pooled last
+            bucket->second.pop_back();
+            tex = pooled.tex;
+            poolBytes -= pooled.bytes;
+            if (pooled.bytes <= kSmallTextureBytes)
+            {
+                poolSmallBytes -= pooled.bytes;
+                --poolSmallCount;
+            }
+            ++stats.texturesReused;
+            reusedFromPool = true;
+        }
+    }
+    if (!tex)
+        tex = SDL_CreateGPUTexture(dev, &ti);
+    const uint64_t createNs = nowNanos() - createStart;
+    stats.texCreateNanos += createNs;
     if (!tex)
     {
         std::fprintf(stderr, "[gs:gpu] cannot create a %ux%u texture: %s\n", w, h, SDL_GetError());
         return nullptr;
     }
 
-    // Decode the whole declared texture from the memory image, one texel at a time, like the CPU
-    // renderer (GSCpuBackend::DecodeTexel).
-    const uint64_t t0 = nowNanos();
-    const size_t bytes = static_cast<size_t>(w) * h * 4u;
-    const size_t offset = allocateStage(bytes);
-    uint32_t *out = reinterpret_cast<uint32_t *>(stage.data() + offset);
-    GSMem::TexturePageCache cache;
+    // No texel is decoded here: decodeTexels fills in the tiles a draw can reach, when the draw is recorded.
+    stats.texTexelsDeclared += static_cast<uint64_t>(w) * h;
+
+    GpuTexture &g = contentTextures[contentHash];
+    g = GpuTexture{};
+    g.tex = tex;
+    g.w = w;
+    g.h = h;
+    g.bytes = bytes;
+    g.lastUsedFlush = flushIndex;
+    textureBytes += bytes;
+    ++stats.texturesCreated;
+    stats.textureBytesCreated += bytes;
+
+    if (!missLogPath.empty())
+    {
+        MissRecord r;
+        r.marker = markerSeq;
+        r.w = w;
+        r.h = h;
+        r.psm = t.psm;
+        r.tbp0 = t.tbp0;
+        r.tbw = t.tbw;
+        r.indexed = (isFourBitIndexedPsm(t.psm) || isEightBitIndexedPsm(t.psm)) ? 1u : 0u;
+        r.wms = static_cast<uint32_t>(state.context.clamp & 3u);
+        r.wmt = static_cast<uint32_t>((state.context.clamp >> 2) & 3u);
+        r.bilinear = state.linearFilter ? 1u : 0u;
+        r.createNs = createNs;
+        r.reused = reusedFromPool ? 1u : 0u;
+        r.hashNs = lastHashNs;
+        r.pages = static_cast<uint32_t>(BufferPageSpan(t.psm, t.tbp0, t.tbw, 0, 0, w, h).count);
+        missIndex[tex] = missRecords.size();
+        missRecords.push_back(r);
+    }
+    return &g;
+}
+
+// Decodes, from the memory image into RGBA8 and into the GPU texture, the tiles of `g` that the primitive in `setup` can
+// reach and that are not decoded yet (TextureReach says what it can reach). Every textured primitive comes through here
+// after its texture was resolved, so a texture is complete wherever any draw samples it; the first draw of a wrestler's
+// 512 x 512 portrait decodes the 100 x 100 texels it shows, not the 262,144 it was declared with. The texture was
+// resolved for the current memory contents (the cache key or the hash of its pages), so what is decoded now is what
+// would have been decoded when it was created. The GPU texture is written in the copy pass at the start of the next
+// command buffer: draws recorded before this one read other tiles (or tiles already there), so nothing they read changes.
+void GSGpuBackend::Impl::decodeTexels(GpuTexture &g, const GSDrawState &state, const Setup &setup)
+{
+    if (g.complete)
+        return;
+    const bool tiled = g.w <= kTilesPerSide * kTileTexels && g.h <= kTilesPerSide * kTileTexels;
+    TexelRect reach;
+    reach.x0 = 0;
+    reach.y0 = 0;
+    reach.x1 = static_cast<int32_t>(g.w) - 1;
+    reach.y1 = static_cast<int32_t>(g.h) - 1;
+    const bool whole = fullDecode || !tiled || static_cast<uint64_t>(g.w) * g.h <= kWholeTextureTexels;
+    if (!whole)
+        reach = TextureReach(setup, state.context.clamp, g.w, g.h);
+    if (reach.x0 >= g.validRect.x0 && reach.y0 >= g.validRect.y0 && reach.x1 <= g.validRect.x1 && reach.y1 <= g.validRect.y1)
+        return;
+    fillRegions.clear();
+    if (tiled)
+    {
+        TakeMissingTiles(g.tiles, reach, g.w, g.h, fillRegions);
+        // Every tile of the reach is decoded now: keep the larger of the two rectangles as the quick check.
+        TexelRect aligned;
+        aligned.x0 = (reach.x0 >> kTileShift) << kTileShift;
+        aligned.y0 = (reach.y0 >> kTileShift) << kTileShift;
+        aligned.x1 = std::min<int32_t>(((reach.x1 >> kTileShift) + 1) << kTileShift, static_cast<int32_t>(g.w)) - 1;
+        aligned.y1 = std::min<int32_t>(((reach.y1 >> kTileShift) + 1) << kTileShift, static_cast<int32_t>(g.h)) - 1;
+        const auto area = [](const TexelRect &r) { return r.Empty() ? 0 : static_cast<int64_t>(r.x1 - r.x0 + 1) * (r.y1 - r.y0 + 1); };
+        if (area(aligned) > area(g.validRect))
+            g.validRect = aligned;
+    }
+    else
+    {
+        fillRegions.push_back(reach);
+    }
+    if (reach.x0 == 0 && reach.y0 == 0 && reach.x1 == static_cast<int32_t>(g.w) - 1 && reach.y1 == static_cast<int32_t>(g.h) - 1)
+        g.complete = true;
+    if (fillRegions.empty())
+        return;
+
+    const GSTex0Reg &t = state.context.tex0;
     const bool indexed = isFourBitIndexedPsm(t.psm) || isEightBitIndexedPsm(t.psm);
     uint32_t palette[256];
     if (indexed)
@@ -849,57 +1045,85 @@ SDL_GPUTexture *GSGpuBackend::Impl::createTexture(const GSDrawState &state, uint
         for (uint32_t i = 0; i < 256u; ++i)
             palette[i] = LookupClutEntry(clut.data(), state.texa, static_cast<uint8_t>(i % count), t.cpsm, t.csm, t.csa, t.psm);
     }
-    for (uint32_t v = 0; v < h; ++v)
-        for (uint32_t u = 0; u < w; ++u)
+    uint32_t pageW, pageH;
+    PageSize(t.psm, pageW, pageH);
+    GSMem::TexturePageCache cache;
+    uint64_t decodeNs = 0, stageNs = 0;
+    for (const TexelRect &r : fillRegions)
+    {
+        const uint32_t x0 = static_cast<uint32_t>(r.x0), y0 = static_cast<uint32_t>(r.y0);
+        const uint32_t x1 = static_cast<uint32_t>(r.x1), y1 = static_cast<uint32_t>(r.y1);
+        const uint32_t rw = x1 - x0 + 1u, rh = y1 - y0 + 1u;
+        const uint64_t stageStart = nowNanos();
+        const size_t offset = allocateStage(static_cast<size_t>(rw) * rh * 4u);
+        const uint64_t decodeStart = nowNanos();
+        stageNs += decodeStart - stageStart;
+        uint32_t *out = reinterpret_cast<uint32_t *>(stage.data() + offset);
+        // One page of GS memory at a time: the page cache holds a single page, so reading a row across several
+        // pages would copy each of them again for every row.
+        for (uint32_t cy = y0; cy <= y1;)
         {
-            const uint32_t raw = GSMem::ReadTexture(cache, vram, t.psm, t.tbp0, t.tbw, u, v);
-            uint32_t texel;
-            switch (t.psm)
+            const uint32_t cyEnd = std::min<uint32_t>(y1, (cy / pageH + 1u) * pageH - 1u);
+            for (uint32_t cx = x0; cx <= x1;)
             {
-            case GS_PSM_CT32:
-            case GS_PSM_Z32:
-            case GS_PSM_CT24:
-            case GS_PSM_Z24:
-                texel = applyTexa(state.texa, t.psm, raw);
-                break;
-            case GS_PSM_CT16:
-            case GS_PSM_CT16S:
-            case GS_PSM_Z16:
-            case GS_PSM_Z16S:
-                texel = applyTexa(state.texa, t.psm, Rgba5551ToRgba8888(static_cast<uint16_t>(raw)));
-                break;
-            case GS_PSM_T8:
-            case GS_PSM_T8H:
-                texel = palette[raw & 0xFFu];
-                break;
-            case GS_PSM_T4:
-            case GS_PSM_T4HL:
-            case GS_PSM_T4HH:
-                texel = palette[raw & 0x0Fu];
-                break;
-            default:
-                texel = 0xFFFF00FFu;
-                break;
+                const uint32_t cxEnd = std::min<uint32_t>(x1, (cx / pageW + 1u) * pageW - 1u);
+                for (uint32_t v = cy; v <= cyEnd; ++v)
+                    for (uint32_t u = cx; u <= cxEnd; ++u)
+                    {
+                        const uint32_t raw = GSMem::ReadTexture(cache, vram, t.psm, t.tbp0, t.tbw, u, v);
+                        uint32_t texel;
+                        switch (t.psm)
+                        {
+                        case GS_PSM_CT32:
+                        case GS_PSM_Z32:
+                        case GS_PSM_CT24:
+                        case GS_PSM_Z24:
+                            texel = applyTexa(state.texa, t.psm, raw);
+                            break;
+                        case GS_PSM_CT16:
+                        case GS_PSM_CT16S:
+                        case GS_PSM_Z16:
+                        case GS_PSM_Z16S:
+                            texel = applyTexa(state.texa, t.psm, Rgba5551ToRgba8888(static_cast<uint16_t>(raw)));
+                            break;
+                        case GS_PSM_T8:
+                        case GS_PSM_T8H:
+                            texel = palette[raw & 0xFFu];
+                            break;
+                        case GS_PSM_T4:
+                        case GS_PSM_T4HL:
+                        case GS_PSM_T4HH:
+                            texel = palette[raw & 0x0Fu];
+                            break;
+                        default:
+                            texel = 0xFFFF00FFu;
+                            break;
+                        }
+                        out[static_cast<size_t>(v - y0) * rw + (u - x0)] = texel;
+                    }
+                cx = cxEnd + 1u;
             }
-            out[static_cast<size_t>(v) * w + u] = texel;
+            cy = cyEnd + 1u;
         }
-    stats.texDecodeNanos += nowNanos() - t0;
-    pendingUploads.push_back({tex, w, h, offset});
-
-    GpuTexture g;
-    g.tex = tex;
-    g.w = w;
-    g.h = h;
-    g.bytes = bytes;
-    g.lastUsedFlush = flushIndex;
-    contentTextures[contentHash] = g;
-    textureBytes += bytes;
-    ++stats.texturesCreated;
-    stats.textureBytesCreated += bytes;
-    return tex;
+        decodeNs += nowNanos() - decodeStart;
+        stats.texTexelsDecoded += static_cast<uint64_t>(rw) * rh;
+        ++stats.texFillRegions;
+        pendingUploads.push_back({g.tex, rw, rh, offset, x0, y0});
+    }
+    stats.texDecodeNanos += decodeNs;
+    stats.texStageNanos += stageNs;
+    if (!missLogPath.empty())
+    {
+        const auto it = missIndex.find(g.tex);
+        if (it != missIndex.end())
+        {
+            missRecords[it->second].decodeNs += decodeNs;
+            missRecords[it->second].stageNs += stageNs;
+        }
+    }
 }
 
-SDL_GPUTexture *GSGpuBackend::Impl::resolveTexture(const GSDrawState &state)
+GpuTexture *GSGpuBackend::Impl::resolveTexture(const GSDrawState &state)
 {
     ++stats.texLookups;
     const GSTex0Reg &t = state.context.tex0;
@@ -915,19 +1139,19 @@ SDL_GPUTexture *GSGpuBackend::Impl::resolveTexture(const GSDrawState &state)
     if (recentValid && recentEpoch == epoch && recentKey == key)
     {
         ++stats.texHitsRecent;
-        return recentTexture;
+        return recentEntry;
     }
 
     const uint32_t w = std::max<uint32_t>(state.textureWidth, 1u);
     const uint32_t h = std::max<uint32_t>(state.textureHeight, 1u);
-    SDL_GPUTexture *result = nullptr;
+    GpuTexture *result = nullptr;
     auto touch = [&](uint64_t contentHash) -> bool
     {
         const auto it = contentTextures.find(contentHash);
         if (it == contentTextures.end())
             return false;
         it->second.lastUsedFlush = flushIndex;
-        result = it->second.tex;
+        result = &it->second;
         return true;
     };
 
@@ -944,15 +1168,20 @@ SDL_GPUTexture *GSGpuBackend::Impl::resolveTexture(const GSDrawState &state)
             recentValid = true;
             recentKey = key;
             recentEpoch = epoch;
-            recentTexture = result;
+            recentEntry = result;
             return result;
         }
     }
 
     // 3. content: the bytes of the pages the texture can live in, with everything else the decode depends on
+    const uint64_t hashStart = nowNanos();
     uint64_t hash = SigKeyHash{}(key);
     for (uint32_t i = 0; i < span.count; ++i)
         hash = GSRec::Hash64(vram + static_cast<size_t>((span.first + i) & (kPageCount - 1u)) * kPageBytes, kPageBytes, hash);
+    lastHashNs = nowNanos() - hashStart;
+    ++stats.texContentLookups;
+    stats.texHashNanos += lastHashNs;
+    stats.texHashBytes += static_cast<uint64_t>(span.count) * kPageBytes;
     if (touch(hash))
     {
         ++stats.texHitsContent;
@@ -970,7 +1199,7 @@ SDL_GPUTexture *GSGpuBackend::Impl::resolveTexture(const GSDrawState &state)
     recentValid = true;
     recentKey = key;
     recentEpoch = epoch;
-    recentTexture = result;
+    recentEntry = result;
     return result;
 }
 
@@ -991,16 +1220,63 @@ void GSGpuBackend::Impl::evictTextures()
         if (textureBytes <= target)
             break;
         const auto it = contentTextures.find(o.second);
-        {
-            ps2x_gs::DefragGuard defragGuard; // see gs_gpu_threads.h
-            SDL_ReleaseGPUTexture(dev, it->second.tex);
-        }
+        const PooledTexture evicted = {it->second.tex, it->second.bytes, flushIndex};
+        const uint32_t sizeKey = (it->second.w << 16) | it->second.h;
+        missIndex.erase(it->second.tex); // the census forgets a texture that is gone (the pointer may be reused)
         textureBytes -= it->second.bytes;
         contentTextures.erase(it);
         ++stats.texturesEvicted;
+        // Keep the GPU object for the next texture of its size, or release it when the pool is full. Every draw that
+        // used it was submitted, and the copy pass that writes its next texels is in a later command buffer, which
+        // the GPU runs after them (SDL puts the barriers in).
+        const bool small = evicted.bytes <= kSmallTextureBytes;
+        const auto wanted = poolWanted.find(sizeKey);
+        const bool recentlyWanted = wanted != poolWanted.end() && wanted->second + kPoolWantedFlushes >= flushIndex;
+        if (poolEnabled && recentlyWanted &&
+            (small ? poolSmallCount < kSmallPoolEntries : poolBytes - poolSmallBytes + evicted.bytes <= kTexturePoolBudget))
+        {
+            texturePool[sizeKey].push_back(evicted);
+            poolBytes += evicted.bytes;
+            if (small)
+            {
+                poolSmallBytes += evicted.bytes;
+                ++poolSmallCount;
+            }
+        }
+        else
+        {
+            releaseTexture(evicted.tex);
+        }
     }
     // Signatures pointing at evicted textures miss on lookup and are rebuilt; nothing to fix here.
     recentValid = false;
+}
+
+void GSGpuBackend::Impl::releaseTexture(SDL_GPUTexture *tex)
+{
+    ps2x_gs::DefragGuard defragGuard; // see gs_gpu_threads.h
+    SDL_ReleaseGPUTexture(dev, tex);
+}
+
+// Releases the pooled textures that were not asked for in a long time (the oldest of each size), a few per flush.
+void GSGpuBackend::Impl::trimTexturePool()
+{
+    if (poolBytes == 0)
+        return;
+    int budget = 8;
+    for (auto &bucket : texturePool)
+        while (budget > 0 && !bucket.second.empty() && bucket.second.front().pooledAtFlush + kPoolMaxAgeFlushes < flushIndex)
+        {
+            poolBytes -= bucket.second.front().bytes;
+            if (bucket.second.front().bytes <= kSmallTextureBytes)
+            {
+                poolSmallBytes -= bucket.second.front().bytes;
+                --poolSmallCount;
+            }
+            releaseTexture(bucket.second.front().tex);
+            bucket.second.pop_front();
+            --budget;
+        }
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -1053,9 +1329,13 @@ void GSGpuBackend::Impl::submitSetup(const GSDrawState &state, const Setup &setu
     d.texture = nullptr;
     if (state.prim.tme)
     {
-        d.texture = resolveTexture(state);
-        if (!d.texture)
+        GpuTexture *texture = resolveTexture(state);
+        if (!texture)
             return;
+        decodeTexels(*texture, state, setup);
+        d.texture = texture->tex;
+        if (!missLogPath.empty())
+            noteTextureUse(d.texture, state, setup);
     }
     const FrameTarget &target = frames[frame];
     const int32_t s = static_cast<int32_t>(scale);
@@ -1178,6 +1458,7 @@ void GSGpuBackend::Impl::flushLocked(bool wait, const FieldCopy *fieldCopies, in
             SDL_WaitForGPUIdle(dev);
         return;
     }
+    const uint64_t flushStart = nowNanos();
     const size_t vertexBytes = vertices.size() * sizeof(Vertex);
     const size_t stageBase = alignUp(vertexBytes, 256u);
     const bool haveUploads = vertexBytes != 0 || !stage.empty();
@@ -1204,6 +1485,8 @@ void GSGpuBackend::Impl::flushLocked(bool wait, const FieldCopy *fieldCopies, in
             std::memcpy(map + stageBase, stage.data(), stage.size());
         SDL_UnmapGPUTransferBuffer(dev, uploadBuffer);
     }
+    const uint64_t mapDone = nowNanos();
+    stats.flushMapNanos += mapDone - flushStart;
 
     ps2x_gs::DefragGuard window; // Vulkan only: held from here to the submit, see gs_gpu_threads.h
     SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(dev);
@@ -1225,6 +1508,8 @@ void GSGpuBackend::Impl::flushLocked(bool wait, const FieldCopy *fieldCopies, in
             src.rows_per_layer = u.h;
             SDL_GPUTextureRegion dst = {};
             dst.texture = u.tex;
+            dst.x = u.x;
+            dst.y = u.y;
             dst.w = u.w;
             dst.h = u.h;
             dst.d = 1;
@@ -1310,12 +1595,15 @@ void GSGpuBackend::Impl::flushLocked(bool wait, const FieldCopy *fieldCopies, in
 
     ++stats.flushes;
     stats.maxDrawsPerFlush = std::max<uint64_t>(stats.maxDrawsPerFlush, draws.size());
+    const uint64_t recordDone = nowNanos();
+    stats.flushRecordNanos += recordDone - mapDone;
     SDL_GPUFence *fence = nullptr;
     if (fieldCopyCount > 0)
         fence = SDL_SubmitGPUCommandBufferAndAcquireFence(cmd); // a marker's flush: keep its fence
     else
         SDL_SubmitGPUCommandBuffer(cmd);
     window.Unlock();
+    stats.flushSubmitNanos += nowNanos() - recordDone;
     if (fieldCopyCount > 0)
     {
         // The fence keeps the GPU from falling more than kMaxFramesInFlight markers behind.
@@ -1348,6 +1636,7 @@ void GSGpuBackend::Impl::flushLocked(bool wait, const FieldCopy *fieldCopies, in
     vertices.clear();
     pendingUploads.clear();
     stage.clear();
+    const uint64_t evictStart = nowNanos();
     for (SDL_GPUTexture *t : transientTextures)
     {
         ps2x_gs::DefragGuard defragGuard;
@@ -1356,6 +1645,10 @@ void GSGpuBackend::Impl::flushLocked(bool wait, const FieldCopy *fieldCopies, in
     transientTextures.clear();
     ++flushIndex;
     evictTextures();
+    trimTexturePool();
+    const uint64_t flushEnd = nowNanos();
+    stats.flushEvictNanos += flushEnd - evictStart;
+    stats.flushTotalNanos += flushEnd - flushStart;
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -1767,9 +2060,94 @@ void GSGpuBackend::Impl::printStats()
                 static_cast<double>(a.downloadBytes - b.downloadBytes) / 1048576.0, d(a.backlogWaits, b.backlogWaits),
                 static_cast<double>(a.backlogWaitNanos - b.backlogWaitNanos) / 1e6);
     std::fflush(stdout);
+    // The cost split of misses and flushes, in ms per second of this interval.
+    const auto ms = [](uint64_t x, uint64_t y) { return static_cast<double>(x - y) / 1e6; };
+    std::printf("[gs:gpu-cost] misses=%llu reused=%llu pool=%.1fMB content_lookups=%llu hash=%.1fms (%.1f MB) create=%.1fms stage=%.1fms decode=%.1fms "
+                "(texels declared %.2fM, decoded %.2fM) | flushes=%llu total=%.1fms map=%.1fms record=%.1fms submit=%.1fms evict=%.1fms backlog=%.1fms | mark=%.1fms\n",
+                d(a.texMisses, b.texMisses), d(a.texturesReused, b.texturesReused), static_cast<double>(poolBytes) / 1048576.0,
+                d(a.texContentLookups, b.texContentLookups), ms(a.texHashNanos, b.texHashNanos),
+                static_cast<double>(a.texHashBytes - b.texHashBytes) / 1048576.0, ms(a.texCreateNanos, b.texCreateNanos),
+                ms(a.texStageNanos, b.texStageNanos), ms(a.texDecodeNanos, b.texDecodeNanos),
+                static_cast<double>(a.texTexelsDeclared - b.texTexelsDeclared) / 1e6, static_cast<double>(a.texTexelsDecoded - b.texTexelsDecoded) / 1e6,
+                d(a.flushes, b.flushes), ms(a.flushTotalNanos, b.flushTotalNanos), ms(a.flushMapNanos, b.flushMapNanos),
+                ms(a.flushRecordNanos, b.flushRecordNanos), ms(a.flushSubmitNanos, b.flushSubmitNanos), ms(a.flushEvictNanos, b.flushEvictNanos),
+                ms(a.backlogWaitNanos, b.backlogWaitNanos), ms(a.markNanos, b.markNanos));
+    std::fflush(stdout);
     statsPrev = stats;
     statsMarkers = 0;
     statsLastNs = now;
+}
+
+// One CSV row per VBlank marker (PS2X_GS_GPU_MARKER_LOG): the change of the counters since the previous marker.
+void GSGpuBackend::Impl::logMarkerRow(uint64_t markNs)
+{
+    const Stats &a = stats;
+    const Stats &b = markerPrev;
+    const auto us = [](uint64_t x, uint64_t y) { return static_cast<unsigned long long>((x - y) / 1000u); };
+    const auto n = [](uint64_t x, uint64_t y) { return static_cast<unsigned long long>(x - y); };
+    std::fprintf(markerLog, "%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%.1f,%llu,%llu,%.1f\n",
+                 static_cast<unsigned long long>(markerSeq), static_cast<unsigned long long>(nowNanos()), static_cast<unsigned long long>(markNs / 1000u),
+                 n(a.flushes, b.flushes), us(a.flushTotalNanos, b.flushTotalNanos), us(a.flushMapNanos, b.flushMapNanos),
+                 us(a.flushRecordNanos, b.flushRecordNanos), us(a.flushSubmitNanos, b.flushSubmitNanos), us(a.flushEvictNanos, b.flushEvictNanos),
+                 us(a.backlogWaitNanos, b.backlogWaitNanos), n(a.texMisses, b.texMisses), n(a.texContentLookups, b.texContentLookups),
+                 us(a.texHashNanos, b.texHashNanos), us(a.texCreateNanos, b.texCreateNanos), us(a.texStageNanos, b.texStageNanos),
+                 us(a.texDecodeNanos, b.texDecodeNanos), n(a.texTexelsDeclared, b.texTexelsDeclared), n(a.texTexelsDecoded, b.texTexelsDecoded),
+                 n(a.textureBytesCreated, b.textureBytesCreated) / 1024u, n(a.texturesEvicted, b.texturesEvicted),
+                 static_cast<double>(textureBytes) / 1048576.0, n(a.uploadBytes, b.uploadBytes) / 1024u, n(a.texturesReused, b.texturesReused),
+                 static_cast<double>(poolBytes) / 1048576.0);
+    if ((markerSeq % 30u) == 0u)
+        std::fflush(markerLog);
+    markerPrev = stats;
+}
+
+// The census of missed textures (PS2X_GS_GPU_MISS_LOG): for each draw that used a texture the backend created, what part
+// of it the draw can sample (GSGpu::TextureReach, the same bound decodeTexels uses), accumulated over the draws.
+void GSGpuBackend::Impl::noteTextureUse(SDL_GPUTexture *tex, const GSDrawState &state, const Setup &setup)
+{
+    const auto it = missIndex.find(tex);
+    if (it == missIndex.end())
+        return;
+    MissRecord &r = missRecords[it->second];
+    ++r.uses;
+    const TexelRect reach = TextureReach(setup, state.context.clamp, r.w, r.h);
+    r.minU = std::min(r.minU, reach.x0);
+    r.maxU = std::max(r.maxU, reach.x1);
+    r.minV = std::min(r.minV, reach.y0);
+    r.maxV = std::max(r.maxV, reach.y1);
+    if (r.w <= kTilesPerSide * kTileTexels && r.h <= kTilesPerSide * kTileTexels)
+        for (int32_t ty = reach.y0 / 16; ty <= reach.y1 / 16; ++ty)
+            for (int32_t tx = reach.x0 / 16; tx <= reach.x1 / 16; ++tx)
+                r.tiles16.set(static_cast<size_t>(ty) * kTilesPerSide + static_cast<size_t>(tx));
+}
+
+void GSGpuBackend::Impl::writeMissLog()
+{
+    std::FILE *f = std::fopen(missLogPath.c_str(), "w");
+    if (!f)
+        return;
+    std::fprintf(f, "idx,marker,w,h,psm,tbp0,tbw,pages,indexed,wms,wmt,bilinear,uses,min_u,max_u,min_v,max_v,box_texels,tiles16_texels,tiles32_texels,"
+                    "create_us,stage_us,decode_us,hash_us,reused\n");
+    for (size_t i = 0; i < missRecords.size(); ++i)
+    {
+        const MissRecord &r = missRecords[i];
+        uint64_t box = 0;
+        if (r.maxU >= r.minU && r.maxV >= r.minV)
+            box = static_cast<uint64_t>(r.maxU - r.minU + 1) * static_cast<uint64_t>(r.maxV - r.minV + 1);
+        const uint64_t tiles16 = r.tiles16.count() * 256u;
+        uint64_t tiles32 = 0;
+        for (uint32_t ty = 0; ty < 32u; ++ty)
+            for (uint32_t tx = 0; tx < 32u; ++tx)
+                if (r.tiles16.test(ty * 2u * 64u + tx * 2u) || r.tiles16.test(ty * 2u * 64u + tx * 2u + 1u) ||
+                    r.tiles16.test((ty * 2u + 1u) * 64u + tx * 2u) || r.tiles16.test((ty * 2u + 1u) * 64u + tx * 2u + 1u))
+                    tiles32 += 1024u;
+        std::fprintf(f, "%zu,%llu,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%llu,%d,%d,%d,%d,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%u\n", i,
+                     static_cast<unsigned long long>(r.marker), r.w, r.h, r.psm, r.tbp0, r.tbw, r.pages, r.indexed, r.wms, r.wmt, r.bilinear,
+                     static_cast<unsigned long long>(r.uses), r.minU, r.maxU, r.minV, r.maxV, static_cast<unsigned long long>(box),
+                     static_cast<unsigned long long>(tiles16), static_cast<unsigned long long>(tiles32),
+                     static_cast<unsigned long long>(r.createNs / 1000u), static_cast<unsigned long long>(r.stageNs / 1000u),
+                     static_cast<unsigned long long>(r.decodeNs / 1000u), static_cast<unsigned long long>(r.hashNs / 1000u), r.reused);
+    }
+    std::fclose(f);
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -1940,12 +2318,20 @@ GSGpuBackend::MarkResult GSGpuBackend::MarkPresentation(const GSPresentationRequ
     MarkResult result;
     if (!s.ready || !s.vram)
         return result;
+    const uint64_t markStart = nowNanos();
     s.lastMarker = request;
     s.hasMarker = true;
     if (s.fields)
         result = s.produceField(request);
     else
         s.flushLocked(false);
+    const uint64_t markNs = nowNanos() - markStart;
+    s.stats.markNanos += markNs;
+    ++s.markerSeq;
+    if (s.markerLog)
+        s.logMarkerRow(markNs);
+    if (!s.missLogPath.empty() && s.markerSeq % 300u == 0u)
+        s.writeMissLog();
     if (s.statsOn)
         s.printStats();
     return result;
@@ -2172,6 +2558,7 @@ GSGpuBackend::Stats GSGpuBackend::GetStats() const
     Stats result = m_impl->stats;
     result.signaturesLive = m_impl->signatures.size();
     result.textureBytesLive = m_impl->textureBytes;
+    result.texturePoolBytes = m_impl->poolBytes;
     return result;
 }
 

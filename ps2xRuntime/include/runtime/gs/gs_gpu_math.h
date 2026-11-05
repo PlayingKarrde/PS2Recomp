@@ -16,9 +16,11 @@
 #include "runtime/gs/gs_types.h"
 
 #include <algorithm>
+#include <bitset>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <vector>
 
 namespace GSGpu
 {
@@ -400,5 +402,151 @@ namespace GSGpu
         const uint64_t count = static_cast<uint64_t>(lastPage) - firstPage + 1u;
         span.count = static_cast<uint32_t>(std::min<uint64_t>(count, 512u));
         return span;
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // Which texels of a texture a draw can sample. The GPU renderer decodes a texture from GS memory lazily, only
+    // the 16 x 16 texel tiles that some draw can reach: a wrestler's portrait is declared 512 x 512 texels but a draw
+    // uses about a tenth of that, and decoding the rest is what made the random pick on the wrestler select slow. The
+    // bound has to be safe, because a texel the shader fetches that was never decoded would show garbage.
+    struct TexelRect
+    {
+        int32_t x0 = 0, y0 = 0, x1 = -1, y1 = -1; // inclusive
+        bool Empty() const { return x1 < x0 || y1 < y0; }
+        bool operator==(const TexelRect &o) const { return x0 == o.x0 && y0 == o.y0 && x1 == o.x1 && y1 == o.y1; }
+    };
+
+    // What gs.frag.hlsl can fetch from a width x height texture for the primitive in `setup`. The shader fetches texel
+    // floor(u) (nearest), or floor(u - 0.5) and the one after it (bilinear), after rounding the coordinate to 1/16 and
+    // applying the wrap mode. A texel coordinate stays between the smallest and the largest value at the vertices
+    // (for S, T, Q too, as long as every Q is positive: the interpolated S/Q is a weighted mean of the vertex ratios),
+    // so that range widened by one texel on each side covers every case, and the wrap mode then narrows or widens it:
+    //   CLAMP         the range clamped to the texture
+    //   REGION_CLAMP  the range clamped into [MINU, MAXU] (or V), then to the texture (the sampler clamps what is left)
+    //   REPEAT        the range itself when it lies inside the texture, otherwise the whole axis
+    //   REGION_REPEAT the whole axis
+    // A Q that is not positive, a coordinate that is not finite or absurdly large, or no vertices: the whole texture.
+    inline TexelRect TextureReach(const Setup &setup, uint64_t clampReg, uint32_t width, uint32_t height)
+    {
+        TexelRect whole;
+        whole.x0 = 0;
+        whole.y0 = 0;
+        whole.x1 = static_cast<int32_t>(width) - 1;
+        whole.y1 = static_cast<int32_t>(height) - 1;
+        if (setup.count == 0 || width == 0u || height == 0u)
+            return whole;
+        const float size[2] = {static_cast<float>(width), static_cast<float>(height)};
+        float lo[2] = {1.0e30f, 1.0e30f}, hi[2] = {-1.0e30f, -1.0e30f};
+        for (uint32_t i = 0; i < setup.count; ++i)
+        {
+            const Vertex &v = setup.v[i];
+            float c[2];
+            if (setup.texelCoords)
+            {
+                c[0] = v.u;
+                c[1] = v.v;
+            }
+            else
+            {
+                if (!(v.q > 0.0f))
+                    return whole;
+                c[0] = v.u / v.q * size[0];
+                c[1] = v.v / v.q * size[1];
+            }
+            for (int k = 0; k < 2; ++k)
+            {
+                if (!(std::fabs(c[k]) < 1.0e6f))
+                    return whole;
+                lo[k] = std::min(lo[k], c[k]);
+                hi[k] = std::max(hi[k], c[k]);
+            }
+        }
+        const int32_t extent[2] = {static_cast<int32_t>(width), static_cast<int32_t>(height)};
+        const uint32_t mode[2] = {static_cast<uint32_t>(clampReg & 3u), static_cast<uint32_t>((clampReg >> 2) & 3u)};
+        const int32_t regionMin[2] = {static_cast<int32_t>((clampReg >> 4) & 0x3FFu), static_cast<int32_t>((clampReg >> 24) & 0x3FFu)};
+        const int32_t regionMax[2] = {static_cast<int32_t>((clampReg >> 14) & 0x3FFu), static_cast<int32_t>((clampReg >> 34) & 0x3FFu)};
+        int32_t first[2], last[2];
+        for (int k = 0; k < 2; ++k)
+        {
+            const int32_t l = static_cast<int32_t>(std::floor(lo[k])) - 1;
+            const int32_t h = static_cast<int32_t>(std::floor(hi[k])) + 1;
+            first[k] = 0;
+            last[k] = extent[k] - 1;
+            switch (mode[k])
+            {
+            case 0u: // REPEAT
+                if (l >= 0 && h <= extent[k] - 1)
+                {
+                    first[k] = l;
+                    last[k] = h;
+                }
+                break;
+            case 1u: // CLAMP
+                first[k] = std::clamp(l, 0, extent[k] - 1);
+                last[k] = std::clamp(h, 0, extent[k] - 1);
+                break;
+            case 2u: // REGION_CLAMP: min(max(c, MIN), MAX) as in the shader, which is monotonic in c
+                first[k] = std::clamp(std::min(std::max(l, regionMin[k]), regionMax[k]), 0, extent[k] - 1);
+                last[k] = std::clamp(std::min(std::max(h, regionMin[k]), regionMax[k]), 0, extent[k] - 1);
+                break;
+            default: // REGION_REPEAT is a bitwise operation, not a range
+                break;
+            }
+        }
+        TexelRect r;
+        r.x0 = first[0];
+        r.y0 = first[1];
+        r.x1 = last[0];
+        r.y1 = last[1];
+        return r;
+    }
+
+    // Which 16 x 16 texel tiles of a texture hold decoded texels. A texture is at most 1024 x 1024 (TW, TH <= 10).
+    constexpr uint32_t kTileShift = 4u;
+    constexpr uint32_t kTileTexels = 1u << kTileShift;
+    constexpr uint32_t kTilesPerSide = 64u;
+
+    struct TileMap
+    {
+        std::bitset<kTilesPerSide * kTilesPerSide> decoded; // tile (tx, ty) is bit ty * 64 + tx
+    };
+
+    // Marks the tiles that `rect` (inclusive, inside the texture) touches as decoded, and appends to `out` the
+    // tile-aligned rectangles, clipped to the width x height texture, that were not decoded before: runs of missing tiles
+    // along a tile row, joined with the run above when the two line up. A rectangle that is already decoded adds nothing.
+    inline void TakeMissingTiles(TileMap &map, const TexelRect &rect, uint32_t width, uint32_t height, std::vector<TexelRect> &out)
+    {
+        if (rect.Empty() || rect.x0 < 0 || rect.y0 < 0)
+            return;
+        const uint32_t tx0 = static_cast<uint32_t>(rect.x0) >> kTileShift, tx1 = std::min(static_cast<uint32_t>(rect.x1) >> kTileShift, kTilesPerSide - 1u);
+        const uint32_t ty0 = static_cast<uint32_t>(rect.y0) >> kTileShift, ty1 = std::min(static_cast<uint32_t>(rect.y1) >> kTileShift, kTilesPerSide - 1u);
+        const size_t firstNew = out.size();
+        for (uint32_t ty = ty0; ty <= ty1; ++ty)
+        {
+            uint32_t tx = tx0;
+            while (tx <= tx1)
+            {
+                if (map.decoded.test(ty * kTilesPerSide + tx))
+                {
+                    ++tx;
+                    continue;
+                }
+                uint32_t run = tx;
+                while (run + 1u <= tx1 && !map.decoded.test(ty * kTilesPerSide + run + 1u))
+                    ++run;
+                for (uint32_t i = tx; i <= run; ++i)
+                    map.decoded.set(ty * kTilesPerSide + i);
+                TexelRect r;
+                r.x0 = static_cast<int32_t>(tx << kTileShift);
+                r.y0 = static_cast<int32_t>(ty << kTileShift);
+                r.x1 = static_cast<int32_t>(std::min((run + 1u) << kTileShift, width)) - 1;
+                r.y1 = static_cast<int32_t>(std::min((ty + 1u) << kTileShift, height)) - 1;
+                if (out.size() > firstNew && out.back().x0 == r.x0 && out.back().x1 == r.x1 && out.back().y1 + 1 == r.y0)
+                    out.back().y1 = r.y1;
+                else
+                    out.push_back(r);
+                tx = run + 1u;
+            }
+        }
     }
 }

@@ -11,8 +11,9 @@
 //     exist only as GPU render targets. The game never reads back what it draws (GS census), so
 //     ReadVram, SnapshotVram and local-to-host transfers return the memory image without them.
 //   - Each primitive becomes vertices (gs_gpu_math.h) in a per-flush list, grouped into draws by pipeline
-//     state, texture and scissor. Textures are decoded from the memory image on the CPU into RGBA8 and
-//     cached on the GPU (see the cache comment in gs_gpu_backend.cpp).
+//     state, texture and scissor. Textures are decoded from the memory image on the CPU into RGBA8, in 16 x 16
+//     texel tiles and only where a draw can sample, and cached on the GPU (see the cache comment in
+//     gs_gpu_backend.cpp).
 //   - Draws are recorded into one command buffer at Flush, Sync, Present or MarkPresentation (and when a
 //     list gets large) and submitted at once.
 //
@@ -65,13 +66,30 @@ public:
         uint64_t pipelinesCreated = 0;    // cumulative since construction (not cleared by ResetStats)
         uint64_t texturesCreated = 0;
         uint64_t texturesEvicted = 0;
+        uint64_t texturesReused = 0;      // textures made from a pooled GPU object (an evicted one of the same size) instead of SDL_CreateGPUTexture
         uint64_t textureBytesCreated = 0;
         uint64_t texLookups = 0;          // textured draws that asked the cache
         uint64_t texHitsRecent = 0;       // same texture as the previous primitive, memory unchanged
         uint64_t texHitsSignature = 0;    // known texture, its memory pages unchanged since
         uint64_t texHitsContent = 0;      // memory changed, but the bytes (and CLUT) are the same as a cached texture
         uint64_t texMisses = 0;           // decoded and uploaded
-        uint64_t texDecodeNanos = 0;
+        uint64_t texDecodeNanos = 0;      // the decode loop of the misses (and the palette), not the staging
+        // Where a texture miss and a flush spend their time, in nanoseconds on the GS thread (two clock reads per
+        // step, only on the slow paths). Printed by PS2X_GS_GPU_STATS=1 and PS2X_GS_GPU_MARKER_LOG.
+        uint64_t texContentLookups = 0;   // lookups that had to hash the texture's pages (the third cache level)
+        uint64_t texHashNanos = 0;        // ... and what that hashing took
+        uint64_t texHashBytes = 0;
+        uint64_t texCreateNanos = 0;      // SDL_CreateGPUTexture of the misses
+        uint64_t texStageNanos = 0;       // allocateStage for the misses (growing and zero-filling the stage vector)
+        uint64_t texTexelsDeclared = 0;   // width x height of the missed textures
+        uint64_t texTexelsDecoded = 0;    // texels the decode loop actually produced (the tiles draws can reach, see decodeTexels)
+        uint64_t texFillRegions = 0;      // rectangles decoded and uploaded to a texture
+        uint64_t flushMapNanos = 0;       // ensureBuffers, map, memcpy of vertices and stage, unmap
+        uint64_t flushRecordNanos = 0;    // acquire the command buffer, record copy and render passes
+        uint64_t flushSubmitNanos = 0;    // SDL_SubmitGPUCommandBuffer
+        uint64_t flushEvictNanos = 0;     // evictTextures and the release of transient textures
+        uint64_t flushTotalNanos = 0;     // flushLocked from start to end (also the waits of wait=true and the backlog)
+        uint64_t markNanos = 0;           // MarkPresentation, all of it
         uint64_t uploadTransfers = 0;     // BeginTransfer calls that wrote GS memory
         uint64_t uploadBytes = 0;
         uint64_t depthRestores = 0;       // times Z pages changed by GS memory writes were copied into the depth target
@@ -93,6 +111,7 @@ public:
         uint64_t fieldsDropped = 0;       // fields not published because every slot was in use
         uint64_t signaturesLive = 0;      // entries of the texture signature map now (not cleared by ResetStats)
         uint64_t textureBytesLive = 0;    // bytes of cached GPU textures now (not cleared by ResetStats)
+        uint64_t texturePoolBytes = 0;    // bytes of evicted GPU textures kept for reuse now (not cleared by ResetStats)
     };
 
     // One field published by the GS thread for the host (path B). A field uses one slot for the displayed
