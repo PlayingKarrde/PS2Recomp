@@ -41,6 +41,7 @@
 #include "runtime/gs/gs_cpu_backend.h"
 #include "runtime/gs/gs_field_deinterlacer.h"
 #include "runtime/gs/gs_gpu_backend.h"
+#include "runtime/gs/gs_gpu_math.h"
 #include "runtime/gs/gs_gpu_present.h"
 #include "runtime/gs/gs_recording.h"
 #include "../common/png_write.h"
@@ -113,6 +114,8 @@ namespace
         std::string directDir;
         bool states = false;
         bool offsets = false;   // investigation: how the half-line field offset is applied (see reportOffsets)
+        bool prims = false;     // investigation (task g4b): which primitive kinds the clip draws and how its sprites are scaled (see reportPrims)
+        bool vsScale1 = false;  // task g4b: also run a scale-1 GPU renderer and compare the scaled pictures, averaged down, with its pictures
         int onlyState = -1;     // debugging: draw only primitives of this recorded state id
         int skipState = -1;     // debugging: skip primitives of this recorded state id
     };
@@ -128,7 +131,7 @@ namespace
                      "  --backend B     the renderer to replay through: cpu (default) or gpu (SDL_GPU, headless)\n"
                      "  --compare       replay through both and measure how the pictures differ\n"
                      "  --driver D      SDL_GPU driver for the gpu renderer: vulkan, direct3d12 or metal (default: SDL picks)\n"
-                     "  --scale N       render scale of the gpu renderer (only 1 is supported)\n"
+                     "  --scale N       internal resolution of the gpu renderer, 1 to 4 (weave mode draws at 1 only); its pictures are 640N pixels wide\n"
                      "  --compare-rows R  with --compare --fields progressive: how the 448-line GPU picture is reduced to the cpu picture's 224 lines:\n"
                      "                  parity (default): the rows that sample the field the way the cpu renderer does (even rows for a field whose OFY is a\n"
                      "                  whole number, odd rows for the half-line one), or average: pairs of rows averaged\n"
@@ -155,7 +158,11 @@ namespace
                      "                  (with --direct, --png-dir also gets direct_marker_NNNNN.png: the picture path B builds, at its own size)\n"
                      "  --info          list the records in the file and stop\n"
                      "  --presents      list the distinct presentation requests in the file and stop\n"
-                     "  --offsets       list how the half-line field offset is applied in the file and stop\n");
+                     "  --offsets       list how the half-line field offset is applied in the file and stop\n"
+                     "  --prims         list which primitive kinds the file draws and how its sprites are scaled and filtered, and stop\n"
+                     "  --vs-scale1     with --backend gpu --fields progressive --scale N (N > 1): also run a scale-1 GPU renderer and compare every\n"
+                     "                  picture, averaged down by N in both directions, with its scale-1 picture (share of pixels differing by more than\n"
+                     "                  8 in any colour channel); --diff-dir D writes the scale-1, averaged and difference pictures of the worst frames\n");
     }
 
     bool parse(int argc, char **argv, Options &o)
@@ -327,6 +334,14 @@ namespace
             {
                 o.offsets = true;
             }
+            else if (arg == "--prims")
+            {
+                o.prims = true;
+            }
+            else if (arg == "--vs-scale1")
+            {
+                o.vsScale1 = true;
+            }
             else if (arg == "--only-state")
             {
                 const char *v = value("--only-state");
@@ -385,11 +400,12 @@ namespace
         std::vector<std::string> callProblems;
     };
 
-    // One picture of a marker, as RGBA rows kStride pixels wide.
+    // One picture of a marker, as RGBA rows `stride` pixels apart (kStride, except for the GPU renderer's pictures at a scale above 1).
     struct Picture
     {
         std::vector<uint8_t> pixels;
         uint32_t width = 0, height = 0;
+        uint32_t stride = kStride;
     };
 
     // Plays one record into one side. Markers are handled by the caller.
@@ -489,7 +505,8 @@ namespace
         uint64_t pixels = 0;
     };
 
-    DiffResult diffPictures(const Picture &a, const Picture &b)
+    // `tolerance` and `channels` (4: alpha counts, 3: colour only) default to the --compare rule.
+    DiffResult diffPictures(const Picture &a, const Picture &b, int tolerance = kPixelTolerance, int channels = 4)
     {
         DiffResult r;
         const uint32_t w = std::min(a.width, b.width), h = std::min(a.height, b.height);
@@ -503,15 +520,15 @@ namespace
         }
         for (uint32_t y = 0; y < h; ++y)
         {
-            const uint8_t *pa = a.pixels.data() + static_cast<size_t>(y) * kStride * 4u;
-            const uint8_t *pb = b.pixels.data() + static_cast<size_t>(y) * kStride * 4u;
+            const uint8_t *pa = a.pixels.data() + static_cast<size_t>(y) * a.stride * 4u;
+            const uint8_t *pb = b.pixels.data() + static_cast<size_t>(y) * b.stride * 4u;
             for (uint32_t x = 0; x < w; ++x)
             {
                 int worst = 0;
-                for (int c = 0; c < 4; ++c)
+                for (int c = 0; c < channels; ++c)
                     worst = std::max(worst, std::abs(static_cast<int>(pa[x * 4u + c]) - static_cast<int>(pb[x * 4u + c])));
                 r.maxDiff = std::max(r.maxDiff, worst);
-                r.differing += worst > kPixelTolerance ? 1u : 0u;
+                r.differing += worst > tolerance ? 1u : 0u;
             }
         }
         r.pixels = static_cast<uint64_t>(w) * h;
@@ -525,13 +542,14 @@ namespace
         Picture d;
         d.width = std::min(a.width, b.width);
         d.height = std::min(a.height, b.height);
-        d.pixels.assign(static_cast<size_t>(kStride) * 512u * 4u, 255u);
+        d.stride = d.width;
+        d.pixels.assign(static_cast<size_t>(d.stride) * d.height * 4u, 255u);
         for (uint32_t y = 0; y < d.height; ++y)
             for (uint32_t x = 0; x < d.width; ++x)
             {
-                const uint8_t *pa = a.pixels.data() + (static_cast<size_t>(y) * kStride + x) * 4u;
-                const uint8_t *pb = b.pixels.data() + (static_cast<size_t>(y) * kStride + x) * 4u;
-                uint8_t *pd = d.pixels.data() + (static_cast<size_t>(y) * kStride + x) * 4u;
+                const uint8_t *pa = a.pixels.data() + (static_cast<size_t>(y) * a.stride + x) * 4u;
+                const uint8_t *pb = b.pixels.data() + (static_cast<size_t>(y) * b.stride + x) * 4u;
+                uint8_t *pd = d.pixels.data() + (static_cast<size_t>(y) * d.stride + x) * 4u;
                 int worst = 0;
                 for (int c = 0; c < 3; ++c)
                 {
@@ -578,11 +596,12 @@ namespace
         return r;
     }
 
-    Picture toPicture(const PresentationFrame &frame)
+    Picture toPicture(const PresentationFrame &frame, uint32_t stride = kStride)
     {
         Picture p;
         p.width = frame.width;
         p.height = frame.height;
+        p.stride = stride;
         if (frame)
             p.pixels = frame.pixels;
         return p;
@@ -592,7 +611,44 @@ namespace
     {
         if (p.pixels.empty() || p.width == 0 || p.height == 0)
             return false;
-        return writePng(path, p.pixels.data(), p.width, p.height, kStride * 4u);
+        return writePng(path, p.pixels.data(), p.width, p.height, p.stride * 4u);
+    }
+
+    // The average of every n x n block of pixels of a scaled picture, one pixel of the result per block, with the blocks'
+    // top-left corners `shift` pixels up and to the left of multiples of n (the blocks at the border are clipped to the
+    // picture). The result is a picture of width / n x height / n. All four channels are averaged, rounding to nearest.
+    // With `pick` set the result takes the one pixel at each block's top-left corner (n x + 0, n y + 0 before the shift) instead of
+    // the average: the target pixels that sample the same GS position as the scale-1 picture's pixels do (TargetMapping, corner grid).
+    // `pickOffset` moves the picked pixel that many pixels right and down (n / 2 is half a scale-1 pixel off the scale-1 sample position:
+    // how much the scale-1 picture changes when its samples are taken half a pixel away, to compare the averages with).
+    Picture boxDown(const Picture &p, uint32_t n, uint32_t shift, bool pick = false, uint32_t pickOffset = 0)
+    {
+        Picture r;
+        r.width = p.width / n;
+        r.height = p.height / n;
+        r.stride = r.width;
+        r.pixels.assign(static_cast<size_t>(r.stride) * r.height * 4u, 0u);
+        for (uint32_t y = 0; y < r.height; ++y)
+            for (uint32_t x = 0; x < r.width; ++x)
+            {
+                uint32_t sum[4] = {};
+                uint32_t count = 0;
+                for (uint32_t ky = 0; ky < (pick ? 1u : n); ++ky)
+                    for (uint32_t kx = 0; kx < (pick ? 1u : n); ++kx)
+                    {
+                        const int64_t sx = static_cast<int64_t>(x) * n + kx - shift + pickOffset, sy = static_cast<int64_t>(y) * n + ky - shift + pickOffset;
+                        if (sx < 0 || sy < 0 || sx >= static_cast<int64_t>(p.width) || sy >= static_cast<int64_t>(p.height))
+                            continue;
+                        const uint8_t *src = p.pixels.data() + (static_cast<size_t>(sy) * p.stride + static_cast<size_t>(sx)) * 4u;
+                        for (int c = 0; c < 4; ++c)
+                            sum[c] += src[c];
+                        ++count;
+                    }
+                uint8_t *dst = r.pixels.data() + (static_cast<size_t>(y) * r.stride + x) * 4u;
+                for (int c = 0; c < 4; ++c)
+                    dst[c] = count ? static_cast<uint8_t>((sum[c] + count / 2u) / count) : 0u;
+            }
+        return r;
     }
 
     std::string clipName(const std::string &path)
@@ -645,6 +701,116 @@ namespace
         int count = 0;
         std::array<GSVertex, 3> vertices{};
     };
+
+    // --prims (investigation for the internal-resolution work, task g4b): which primitive kinds the clip draws, and for the
+    // sprites, whether they show their texels 1:1, magnified or minified, with nearest or bilinear filtering. Lines and points
+    // stay one target pixel thin at a higher scale, so where they are used matters; so does the share of magnified bilinear
+    // sprites, which a higher scale can sample more finely. A sprite is 1:1 when a texel is one GS pixel on both axes (within
+    // 1/32), magnified when a texel covers more than one pixel on an axis and none less, minified when it covers less on an
+    // axis and none more, and mixed otherwise. The pixel columns count the sprite's area (width x height in GS pixels).
+    int reportPrims(GSRec::Reader &reader)
+    {
+        static const char *const kType[] = {"POINT", "LINE", "LINESTRIP", "TRIANGLE", "TRISTRIP", "TRIFAN", "SPRITE"};
+        uint64_t perType[7] = {};
+        uint64_t drawn = 0;
+        struct Bucket
+        {
+            uint64_t prims = 0, pixels = 0;
+        };
+        // [textured: 0 no / 1 yes][filter: 0 nearest / 1 linear][class: 0 1:1, 1 magnified, 2 minified, 3 mixed]
+        Bucket sprites[2][2][4] = {};
+        Bucket triangles[2][2] = {};                // [textured][filter]
+        std::map<std::string, uint64_t> lineStates; // where lines and points are drawn
+        std::map<std::string, uint64_t> clampKinds; // wrap modes of the textured sprites: WMS/WMT
+        GSRec::Record r;
+        while (reader.next(r) == GSRec::Reader::Status::Ok)
+        {
+            if (r.type != GSRec::RT_Submit)
+                continue;
+            const GSDrawState &st = r.batch.state;
+            const unsigned type = std::min<unsigned>(st.prim.type, 6);
+            ++perType[type];
+            ++drawn;
+            const int textured = st.prim.tme ? 1 : 0;
+            const int linear = st.linearFilter ? 1 : 0;
+            if (type == GS_PRIM_POINT || type == GS_PRIM_LINE || type == GS_PRIM_LINESTRIP)
+            {
+                char key[160];
+                std::snprintf(key, sizeof(key), "%-9s fbp %u tex %s abe %d", kType[type], st.context.frame.fbp, textured ? "on" : "off", st.prim.abe ? 1 : 0);
+                ++lineStates[key];
+            }
+            else if (type == GS_PRIM_SPRITE)
+            {
+                GSGpu::Setup setup;
+                if (r.batch.vertexCount < 2 || !GSGpu::BuildSprite(r.batch, 1u, setup))
+                    continue;
+                const float spanX = setup.v[1].x - setup.v[0].x, spanY = setup.v[2].y - setup.v[1].y;
+                int cls = 0;
+                if (textured)
+                {
+                    const float texX = std::fabs(setup.v[1].u - setup.v[0].u), texY = std::fabs(setup.v[2].v - setup.v[1].v);
+                    const float rx = texX / std::max(spanX, 1.0f), ry = texY / std::max(spanY, 1.0f); // texels per pixel
+                    const bool oneX = std::fabs(rx - 1.0f) < 1.0f / 32.0f, oneY = std::fabs(ry - 1.0f) < 1.0f / 32.0f;
+                    const bool magX = rx < 1.0f - 1.0f / 32.0f, magY = ry < 1.0f - 1.0f / 32.0f;
+                    const bool minX = rx > 1.0f + 1.0f / 32.0f, minY = ry > 1.0f + 1.0f / 32.0f;
+                    if (oneX && oneY)
+                        cls = 0;
+                    else if ((magX || magY) && !(minX || minY))
+                        cls = 1;
+                    else if ((minX || minY) && !(magX || magY))
+                        cls = 2;
+                    else
+                        cls = 3;
+                    char key[96];
+                    std::snprintf(key, sizeof(key), "WMS %llu WMT %llu", (unsigned long long)(st.context.clamp & 3), (unsigned long long)((st.context.clamp >> 2) & 3));
+                    ++clampKinds[key];
+                }
+                Bucket &b = sprites[textured][linear][cls];
+                ++b.prims;
+                b.pixels += static_cast<uint64_t>(std::max(spanX, 1.0f) * std::max(spanY, 1.0f));
+            }
+            else
+            {
+                ++triangles[textured][linear].prims;
+            }
+        }
+        std::printf("primitives drawn: %llu\n", static_cast<unsigned long long>(drawn));
+        for (unsigned t = 0; t < 7; ++t)
+            std::printf("  %-10s %llu\n", kType[t], static_cast<unsigned long long>(perType[t]));
+        static const char *const kClass[] = {"1:1", "magnified", "minified", "mixed"};
+        uint64_t spriteTotal = 0, spritePixels = 0;
+        for (int t = 0; t < 2; ++t)
+            for (int f = 0; f < 2; ++f)
+                for (int c = 0; c < 4; ++c)
+                {
+                    spriteTotal += sprites[t][f][c].prims;
+                    spritePixels += sprites[t][f][c].pixels;
+                }
+        std::printf("sprites: %llu (%llu GS pixels in all)\n", static_cast<unsigned long long>(spriteTotal), static_cast<unsigned long long>(spritePixels));
+        for (int t = 1; t >= 0; --t)
+            for (int f = 0; f < 2; ++f)
+                for (int c = 0; c < 4; ++c)
+                {
+                    const Bucket &b = sprites[t][f][c];
+                    if (!b.prims)
+                        continue;
+                    std::printf("  %-10s %-8s %-9s %9llu sprites (%5.1f%%) %12llu pixels (%5.1f%%)\n", t ? "textured" : "untextured", f ? "bilinear" : "nearest",
+                                t ? kClass[c] : "-", static_cast<unsigned long long>(b.prims),
+                                100.0 * static_cast<double>(b.prims) / std::max<double>(1.0, static_cast<double>(spriteTotal)),
+                                static_cast<unsigned long long>(b.pixels),
+                                100.0 * static_cast<double>(b.pixels) / std::max<double>(1.0, static_cast<double>(spritePixels)));
+                }
+        for (const auto &e : clampKinds)
+            std::printf("  textured sprites with %s: %llu\n", e.first.c_str(), static_cast<unsigned long long>(e.second));
+        std::printf("triangles: untextured %llu, textured nearest %llu, textured bilinear %llu\n",
+                    static_cast<unsigned long long>(triangles[0][0].prims + triangles[0][1].prims), static_cast<unsigned long long>(triangles[1][0].prims),
+                    static_cast<unsigned long long>(triangles[1][1].prims));
+        if (lineStates.empty())
+            std::printf("lines and points: none\n");
+        for (const auto &e : lineStates)
+            std::printf("lines and points: %s : %llu\n", e.first.c_str(), static_cast<unsigned long long>(e.second));
+        return 0;
+    }
 
     int reportOffsets(GSRec::Reader &reader)
     {
@@ -976,6 +1142,21 @@ int main(int argc, char **argv)
     }
     const bool useCpu = opt.compare || opt.backend == "cpu";
     const bool useGpu = opt.compare || opt.backend == "gpu";
+    if (opt.scale > 4)
+    {
+        std::fprintf(stderr, "--scale must be 1 to 4\n");
+        return 2;
+    }
+    if (opt.scale > 1 && (opt.compare || opt.backend != "gpu" || opt.fields != "progressive"))
+    {
+        std::fprintf(stderr, "--scale above 1 needs --backend gpu --fields progressive (the CPU renderer draws at scale 1 only: use --vs-scale1 to compare)\n");
+        return 2;
+    }
+    if (opt.vsScale1 && (opt.scale < 2 || opt.backend != "gpu" || opt.compare || opt.noFields))
+    {
+        std::fprintf(stderr, "--vs-scale1 needs --backend gpu --fields progressive --scale 2..4 (and not --compare or --no-fields)\n");
+        return 2;
+    }
 
     // These are read once, when the backend first needs them, so set them before it exists.
     if (opt.threads >= 0)
@@ -1063,6 +1244,8 @@ int main(int argc, char **argv)
 
     if (opt.offsets)
         return reportOffsets(reader);
+    if (opt.prims)
+        return reportPrims(reader);
 
     if (opt.states)
     {
@@ -1157,9 +1340,10 @@ int main(int argc, char **argv)
     }
 
     // The renderers. Each gets its own copy of the starting GS memory.
-    Side cpuSide, gpuSide;
+    Side cpuSide, gpuSide, refSide;
     std::unique_ptr<GSCpuBackend> cpuBackend;
     std::unique_ptr<GSGpuBackend> gpuBackend;
+    std::unique_ptr<GSGpuBackend> refBackend; // --vs-scale1: the same GPU renderer at scale 1
     SDL_GPUDevice *gpuDevice = nullptr;
     std::string gpuDriver, gpuDeviceName;
     if (useCpu)
@@ -1197,6 +1381,21 @@ int main(int argc, char **argv)
             std::fprintf(stderr, "the GPU renderer could not publish field copies\n");
             return 2;
         }
+        if (opt.vsScale1)
+        {
+            refSide.name = "gpu1x";
+            refSide.vram = vram;
+            refBackend = std::make_unique<GSGpuBackend>(gpuDevice, 1u, GSGpuBackend::FieldMode::Progressive);
+            if (!refBackend->Ready() || !refBackend->SetFieldPublishing(true))
+            {
+                std::fprintf(stderr, "the scale-1 reference renderer could not be set up\n");
+                return 2;
+            }
+            refSide.backend = refBackend.get();
+            refSide.gpu = refBackend.get();
+            refBackend->Initialize(refSide.vram.data(), static_cast<uint32_t>(refSide.vram.size()));
+            refBackend->ImportRecordingState(start);
+        }
     }
     std::unique_ptr<GSGpuPresenter> presenter;
     GSFieldDeinterlacer readbackDeinterlacer; // what the runtime does with path A's pictures
@@ -1224,6 +1423,9 @@ int main(int argc, char **argv)
         }
     }
 
+    // The rows of the GPU renderer's pictures are this many pixels apart (640 at scale 1; more at a higher scale with field publishing).
+    const uint32_t gpuStride = (useGpu && !opt.noFields) ? gpuBackend->PictureStride() : kStride;
+    const uint32_t gpuRows = (useGpu && !opt.noFields) ? gpuBackend->PictureRows() : 512u;
     std::map<uint32_t, uint32_t> ofyOfFbp; // the OFY of the latest primitive drawn into each frame buffer (--compare-rows parity)
     std::vector<Replayed> replayed; // the CPU side's when there is one, else the GPU's
     std::map<uint32_t, LiveFrame> liveFrames;
@@ -1234,6 +1436,28 @@ int main(int argc, char **argv)
     uint64_t pngCount = 0, diffPngCount = 0;
     std::string stopReason = "End record";
     const std::string clip = clipName(opt.file);
+
+    // --vs-scale1 bookkeeping: the scaled picture averaged down by `opt.scale`, with the blocks' corners at multiples of the scale
+    // (shift 0) and moved up and left by half the scale (shift scale / 2), against the scale-1 picture of the same marker.
+    constexpr int kDownsampleTolerance = 8;
+    struct DownsampleSeries
+    {
+        uint32_t shift = 0;
+        std::vector<double> shares; // percent of pixels differing by more than kDownsampleTolerance in any colour channel
+        std::vector<int> maxDiffs;
+        std::vector<uint32_t> markers;
+        std::vector<WorstFrame> worst;
+    };
+    // Series 2 is not an average: it takes the pixel at each block's top-left corner, which samples the same GS position as the
+    // scale-1 picture's pixel does when the sample grid is the corner grid (the default).
+    // Series 3 takes the pixel half a scale-1 pixel to the right and down of that corner: the scale-1 picture's sensitivity to a half pixel.
+    constexpr int kSeries = 4;
+    DownsampleSeries downsample[kSeries];
+    downsample[0].shift = 0;
+    downsample[1].shift = opt.scale / 2u;
+    downsample[2].shift = 0;
+    downsample[3].shift = 0;
+    uint64_t downsampleUnscaled = 0; // markers whose picture was not at the scaled size (a picture composed from real pixels)
 
     // --compare bookkeeping
     std::vector<double> shares; // per compared marker, in percent
@@ -1292,14 +1516,14 @@ int main(int argc, char **argv)
             if (useGpu)
             {
                 const PresentationFrame frame = playMarker(gpuSide, rec);
-                pictures[1] = toPicture(frame);
+                pictures[1] = toPicture(frame, gpuStride);
                 if (!useCpu && frame)
-                    replayed[rec.marker].frameHash = GSRec::HashFrame(frame.pixels.data(), frame.width, frame.height, kStride * 4u);
+                    replayed[rec.marker].frameHash = GSRec::HashFrame(frame.pixels.data(), frame.width, frame.height, gpuStride * 4u);
             }
             if (presenter && rec.marker % opt.directEvery == opt.directEvery - 1u)
             {
                 // Path A: the picture the runtime would have built from Present()'s pixels (UploadFrame in ps2_runtime.cpp).
-                std::vector<uint8_t> expected(static_cast<size_t>(kStride) * 512u * 4u, 0u);
+                std::vector<uint8_t> expected(static_cast<size_t>(gpuStride) * gpuRows * 4u, 0u);
                 const Picture &readback = pictures[1];
                 uint32_t pictureWidth = 640, pictureHeight = 448;
                 if (readback.pixels.empty())
@@ -1318,20 +1542,20 @@ int main(int argc, char **argv)
                     std::vector<uint8_t> packed(static_cast<size_t>(width) * height * 4u);
                     for (uint32_t y = 0; y < height; ++y)
                         std::memcpy(packed.data() + static_cast<size_t>(y) * width * 4u,
-                                    readback.pixels.data() + static_cast<size_t>(y) * kStride * 4u, static_cast<size_t>(width) * 4u);
+                                    readback.pixels.data() + static_cast<size_t>(y) * readback.stride * 4u, static_cast<size_t>(width) * 4u);
                     const bool fieldPictures = (rec.request.smode2 & 1ull) != 0ull && height != 0u && height * 2u <= 512u && width != 0u && width <= 640u;
                     if (fieldPictures)
                     {
-                        readbackDeinterlacer.process(packed.data(), width, height, expected.data(), static_cast<size_t>(kStride) * 4u);
+                        readbackDeinterlacer.process(packed.data(), width, height, expected.data(), static_cast<size_t>(gpuStride) * 4u);
                         pictureHeight = height * 2u;
                         ++directFieldPictures;
                     }
                     else
                     {
                         readbackDeinterlacer.reset();
-                        for (uint32_t y = 0; y < std::min<uint32_t>(height, 512u); ++y)
-                            std::memcpy(expected.data() + static_cast<size_t>(y) * kStride * 4u, packed.data() + static_cast<size_t>(y) * width * 4u,
-                                        static_cast<size_t>(std::min<uint32_t>(width, 640u)) * 4u);
+                        for (uint32_t y = 0; y < std::min<uint32_t>(height, gpuRows); ++y)
+                            std::memcpy(expected.data() + static_cast<size_t>(y) * gpuStride * 4u, packed.data() + static_cast<size_t>(y) * width * 4u,
+                                        static_cast<size_t>(std::min<uint32_t>(width, gpuStride)) * 4u);
                         pictureHeight = height;
                     }
                     pictureWidth = width;
@@ -1362,6 +1586,7 @@ int main(int argc, char **argv)
                     // The picture the host would show (path B), at its own size: with --png-dir, direct_marker_NNNNN.png.
                     Picture shownDirect;
                     shownDirect.pixels = got;
+                    shownDirect.stride = gpuStride;
                     shownDirect.width = directSize.width;
                     shownDirect.height = directSize.height;
                     char directName[64];
@@ -1401,8 +1626,9 @@ int main(int argc, char **argv)
                         Picture a, b, diff;
                         a.pixels = expected;
                         b.pixels = got;
-                        a.width = b.width = diff.width = 640;
-                        a.height = b.height = diff.height = 512;
+                        a.stride = b.stride = gpuStride;
+                        a.width = b.width = diff.width = gpuStride;
+                        a.height = b.height = diff.height = gpuRows;
                         diff = makeDiffPicture(a, b);
                         char name[96];
                         std::snprintf(name, sizeof(name), "%s_m%05u_", clip.c_str(), rec.marker);
@@ -1424,6 +1650,47 @@ int main(int argc, char **argv)
                                     static_cast<long long>(cpuDecision.upperError), cpuDecision.lower ? "lower" : "upper",
                                     static_cast<unsigned long long>(gpuLower), static_cast<unsigned long long>(gpuUpper),
                                     gpuKnown ? (gpuIsLower ? "lower" : "upper") : "?");
+                    }
+                }
+            }
+            if (refBackend)
+            {
+                const Picture reference = toPicture(playMarker(refSide, rec), refBackend->PictureStride());
+                const Picture &scaled = pictures[1];
+                if (reference.pixels.empty() || scaled.pixels.empty() || scaled.width != reference.width * opt.scale ||
+                    scaled.height != reference.height * opt.scale)
+                {
+                    ++downsampleUnscaled;
+                }
+                else
+                {
+                    for (int k = 0; k < kSeries; ++k)
+                    {
+                        DownsampleSeries &series = downsample[k];
+                        const Picture averaged = boxDown(scaled, opt.scale, series.shift, k >= 2, k == 3 ? opt.scale / 2u : 0u);
+                        const DiffResult d = diffPictures(reference, averaged, kDownsampleTolerance, 3);
+                        series.shares.push_back(d.share * 100.0);
+                        series.maxDiffs.push_back(d.maxDiff);
+                        series.markers.push_back(rec.marker);
+                        if (!opt.diffDir.empty() && opt.diffWorst != 0)
+                        {
+                            const bool room = series.worst.size() < opt.diffWorst;
+                            auto smallest = std::min_element(series.worst.begin(), series.worst.end(),
+                                                             [](const WorstFrame &a, const WorstFrame &b) { return a.share < b.share; });
+                            if (room || d.share * 100.0 > smallest->share)
+                            {
+                                WorstFrame w;
+                                w.share = d.share * 100.0;
+                                w.maxDiff = d.maxDiff;
+                                w.marker = rec.marker;
+                                w.cpu = reference; // the scale-1 picture
+                                w.gpu = averaged;  // the scaled picture, averaged down
+                                if (room)
+                                    series.worst.push_back(std::move(w));
+                                else
+                                    *smallest = std::move(w);
+                            }
+                        }
                     }
                 }
             }
@@ -1528,11 +1795,15 @@ int main(int argc, char **argv)
             applyRecord(cpuSide, rec);
         if (useGpu)
             applyRecord(gpuSide, rec);
+        if (refBackend)
+            applyRecord(refSide, rec);
     }
     if (useCpu)
         cpuBackend->Sync(GSSyncReason::DebugReadback);
     if (useGpu)
         gpuBackend->Sync(GSSyncReason::DebugReadback);
+    if (refBackend)
+        refBackend->Sync(GSSyncReason::DebugReadback);
     std::cout.rdbuf(coutBuffer);
     const double seconds = std::chrono::duration<double>(Clock::now() - t0).count() - pngSeconds;
 
@@ -1728,6 +1999,57 @@ int main(int argc, char **argv)
         }
     }
 
+    // --vs-scale1: how far the scaled pictures, averaged down, are from the scale-1 pictures
+    double dsMean[kSeries] = {}, dsMedian[kSeries] = {}, dsP95[kSeries] = {}, dsWorst[kSeries] = {};
+    uint32_t dsWorstMarker[kSeries] = {};
+    int dsMaxDiff[kSeries] = {};
+    if (opt.vsScale1)
+    {
+        for (int k = 0; k < kSeries; ++k)
+        {
+            DownsampleSeries &series = downsample[k];
+            for (size_t i = 0; i < series.shares.size(); ++i)
+            {
+                dsMean[k] += series.shares[i];
+                dsMaxDiff[k] = std::max(dsMaxDiff[k], series.maxDiffs[i]);
+                if (series.shares[i] > dsWorst[k] || i == 0)
+                {
+                    dsWorst[k] = series.shares[i];
+                    dsWorstMarker[k] = series.markers[i];
+                }
+            }
+            if (!series.shares.empty())
+                dsMean[k] /= static_cast<double>(series.shares.size());
+            dsMedian[k] = percentile(series.shares, 0.5);
+            dsP95[k] = percentile(series.shares, 0.95);
+            std::printf("downsample %s scale %u vs 1, %s: %zu pictures; share of pixels differing by more than %d in any colour channel: "
+                        "mean %.4f%%, median %.4f%%, p95 %.4f%%, worst %.4f%% (marker %u); largest channel difference %d\n",
+                        clip.c_str(), opt.scale,
+                        k == 0 ? "averaged in blocks at multiples of the scale"
+                               : (k == 1 ? "averaged in blocks moved up and left by half the scale"
+                                         : (k == 2 ? "taking the pixel at each block's top-left corner" : "taking the pixel half a scale-1 pixel right and down of that corner")),
+                        series.shares.size(),
+                        kDownsampleTolerance, dsMean[k], dsMedian[k], dsP95[k], dsWorst[k], dsWorstMarker[k], dsMaxDiff[k]);
+            if (!opt.diffDir.empty())
+            {
+                std::sort(series.worst.begin(), series.worst.end(), [](const WorstFrame &a, const WorstFrame &b) { return a.share > b.share; });
+                for (const WorstFrame &w : series.worst)
+                {
+                    char name[96];
+                    std::snprintf(name, sizeof(name), "%s_x%u_%s%u_worst_m%05u_", clip.c_str(), opt.scale, k == 2 ? "pick" : (k == 3 ? "half" : "shift"), series.shift, w.marker);
+                    const std::string base = opt.diffDir + "/" + name;
+                    const Picture diff = makeDiffPicture(w.cpu, w.gpu);
+                    if (writePicture(base + "scale1.png", w.cpu) && writePicture(base + "averaged.png", w.gpu) && writePicture(base + "diff.png", diff))
+                        std::printf("  worst frame (shift %u): marker %u, %.4f%% of pixels over %d, max channel difference %d -> %s*.png\n", series.shift,
+                                    w.marker, w.share, kDownsampleTolerance, w.maxDiff, base.c_str());
+                }
+            }
+        }
+        if (downsampleUnscaled)
+            std::printf("downsample: %llu markers had no picture at the scaled size on one side (a placeholder or a picture composed from real pixels)\n",
+                        static_cast<unsigned long long>(downsampleUnscaled));
+    }
+
     GSGpuBackend::Stats gs;
     if (useGpu)
     {
@@ -1787,6 +2109,15 @@ int main(int argc, char **argv)
                     std::fprintf(f, "%s[%u, %.5f, %d]", i ? ", " : "", shareMarkers[i], shares[i], maxDiffs[i]);
                 std::fprintf(f, "],\n");
             }
+            if (opt.vsScale1)
+            {
+                std::fprintf(f, "  \"downsample\": {\"scale\": %u, \"tolerance\": %d, \"series\": [", opt.scale, kDownsampleTolerance);
+                for (int k = 0; k < kSeries; ++k)
+                    std::fprintf(f, "%s{\"kind\": \"%s\", \"shift\": %u, \"pictures\": %zu, \"mean\": %.6f, \"median\": %.6f, \"p95\": %.6f, \"worst\": %.6f, \"worst_marker\": %u, \"max_channel_difference\": %d}",
+                                 k ? ", " : "", k == 2 ? "pick" : (k == 3 ? "pickhalf" : "average"), downsample[k].shift, downsample[k].shares.size(), dsMean[k], dsMedian[k], dsP95[k], dsWorst[k],
+                                 dsWorstMarker[k], dsMaxDiff[k]);
+                std::fprintf(f, "]},\n");
+            }
             std::fprintf(f, "  \"gpu_stats\": {\"primitives\": %llu, \"culled\": %llu, \"vertices\": %llu, \"draw_calls\": %llu, \"flushes\": %llu, "
                             "\"render_passes\": %llu, \"max_draws_per_flush\": %llu, \"pipelines_created\": %llu, \"texture_lookups\": %llu, "
                             "\"tex_hits_recent\": %llu, \"tex_hits_signature\": %llu, \"tex_hits_content\": %llu, \"tex_misses\": %llu, "
@@ -1828,6 +2159,7 @@ int main(int argc, char **argv)
     std::fflush(stdout);
 
     presenter.reset();
+    refBackend.reset();
     gpuBackend.reset();
     if (gpuDevice)
     {

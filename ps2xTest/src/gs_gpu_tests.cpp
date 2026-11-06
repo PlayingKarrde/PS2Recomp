@@ -237,10 +237,10 @@ void register_gs_gpu_tests()
             t.Equals(s.v[0].rgba, PackRgba(30, 60, 90, 0x80), "flat shading: every vertex has the last vertex colour");
             t.Equals(s.v[1].rgba, s.v[0].rgba, "flat shading, vertex 1");
             t.Equals(s.v[0].z, 1000.0f * kDepthScale, "Z is the 24-bit value over 2^24");
-            // scale 2 doubles the target pixels but keeps the half pixel in GS units
+            // scale 2: twice the GS position, plus the half target pixel that makes the GPU's pixel-centre sample the corner
             Setup s2;
             t.IsTrue(BuildTriangle(b, 2, s2), "scale 2");
-            t.Equals(s2.v[1].x, 101.0f, "scale 2 x of vertex 1");
+            t.Equals(s2.v[1].x, 100.5f, "scale 2 x of vertex 1");
         });
 
         tc.Run("a fractional 12.4 position is kept and a degenerate triangle is dropped", [](TestCase &t)
@@ -344,7 +344,7 @@ void register_gs_gpu_tests()
             // the existing scale parameter still means the same in both axes
             Setup w2;
             t.IsTrue(BuildTriangle(a, 2, w2), "scale 2");
-            t.Equals(w2.v[0].y, (20.75f + 0.5f) * 2.0f, "scale 2 keeps the half pixel in GS units");
+            t.Equals(w2.v[0].y, 20.75f * 2.0f + 0.5f, "scale 2: the GS position times 2, plus half a target pixel");
             // sprites: the rectangle is the same in both kinds of field and twice as tall
             GSPrimitiveBatch sprite = spriteBatch(10.0f, 20.0f, 30.0f, 50.0f);
             GSPrimitiveBatch spriteB = sprite;
@@ -371,6 +371,65 @@ void register_gs_gpu_tests()
             t.Equals(snapped.flags[2], 1u, "target columns per GS pixel");
             t.IsTrue((BuildFragUniforms(textured, true, false).flags[0] & kFlagSnapToGsPixel) == 0u, "no snapping at scale 1 (the M3 shader path)");
             t.IsTrue((BuildFragUniforms(textured, false, false, 1u, 2u).flags[0] & kFlagSnapToGsPixel) == 0u, "S, T, Q coordinates are never snapped");
+        });
+
+        tc.Run("a higher scale samples on the corner grid, so triangle and sprite edges meet and nearest texels are repeated", [](TestCase &t)
+        {
+            // A triangle with its left edge at GS x = 10 and a sprite starting at GS x = 10 cover from the same target pixel on.
+            for (uint32_t n : {2u, 3u, 4u})
+            {
+                const TargetMapping map{n, 2u * n, true};
+                GSPrimitiveBatch tri = triangleBatch(10.0f, 20.0f, 50.0f, 20.0f, 10.0f, 60.0f);
+                GSPrimitiveBatch spr = spriteBatch(10.0f, 20.0f, 50.0f, 60.0f);
+                Setup st, ss;
+                t.IsTrue(BuildTriangle(tri, map, st) && BuildSprite(spr, map, ss), "scale converts");
+                const float fn = static_cast<float>(n);
+                // vertex + 0.5: the pixel whose centre is first at or after the edge is the one that starts the sprite
+                t.Equals(st.v[0].x, 10.0f * fn + 0.5f, "triangle x: GS position times the scale, plus half a target pixel");
+                t.Equals(ss.v[0].x, 10.0f * fn, "sprite x: GS position times the scale");
+                t.Equals(st.v[0].y, 20.0f * 2.0f * fn + 0.5f, "triangle y: rows are 2 * scale per GS row");
+                t.Equals(ss.v[0].y, 20.0f * 2.0f * fn, "sprite y");
+                t.Equals(ss.v[2].x, 50.0f * fn, "sprite right edge");
+                t.Equals(ss.v[2].y, 60.0f * 2.0f * fn, "sprite bottom edge");
+                // target pixel X samples GS position X / n: the centre of pixel X is X + 0.5, the vertex is at 10 n + 0.5
+                for (uint32_t k = 0; k < n; ++k)
+                {
+                    const float position = (static_cast<float>(10u * n + k) + 0.5f - st.v[0].x) / fn + 10.0f;
+                    t.Equals(position, 10.0f + static_cast<float>(k) / fn, "target pixel X samples the GS position X / n");
+                }
+                t.Equals(st.minX, 10, "the box stays in GS pixels");
+                t.Equals(ss.maxY, 59, "the sprite box stays in GS pixels");
+            }
+            // the centred grid (measurement only) puts a block's samples around the scale-1 sample
+            {
+                const TargetMapping centred{2, 4, true, true};
+                GSPrimitiveBatch tri = triangleBatch(10.0f, 20.0f, 50.0f, 20.0f, 10.0f, 60.0f);
+                Setup sc;
+                t.IsTrue(BuildTriangle(tri, centred, sc), "centred converts");
+                t.Equals(sc.v[0].x, 10.0f * 2.0f + 1.0f, "centred: half a block, not half a target pixel (x)");
+                t.Equals(sc.v[0].y, 20.0f * 4.0f + 1.0f, "centred: a block row is 2 target rows at scale 2 (y)");
+                const TargetMapping centred1{1, 2, true, true};
+                const TargetMapping corner1{1, 2, true, false};
+                Setup a, b;
+                t.IsTrue(BuildTriangle(tri, centred1, a) && BuildTriangle(tri, corner1, b), "scale 1 converts");
+                t.Equals(a.v[0].x, b.v[0].x, "at scale 1 both grids are the same (x)");
+                t.Equals(a.v[0].y, b.v[0].y, "at scale 1 both grids are the same (y)");
+            }
+            // sprite sampling flags: at the target pixel keeps the snap data and adds its own flag
+            GSDrawState textured{};
+            textured.prim.type = GS_PRIM_SPRITE;
+            textured.prim.tme = true;
+            textured.prim.fst = true;
+            textured.textureWidth = 64;
+            textured.textureHeight = 32;
+            textured.linearFilter = true;
+            const FragUniforms atTarget = BuildFragUniforms(textured, true, false, 2u, 4u, true);
+            t.IsTrue((atTarget.flags[0] & kFlagSnapToGsPixel) != 0u && (atTarget.flags[0] & kFlagSpriteAtTarget) != 0u, "snap data and the at-target flag");
+            t.Equals(atTarget.flags[1], 4u, "target rows per GS pixel");
+            t.Equals(atTarget.flags[2], 2u, "target columns per GS pixel");
+            const FragUniforms atGs = BuildFragUniforms(textured, true, false, 2u, 4u, false);
+            t.IsTrue((atGs.flags[0] & kFlagSpriteAtTarget) == 0u, "no at-target flag when sampling at the GS pixel");
+            t.IsTrue((BuildFragUniforms(textured, true, false, 0u, 0u, true).flags[0] & kFlagSpriteAtTarget) == 0u, "no flag without snapping (scale 1, weave)");
         });
 
         tc.Run("blend equations map to fixed-function blending", [](TestCase &t)

@@ -99,9 +99,12 @@ struct GSGpuPresenter::Impl
     SDL_GPUGraphicsPipeline *pipeline[kShaderCount] = {};
     SDL_GPUSampler *sampler = nullptr;
 
-    SDL_GPUTexture *picture = nullptr;     // 640 x 512 RGBA8: what the host draws
-    SDL_GPUTexture *resolved[3] = {};      // 640 x 512 RGBA8: the last three fields' pictures
-    SDL_GPUTexture *blackCounts = nullptr; // 640 x 1 RGBA32F
+    // The textures are 640 x 512 texels times the scale of the backend (progressive mode draws fields at 640 x 448 times it).
+    uint32_t pictureW = kPictureWidth, pictureH = kPictureHeight;
+    uint32_t mipLevels = 1; // of the picture texture
+    SDL_GPUTexture *picture = nullptr;     // RGBA8: what the host draws
+    SDL_GPUTexture *resolved[3] = {};      // RGBA8: the last three fields' pictures
+    SDL_GPUTexture *blackCounts = nullptr; // one column per picture column, RGBA32F
     SDL_GPUTexture *flags = nullptr;       // 1 x 1 RGBA8: pictures that are not all black
     SDL_GPUTexture *sums = nullptr;        // 160 x 1 R32G32_FLOAT
     SDL_GPUTexture *state[2] = {};         // 1 x 1 RGBA8: red 1 = the newest field is the lower one
@@ -149,7 +152,7 @@ struct GSGpuPresenter::Impl
     ~Impl();
     bool init();
     SDL_GPUGraphicsPipeline *makePipeline(SDL_GPUShader *fragmentShader, SDL_GPUTextureFormat format);
-    SDL_GPUTexture *makeTexture(SDL_GPUTextureFormat format, uint32_t w, uint32_t h);
+    SDL_GPUTexture *makeTexture(SDL_GPUTextureFormat format, uint32_t w, uint32_t h, uint32_t levels = 1);
     bool pass(SDL_GPUCommandBuffer *cb, SDL_GPUTexture *target, int which, uint32_t rectW, uint32_t rectH, uint32_t targetW,
               uint32_t targetH, const void *fragmentUniform, uint32_t fragmentUniformBytes,
               const SDL_GPUTextureSamplerBinding *bindings, uint32_t bindingCount);
@@ -192,7 +195,7 @@ GSGpuPresenter::Impl::~Impl()
             SDL_ReleaseGPUTexture(dev, t);
 }
 
-SDL_GPUTexture *GSGpuPresenter::Impl::makeTexture(SDL_GPUTextureFormat format, uint32_t w, uint32_t h)
+SDL_GPUTexture *GSGpuPresenter::Impl::makeTexture(SDL_GPUTextureFormat format, uint32_t w, uint32_t h, uint32_t levels)
 {
     SDL_GPUTextureCreateInfo ti = {};
     ti.type = SDL_GPU_TEXTURETYPE_2D;
@@ -201,7 +204,7 @@ SDL_GPUTexture *GSGpuPresenter::Impl::makeTexture(SDL_GPUTextureFormat format, u
     ti.width = w;
     ti.height = h;
     ti.layer_count_or_depth = 1;
-    ti.num_levels = 1;
+    ti.num_levels = levels;
     ti.sample_count = SDL_GPU_SAMPLECOUNT_1;
     SDL_GPUTexture *t = SDL_CreateGPUTexture(dev, &ti);
     if (!t)
@@ -281,15 +284,28 @@ bool GSGpuPresenter::Impl::init()
         std::fprintf(stderr, "[gs:present] SDL_CreateGPUSampler: %s\n", SDL_GetError());
         return false;
     }
-    picture = makeTexture(SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM, kPictureWidth, kPictureHeight);
-    for (SDL_GPUTexture *&t : resolved)
-        t = makeTexture(SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM, kPictureWidth, kPictureHeight);
-    blackCounts = makeTexture(SDL_GPU_TEXTUREFORMAT_R32G32B32A32_FLOAT, kPictureWidth, 1);
+    pictureW = backend.PictureStride();
+    pictureH = backend.PictureRows();
+    // At a higher scale the window is usually smaller than the picture, and a bilinear sample of a picture that is shown at a
+    // third or a quarter of its size would alias. The picture therefore carries a mip chain down to about its scale-1 size
+    // (one level per halving: 2 levels at scale 2 and 3, 3 at scale 4), made after each new picture.
+    for (uint32_t n = backend.TargetScaleX(); n > 1u; n >>= 1u)
+        ++mipLevels;
+    picture = makeTexture(SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM, pictureW, pictureH, mipLevels);
+    // The history ring is the weave deinterlacer's; in progressive mode (every field is a finished picture) only the first
+    // texture is ever used, so the other two are not made (at a high scale they are the biggest textures the presenter has).
+    const int historyCount = backend.Fields() == GSGpuBackend::FieldMode::Weave ? 3 : 1;
+    for (int i = 0; i < historyCount; ++i)
+        resolved[i] = makeTexture(SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM, pictureW, pictureH);
+    blackCounts = makeTexture(SDL_GPU_TEXTUREFORMAT_R32G32B32A32_FLOAT, pictureW, 1);
     flags = makeTexture(SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM, 1, 1);
     sums = makeTexture(SDL_GPU_TEXTUREFORMAT_R32G32_FLOAT, kColumns, 1);
     state[0] = makeTexture(SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM, 1, 1);
     state[1] = makeTexture(SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM, 1, 1);
-    return picture && resolved[0] && resolved[1] && resolved[2] && blackCounts && flags && sums && state[0] && state[1];
+    for (int i = 0; i < historyCount; ++i)
+        if (!resolved[i])
+            return false;
+    return picture && blackCounts && flags && sums && state[0] && state[1];
 }
 
 // One render pass that draws the rectangle (0, 0)-(rectW, rectH) of `target` with pipeline `which`. The target is
@@ -353,6 +369,26 @@ SDL_GPUTexture *GSGpuPresenter::PictureTexture() const
     return m_impl->picture;
 }
 
+uint32_t GSGpuPresenter::PictureWidth() const
+{
+    return m_impl->pictureW;
+}
+
+uint32_t GSGpuPresenter::PictureHeight() const
+{
+    return m_impl->pictureH;
+}
+
+uint64_t GSGpuPresenter::MemoryBytes() const
+{
+    const Impl &s = *m_impl;
+    const uint64_t picture = static_cast<uint64_t>(s.pictureW) * s.pictureH * 4u;
+    uint64_t pictures = 1; // the picture itself ...
+    for (SDL_GPUTexture *t : s.resolved)
+        pictures += t ? 1u : 0u; // ... and the history pictures
+    return picture * pictures + static_cast<uint64_t>(s.pictureW) * 16u; // and the black counts
+}
+
 GSGpuPresenter::Size GSGpuPresenter::Pull()
 {
     Impl &s = *m_impl;
@@ -394,13 +430,16 @@ SDL_GPUTexture *GSGpuPresenter::Record(SDL_GPUCommandBuffer *cb)
         s.clear(cb, s.blackCounts, 0.0f, 0.0f, 0.0f, 0.0f);
         s.clear(cb, s.picture, 0.0f, 0.0f, 0.0f, 0.0f);
         for (SDL_GPUTexture *t : s.resolved)
-            s.clear(cb, t, 0.0f, 0.0f, 0.0f, 0.0f);
+            if (t)
+                s.clear(cb, t, 0.0f, 0.0f, 0.0f, 0.0f);
     }
     if (s.pending == Impl::Pending::None)
         return s.picture;
     if (s.pending == Impl::Pending::Magenta)
     {
         s.clear(cb, s.picture, 1.0f, 0.0f, 1.0f, 1.0f); // the placeholder UploadFrame shows when there is no picture
+        if (s.mipLevels > 1)
+            SDL_GenerateMipmapsForGPUTexture(cb, s.picture);
         s.pending = Impl::Pending::None;
         return s.picture;
     }
@@ -425,7 +464,7 @@ SDL_GPUTexture *GSGpuPresenter::Record(SDL_GPUCommandBuffer *cb)
     {
         const SDL_GPUTextureSamplerBinding pictures[3] = {{displayed, smp}, {fallback[0], smp}, {fallback[1], smp}};
         InfoUniform u = {{f.width, f.height, candidateCount, 0u}};
-        s.pass(cb, s.blackCounts, Impl::kBlack1, kPictureWidth, 1, kPictureWidth, 1, &u, sizeof(u), pictures, 3);
+        s.pass(cb, s.blackCounts, Impl::kBlack1, s.pictureW, 1, s.pictureW, 1, &u, sizeof(u), pictures, 3);
         const SDL_GPUTextureSamplerBinding counts[1] = {{s.blackCounts, smp}};
         s.pass(cb, s.flags, Impl::kBlack2, 1, 1, 1, 1, &u, sizeof(u), counts, 1);
     }
@@ -433,7 +472,7 @@ SDL_GPUTexture *GSGpuPresenter::Record(SDL_GPUCommandBuffer *cb)
     {
         const SDL_GPUTextureSamplerBinding pictures[4] = {{displayed, smp}, {fallback[0], smp}, {fallback[1], smp}, {s.flags, smp}};
         InfoUniform u = {{f.width, f.height, candidateCount, 0u}};
-        s.pass(cb, current, Impl::kSelect, f.width, f.height, kPictureWidth, kPictureHeight, &u, sizeof(u), pictures, 4);
+        s.pass(cb, current, Impl::kSelect, f.width, f.height, s.pictureW, s.pictureH, &u, sizeof(u), pictures, 4);
     }
 
     if (isFieldPicture(f))
@@ -460,7 +499,7 @@ SDL_GPUTexture *GSGpuPresenter::Record(SDL_GPUCommandBuffer *cb)
         DeintUniform params = {{f.width, f.height, s.hasPrev ? 1u : 0u, s.hasOlder ? 1u : 0u}, {0u, 0u, 0u, 0u}};
         const SDL_GPUTextureSamplerBinding bindings[4] = {
             {current, smp}, {previous, smp}, {older, smp}, {s.state[s.stateIndex], smp}};
-        s.pass(cb, s.picture, Impl::kDeint, f.width, f.height * 2u, kPictureWidth, kPictureHeight, &params, sizeof(params), bindings, 4);
+        s.pass(cb, s.picture, Impl::kDeint, f.width, f.height * 2u, s.pictureW, s.pictureH, &params, sizeof(params), bindings, 4);
 
         // This field is now the previous one, and the previous one the older one.
         s.curIndex = (s.curIndex + 1) % 3;
@@ -473,9 +512,11 @@ SDL_GPUTexture *GSGpuPresenter::Record(SDL_GPUCommandBuffer *cb)
         // A progressive picture is shown as it is, and the CPU deinterlacer forgets its history.
         DeintUniform params = {{f.width, f.height, 0u, 0u}, {1u, 0u, 0u, 0u}};
         const SDL_GPUTextureSamplerBinding bindings[4] = {{current, smp}, {current, smp}, {current, smp}, {s.state[s.stateIndex], smp}};
-        s.pass(cb, s.picture, Impl::kDeint, f.width, f.height, kPictureWidth, kPictureHeight, &params, sizeof(params), bindings, 4);
+        s.pass(cb, s.picture, Impl::kDeint, f.width, f.height, s.pictureW, s.pictureH, &params, sizeof(params), bindings, 4);
         s.hasPrev = s.hasOlder = false;
     }
+    if (s.mipLevels > 1)
+        SDL_GenerateMipmapsForGPUTexture(cb, s.picture); // outside any pass, as SDL requires
     // The field slots were read by the commands above: give them back once the command buffer is submitted.
     s.unpinAfterSubmit.push_back(f);
     s.pending = Impl::Pending::None;
@@ -503,7 +544,7 @@ void GSGpuPresenter::Submitted()
                 for (uint32_t y = 0; y < size.height; ++y)
                     for (uint32_t x = 0; x < size.width; ++x)
                     {
-                        const size_t i = (static_cast<size_t>(y) * kPictureWidth + x) * 4u;
+                        const size_t i = (static_cast<size_t>(y) * s.pictureW + x) * 4u;
                         int worst = 0, worst2 = 0;
                         for (int c = 0; c < 3; ++c)
                         {
@@ -609,7 +650,7 @@ bool GSGpuPresenter::Download(std::vector<uint8_t> &rgba)
     Impl &s = *m_impl;
     if (!s.ready)
         return false;
-    const size_t bytes = static_cast<size_t>(kPictureWidth) * kPictureHeight * 4u;
+    const size_t bytes = static_cast<size_t>(s.pictureW) * s.pictureH * 4u;
     SDL_GPUTransferBufferCreateInfo tbi = {};
     tbi.usage = SDL_GPU_TRANSFERBUFFERUSAGE_DOWNLOAD;
     tbi.size = static_cast<Uint32>(bytes);
@@ -621,10 +662,10 @@ bool GSGpuPresenter::Download(std::vector<uint8_t> &rgba)
     SDL_GPUCopyPass *copy = SDL_BeginGPUCopyPass(cb);
     SDL_GPUTextureRegion region = {};
     region.texture = s.picture;
-    region.w = kPictureWidth;
-    region.h = kPictureHeight;
+    region.w = s.pictureW;
+    region.h = s.pictureH;
     region.d = 1;
-    SDL_GPUTextureTransferInfo dst = {tb, 0, kPictureWidth, kPictureHeight};
+    SDL_GPUTextureTransferInfo dst = {tb, 0, s.pictureW, s.pictureH};
     SDL_DownloadFromGPUTexture(copy, &region, &dst);
     SDL_EndGPUCopyPass(copy);
     SDL_GPUFence *fence = SDL_SubmitGPUCommandBufferAndAcquireFence(cb);

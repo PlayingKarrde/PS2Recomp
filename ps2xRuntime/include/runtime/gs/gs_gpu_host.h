@@ -7,8 +7,19 @@
 //
 // Environment variables (all read once, at start):
 //   PS2X_GS_BACKEND=cpu|gpu     the GS renderer; cpu is the default and behaves exactly as before.
-//   PS2X_GS_SCALE=1             internal resolution multiplier; only 1 exists so far (other values are
-//                               refused with a log line and 1 is used).
+//   PS2X_GS_SCALE=1..4          internal resolution multiplier N (default 1): the targets are 640N x 448N per field
+//                               (progressive mode), and the picture the host shows is that size, scaled to the window
+//                               with linear filtering. Anything else than 1 to 4 is refused with a log line and 1 is
+//                               used; so is N > 1 with PS2X_GS_FIELDS=weave (the weave is built at scale 1 only) and
+//                               with PS2X_GS_GPU_READBACK=1 (the host's CPU picture is 640x512). Read once at start.
+//   PS2X_GS_SPRITE_SAMPLE=gs|target
+//                               how textured sprites (the game's full-screen backgrounds) are sampled when N > 1: at the
+//                               centre of their GS pixel (the scale-1 picture enlarged) or at each target pixel, with
+//                               bilinear samples held to the two texels the GS pixel's own sample uses (smooth). The
+//                               default is gs at N = 1 and target above.
+//   PS2X_GS_SAMPLE_GRID=corner|centre
+//                               where the target pixels of a scale-1 pixel sample a triangle (gs_gpu_math.h,
+//                               TargetMapping). corner (the default) is the GS's own convention; centre is for measurement.
 //   PS2X_GS_FIELDS=progressive|weave
 //                               how the game's 224-line fields are drawn and shown (GSGpuBackend::FieldMode).
 //                               progressive (the default) draws every field as a 640x448 picture, without the

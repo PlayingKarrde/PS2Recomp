@@ -8,8 +8,9 @@
 //                and says how big the picture will be: the field's size, or twice its height for an
 //                interlaced field, as UploadFrame in ps2_runtime.cpp works it out for the CPU picture.
 //   Record(cb)   records the GPU work that builds the picture into the frame's command buffer, outside any
-//                pass, and returns the 640 x 512 RGBA8 texture that holds it (the picture in its top-left
-//                corner, zero elsewhere, alpha 255 inside it). Interlaced fields go through the same
+//                pass, and returns the RGBA8 texture that holds it (640 x 512 at scale 1; the picture in its top-left
+//                corner, zero elsewhere, alpha 255 inside it; larger at a higher scale, see PictureWidth()).
+//                Interlaced fields go through the same
 //                rules as the CPU deinterlacer (shaders/field_deint.frag.hlsl, field_lower*.frag.hlsl);
 //                other pictures are copied as they are; a marker without a picture gives the magenta
 //                placeholder UploadFrame shows. When Pull took nothing new, Record leaves the texture as it is.
@@ -52,8 +53,8 @@ public:
     SDL_GPUTexture *Record(SDL_GPUCommandBuffer *commandBuffer);
     void Submitted();
 
-    // The picture texture's pixels (kPictureWidth x kPictureHeight RGBA8, as the host's CPU picture is).
-    // Waits for the GPU.
+    // The picture texture's pixels (PictureWidth() x PictureHeight() RGBA8, rows PictureWidth() pixels apart; the host's CPU
+    // picture is the same at scale 1). Waits for the GPU.
     bool Download(std::vector<uint8_t> &rgba);
 
     // For tests: the texture Record draws into.
@@ -63,8 +64,14 @@ public:
     // made (the column sums added up) and the answer it gave. False when there was no such measurement.
     bool DebugDecision(uint64_t &lowerSum, uint64_t &upperSum, bool &lower);
 
+    // The picture texture holds kPictureWidth x kPictureHeight texels at scale 1 and that times the backend's scale above
+    // (GSGpuBackend::PictureStride() / PictureRows()): in progressive mode the picture itself is 640 x 448 times the scale.
     static constexpr uint32_t kPictureWidth = 640;
     static constexpr uint32_t kPictureHeight = 512;
+    uint32_t PictureWidth() const;
+    uint32_t PictureHeight() const;
+    // GPU memory the presenter's own textures take, in bytes.
+    uint64_t MemoryBytes() const;
 
 private:
     struct Impl;

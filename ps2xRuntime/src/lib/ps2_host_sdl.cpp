@@ -311,10 +311,11 @@ namespace ps2x_host
         // one real picture be captured and then shown by either presenter in a later run:
         //   PS2X_PRESENT_DUMP=<file>   when the file <file>.go exists, write the picture being shown (the
         //                              top-left srcWidth x srcHeight part of the picture texture, its shape,
-        //                              and all 640 x 512 RGBA pixels) to <file>, and delete <file>.go
-        //   PS2X_PRESENT_FRAME=<file>  ignore the game's pictures and show the one in <file> instead
+        //                              and all pixels of the texture) to <file>, and delete <file>.go
+        //   PS2X_PRESENT_FRAME=<file>  ignore the game's pictures and show the one in <file> instead (640 x 512 files only)
         // The file is: "PS2XPIC1", then little-endian uint32 srcWidth, srcHeight, float aspect, uint32 width, height
-        // (always 640, 512), then width x height x 4 RGBA bytes. Nothing else uses them.
+        // (640, 512; with the GS GPU renderer at an internal resolution above 1 that times the scale), then width x height x 4
+        // RGBA bytes. Nothing else uses them.
 
         struct PictureHooks
         {
@@ -374,8 +375,12 @@ namespace ps2x_host
             std::FILE *file = std::fopen(g_pictureHooks.dumpPath.c_str(), "wb");
             if (!file)
                 return;
+            // The texture the picture sits in: kPictureWidth x kPictureHeight, or with the GS GPU renderer at a higher internal
+            // resolution that times its scale (the pixels are then that many rows of that many pixels).
+            int textureWidth = kPictureWidth, textureHeight = kPictureHeight;
+            gpu_present::pictureTextureSize(textureWidth, textureHeight);
             const uint32_t header[5] = {static_cast<uint32_t>(srcWidth), static_cast<uint32_t>(srcHeight), 0u,
-                                        static_cast<uint32_t>(kPictureWidth), static_cast<uint32_t>(kPictureHeight)};
+                                        static_cast<uint32_t>(textureWidth), static_cast<uint32_t>(textureHeight)};
             uint32_t withAspect[5];
             std::memcpy(withAspect, header, sizeof(withAspect));
             std::memcpy(&withAspect[2], &aspect, sizeof(float));

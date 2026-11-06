@@ -60,21 +60,23 @@ cbuffer Params : register(b0, space3)
     uint4 Mode; // x: 0 deinterlace, 1 copy the field as a progressive picture
 };
 
-static const float2 kInvSize = float2(1.0f / 640.0f, 1.0f / 512.0f); // the field textures are 640 x 512
+// The field textures are 640 x 512 texels times the renderer's scale (the deinterlacer itself only runs at scale 1; a higher
+// scale takes mode 1, the copy). All the textures are of one size.
+static float2 gInvSize;
 
 uint3 fetchCur(int2 p)
 {
-    return (uint3)round(Cur.SampleLevel(CurSamp, (float2(p) + 0.5f) * kInvSize, 0.0f).rgb * 255.0f);
+    return (uint3)round(Cur.SampleLevel(CurSamp, (float2(p) + 0.5f) * gInvSize, 0.0f).rgb * 255.0f);
 }
 
 uint3 fetchPrev(int2 p)
 {
-    return (uint3)round(Prev.SampleLevel(PrevSamp, (float2(p) + 0.5f) * kInvSize, 0.0f).rgb * 255.0f);
+    return (uint3)round(Prev.SampleLevel(PrevSamp, (float2(p) + 0.5f) * gInvSize, 0.0f).rgb * 255.0f);
 }
 
 uint3 fetchOlder(int2 p)
 {
-    return (uint3)round(Older.SampleLevel(OlderSamp, (float2(p) + 0.5f) * kInvSize, 0.0f).rgb * 255.0f);
+    return (uint3)round(Older.SampleLevel(OlderSamp, (float2(p) + 0.5f) * gInvSize, 0.0f).rgb * 255.0f);
 }
 
 // The largest colour-channel difference between the newest field and the older one at this pixel.
@@ -87,6 +89,9 @@ uint motionAt(int2 p)
 float4 main(PSInput input) : SV_Target0
 {
     const float4 position = input.Position;
+    uint textureWidth, textureHeight;
+    Cur.GetDimensions(textureWidth, textureHeight);
+    gInvSize = float2(1.0f / (float)textureWidth, 1.0f / (float)textureHeight);
     const int x = (int)position.x;
     const int row = (int)position.y;
     const int width = (int)Info.x;

@@ -56,8 +56,11 @@ namespace ps2x_host
     struct PictureSource
     {
         // Records the commands that produce the picture into `commandBuffer` (outside any pass) and returns the
-        // kPictureWidth x kPictureHeight RGBA8 texture to draw (the picture in its top-left corner), or null.
+        // textureWidth x textureHeight RGBA8 texture to draw (the picture in its top-left corner), or null.
         SDL_GPUTexture *(*record)(SDL_GPUCommandBuffer *commandBuffer, void *user) = nullptr;
+        // The size of that texture: kPictureWidth x kPictureHeight at scale 1, that times the scale of the GS renderer above
+        // (internal resolution, GPU renderer M4b). Fixed for as long as the source is set.
+        uint32_t textureWidth = 640, textureHeight = 512;
         // Called after that command buffer was submitted.
         void (*submitted)(void *user) = nullptr;
         // The picture texture's pixels, waiting for the GPU (PS2X_PRESENT_DUMP).
@@ -69,8 +72,10 @@ namespace ps2x_host
     {
         void setPictureSource(const PictureSource &source);
         bool hasPictureSource();
-        // The pixels of the picture texture the source made (kPictureWidth x kPictureHeight RGBA8). False without a source.
+        // The pixels of the picture texture the source made (its textureWidth x textureHeight RGBA8). False without a source.
         bool downloadPicture(std::vector<uint8_t> &rgba);
+        // The size of the picture texture the source makes (kPictureWidth x kPictureHeight without a source).
+        void pictureTextureSize(int &width, int &height);
 
         // Creates the device, claims the window and builds the pipeline. Returns false and fills
         // `failure` (and releases everything it made) when any step fails; the caller then falls back

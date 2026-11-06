@@ -68,9 +68,16 @@ namespace ps2x_gs
         std::unique_ptr<GSRasterBackend> backend;
         if (gpu)
         {
-            if (const char *scale = std::getenv("PS2X_GS_SCALE"))
-                if (std::strcmp(scale, "1") != 0)
-                    std::fprintf(stderr, "[gs] PS2X_GS_SCALE=%s is not supported yet (only 1), using 1\n", scale);
+            uint32_t scale = 1;
+            if (const char *wantedScale = std::getenv("PS2X_GS_SCALE"))
+            {
+                char *end = nullptr;
+                const long value = std::strtol(wantedScale, &end, 10);
+                if (end != wantedScale && *end == '\0' && value >= 1 && value <= 4)
+                    scale = static_cast<uint32_t>(value);
+                else
+                    std::fprintf(stderr, "[gs] PS2X_GS_SCALE=%s is not a whole number from 1 to 4, using 1\n", wantedScale);
+            }
             g.fields = GSGpuBackend::FieldMode::Progressive;
             if (const char *fields = std::getenv("PS2X_GS_FIELDS"))
             {
@@ -79,6 +86,17 @@ namespace ps2x_gs
                 else if (std::strcmp(fields, "progressive") != 0)
                     std::fprintf(stderr, "[gs] PS2X_GS_FIELDS=%s is not progressive or weave, using progressive\n", fields);
             }
+            g.readback = envFlag("PS2X_GS_GPU_READBACK");
+            if (scale > 1 && g.fields == GSGpuBackend::FieldMode::Weave)
+            {
+                std::fprintf(stderr, "[gs] PS2X_GS_FIELDS=weave draws at scale 1 only (PS2X_GS_SCALE=%u asked for), using 1\n", scale);
+                scale = 1;
+            }
+            if (scale > 1 && g.readback)
+            {
+                std::fprintf(stderr, "[gs] PS2X_GS_GPU_READBACK=1 (path A) carries the host's 640x512 CPU picture only (PS2X_GS_SCALE=%u asked for), using 1\n", scale);
+                scale = 1;
+            }
             SDL_GPUDevice *device = ps2x_host::gpuDevice();
             if (!device)
             {
@@ -86,14 +104,13 @@ namespace ps2x_gs
             }
             else
             {
-                auto candidate = std::make_unique<GSGpuBackend>(device, 1, g.fields);
+                auto candidate = std::make_unique<GSGpuBackend>(device, scale, g.fields);
                 if (!candidate->Ready())
                 {
                     say("[gs] the GPU renderer could not be set up (see above); keeping the CPU renderer");
                 }
                 else
                 {
-                    g.readback = envFlag("PS2X_GS_GPU_READBACK");
                     bool direct = false;
                     // Both paths take the picture from the field copies the GS thread makes at each VBlank.
                     const bool fieldsOk = candidate->SetFieldPublishing(true);
@@ -107,6 +124,8 @@ namespace ps2x_gs
                             candidate->SetFieldPublishing(true, true); // the host takes the fields itself
                             ps2x_host::PictureSource source;
                             source.record = recordPicture;
+                            source.textureWidth = g.presenter->PictureWidth();
+                            source.textureHeight = g.presenter->PictureHeight();
                             source.submitted = pictureSubmitted;
                             source.download = downloadPicture;
                             ps2x_host::gpu_present::setPictureSource(source);
@@ -125,7 +144,7 @@ namespace ps2x_gs
                         g.backend = candidate.get();
                     char line[384];
                     const bool progressive = g.fields == GSGpuBackend::FieldMode::Progressive;
-                    std::snprintf(line, sizeof(line), "[gs] GS renderer: gpu, scale 1, fields %s, %s, SDL_GPU driver %s",
+                    std::snprintf(line, sizeof(line), "[gs] GS renderer: gpu, scale %u, fields %s, %s, SDL_GPU driver %s", scale,
                                   progressive ? "progressive (each field drawn as a 640x448 picture, newest field shown)" : "weave (fields woven into 448 lines)",
                                   direct ? (progressive ? "path B (direct: field textures on the GPU, no readback)"
                                                         : "path B (direct: field textures on the GPU, deinterlaced in a shader, no readback)")

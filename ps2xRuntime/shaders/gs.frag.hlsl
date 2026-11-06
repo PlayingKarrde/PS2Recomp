@@ -38,7 +38,8 @@ cbuffer Draw : register(b0, space3)
     uint4 Flags;    // x: bit0 textured, bit1 coordinates are texels (UV or sprite) rather than S,T,Q,
                     //    bit2 bilinear, bit3 TCC (texture alpha used), bits 4-5 TFX, bit6 alpha test on,
                     //    bit7 round texel coordinates to 1/16 (sprite with UV), bit8 truncate them (triangle with UV),
-                    //    bit9 sample at the centre of the GS pixel (a sprite on a target larger than the GS frame)
+                    //    bit9 sample at the centre of the GS pixel (a sprite on a target larger than the GS frame),
+                    //    bit10 (with bit9) sample at the target pixel after all, bilinear taps held to the GS pixel's own two texels
                     // y: target rows per GS pixel, z: target columns per GS pixel (used with bit9)
     uint4 Wrap;     // x: WMS, y: WMT, z: MINU | MAXU << 16, w: MINV | MAXV << 16 (REGION modes)
     uint4 Test;     // x: ATST, y: AREF, z: blend coefficient (0 = source alpha, 1 = FIX), w: FIX
@@ -103,20 +104,35 @@ float4 main(PSInput input) : SV_Target0
             if ((Flags.x & 512u) != 0u)
             {
                 // A sprite covers whole GS pixels and the GS samples its texture once per pixel, at the pixel's centre. On a
-                // larger target a GS pixel is several target pixels (progressive field mode: two rows), and sampling each at
-                // its own centre would use other texel positions than the GS does: half-texel steps in a magnified or
-                // minified sprite, and a vertical blur in a bilinear one. So every target pixel takes the texel
-                // coordinates the centre of its GS pixel has. The coordinates are linear in the target position, so that is
-                // the coordinate here plus the distance to that centre times the rate of change.
+                // larger target a GS pixel is several target pixels (progressive field mode: two rows, and at a higher scale
+                // N columns and 2N rows), and sampling each at its own centre would use other texel positions than the GS
+                // does: half-texel steps in a magnified or minified sprite, and a vertical blur in a bilinear one. So every
+                // target pixel takes the texel coordinates the centre of its GS pixel has. The coordinates are linear in the
+                // target position, so that is the coordinate here plus the distance to that centre times the rate of change.
+                float uGs = u, vGs = v;
                 if (Flags.y > 1u)
                 {
                     const float scaleY = (float)Flags.y;
-                    v += ((floor(input.Position.y / scaleY) + 0.5f) * scaleY - input.Position.y) * dvdy;
+                    vGs += ((floor(input.Position.y / scaleY) + 0.5f) * scaleY - input.Position.y) * dvdy;
                 }
                 if (Flags.z > 1u)
                 {
                     const float scaleX = (float)Flags.z;
-                    u += ((floor(input.Position.x / scaleX) + 0.5f) * scaleX - input.Position.x) * dudx;
+                    uGs += ((floor(input.Position.x / scaleX) + 0.5f) * scaleX - input.Position.x) * dudx;
+                }
+                if ((Flags.x & 1024u) == 0u)
+                {
+                    u = uGs;
+                    v = vGs;
+                }
+                else if ((Flags.x & 4u) != 0u)
+                {
+                    // Sampled at the target pixel (u, v stay), but a bilinear sample is held to the two texels per axis that the
+                    // GS pixel's centre would have blended (floor(c - 0.5) and the next), so that the finer sampling does not
+                    // reach into neighbouring texels at the edge of the sprite's texels.
+                    const float fu = floor(uGs - 0.5f), fv = floor(vGs - 0.5f);
+                    u = clamp(u, fu + 0.5f, fu + 1.5f);
+                    v = clamp(v, fv + 0.5f, fv + 1.5f);
                 }
             }
         }

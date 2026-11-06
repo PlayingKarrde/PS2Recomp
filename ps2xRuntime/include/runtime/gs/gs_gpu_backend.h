@@ -123,6 +123,13 @@ public:
         uint64_t signaturesLive = 0;      // entries of the texture signature map now (not cleared by ResetStats)
         uint64_t textureBytesLive = 0;    // bytes of cached GPU textures now (not cleared by ResetStats)
         uint64_t texturePoolBytes = 0;    // bytes of evicted GPU textures kept for reuse now (not cleared by ResetStats)
+        // GPU memory the render path holds now, in bytes (not cleared by ResetStats). With the texture cache above these make
+        // up the backend's share; the host's presenter has its own textures (GSGpuPresenter::MemoryBytes).
+        uint64_t frameTargetBytes = 0;    // colour targets
+        uint64_t depthTargetBytes = 0;
+        uint64_t fieldTextureBytes = 0;   // the field ring
+        uint64_t uploadBufferBytes = 0;   // the transfer buffer that stages uploads (host-visible memory)
+        uint64_t vertexBufferBytes = 0;
     };
 
     // One field published by the GS thread for the host (path B). A field uses one slot for the displayed
@@ -175,8 +182,9 @@ public:
         bool usedPreferred = false;
     };
 
-    // `scale` multiplies the render target size (the game uses 1; only 1 has been exercised). `fields` says how the
-    // game's field pictures are drawn and shown (see "Field modes" above); weave is the M3 behaviour.
+    // `scale` multiplies the render target size (internal resolution, task g4b): 1 to 4 have been exercised, and weave mode
+    // only draws at 1 (a larger scale is refused with a log line and 1 is used). `fields` says how the game's field pictures
+    // are drawn and shown (see "Field modes" above); weave is the M3 behaviour.
     GSGpuBackend(SDL_GPUDevice *device, uint32_t scale = 1, FieldMode fields = FieldMode::Weave);
     ~GSGpuBackend() override;
     GSGpuBackend(const GSGpuBackend &) = delete;
@@ -189,6 +197,11 @@ public:
     // Target pixels per GS pixel along each axis: the scale in X, and in Y twice that in progressive mode.
     uint32_t TargetScaleX() const;
     uint32_t TargetScaleY() const;
+    // The pictures of the field textures and of Present() when fields are published: 640 x 512 texels times the scale (the
+    // picture is 640 x 448 times the scale in progressive mode; rows are PictureStride() pixels apart). Without field
+    // publishing Present() returns GS-pixel pictures, 640 pixels per row (kPresentationStride).
+    uint32_t PictureStride() const;
+    uint32_t PictureRows() const;
 
     void Initialize(uint8_t *vram, uint32_t vramSize) override;
     void Reset() override;

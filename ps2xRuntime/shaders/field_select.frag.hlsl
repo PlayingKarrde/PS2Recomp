@@ -47,11 +47,13 @@ cbuffer Params : register(b0, space3)
     uint4 Info; // x: width, y: height, z: number of fallback pictures (0, 1 or 2)
 };
 
-static const float2 kInvSize = float2(1.0f / 640.0f, 1.0f / 512.0f);
-
 float4 main(PSInput input) : SV_Target0
 {
     const float4 position = input.Position;
+    // The field textures are 640 x 512 texels times the renderer's scale (all of one size).
+    uint textureWidth, textureHeight;
+    Pic0.GetDimensions(textureWidth, textureHeight);
+    const float2 kInvSize = float2(1.0f / (float)textureWidth, 1.0f / (float)textureHeight);
     const float2 uv = (floor(position.xy) + 0.5f) * kInvSize;
     float3 rgb = Pic0.SampleLevel(Samp0, uv, 0.0f).rgb;
     if (Info.z != 0u)

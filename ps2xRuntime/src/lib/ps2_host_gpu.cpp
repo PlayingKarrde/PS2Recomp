@@ -208,7 +208,10 @@ namespace ps2x_host
                 params.texelSize[1] = 1.0f / static_cast<float>(sourceHeight);
                 params.texelSize[2] = static_cast<float>(sourceWidth);
                 params.texelSize[3] = static_cast<float>(sourceHeight);
-                params.mode[0] = g.scale == ScaleMode::Sharp ? 1.0f : 0.0f;
+                // The pixel-art filter makes a low-resolution picture crisp when it is enlarged. A picture at a higher internal
+                // resolution (GPU renderer M4b) is shown with plain linear filtering, as the filter only widens its blend
+                // zones when the window is smaller than the picture.
+                params.mode[0] = (g.scale == ScaleMode::Sharp && sourceWidth <= kPictureWidth) ? 1.0f : 0.0f;
 
                 SDL_BindGPUGraphicsPipeline(pass, g.pipeline);
                 SDL_PushGPUVertexUniformData(commandBuffer, 0, &place, sizeof(place));
@@ -259,6 +262,12 @@ namespace ps2x_host
         bool downloadPicture(std::vector<uint8_t> &rgba)
         {
             return g.source.download && g.source.download(g.source.user, rgba);
+        }
+
+        void pictureTextureSize(int &width, int &height)
+        {
+            width = g.source.record ? static_cast<int>(g.source.textureWidth) : kPictureWidth;
+            height = g.source.record ? static_cast<int>(g.source.textureHeight) : kPictureHeight;
         }
 
         bool create(SDL_Window *window, ScaleMode scale, std::string &failure)
@@ -351,6 +360,7 @@ namespace ps2x_host
             sampler.address_mode_u = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
             sampler.address_mode_v = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
             sampler.address_mode_w = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
+            sampler.max_lod = 16.0f; // the picture of the GS GPU renderer at a higher scale has mip levels (the CPU picture has one)
             g.sampler = SDL_CreateGPUSampler(g.device, &sampler);
             if (!g.sampler)
                 return fail(failure, "SDL_CreateGPUSampler");
@@ -506,7 +516,11 @@ namespace ps2x_host
                 swapchain = nullptr;
             }
             if (swapchain && width != 0 && height != 0)
-                recordBlit(commandBuffer, swapchain, width, height, picture, kPictureWidth, kPictureHeight);
+            {
+                const int textureWidth = g.source.record ? static_cast<int>(g.source.textureWidth) : kPictureWidth;
+                const int textureHeight = g.source.record ? static_cast<int>(g.source.textureHeight) : kPictureHeight;
+                recordBlit(commandBuffer, swapchain, width, height, picture, textureWidth, textureHeight);
+            }
 
             const bool submitted = SDL_SubmitGPUCommandBuffer(commandBuffer);
             window.Unlock();

@@ -39,12 +39,14 @@ cbuffer Params : register(b0, space3)
 float4 main(PSInput input) : SV_Target0
 {
     const float4 position = input.Position;
+    uint countsWidth, countsHeight;
+    Counts.GetDimensions(countsWidth, countsHeight); // one texel per picture column: 640 times the renderer's scale
     uint total0 = 0u;
     uint total1 = 0u;
     uint total2 = 0u;
     for (uint c = 0u; c < Info.x; ++c)
     {
-        const float3 counts = Counts.SampleLevel(CountsSamp, float2(((float)c + 0.5f) / 640.0f, 0.5f), 0.0f).rgb;
+        const float3 counts = Counts.SampleLevel(CountsSamp, float2(((float)c + 0.5f) / (float)countsWidth, 0.5f), 0.0f).rgb;
         total0 += (uint)(counts.x + 0.5f);
         total1 += (uint)(counts.y + 0.5f);
         total2 += (uint)(counts.z + 0.5f);

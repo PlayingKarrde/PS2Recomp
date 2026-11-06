@@ -44,26 +44,30 @@ cbuffer Params : register(b0, space3)
     uint4 Info; // x: width, y: height, z: number of fallback pictures (0, 1 or 2)
 };
 
-static const float2 kInvSize = float2(1.0f / 640.0f, 1.0f / 512.0f);
+// The pictures are field textures, 640 x 512 texels times the renderer's scale; one texel is one step of the loop below.
+static float2 gInvSize;
 
 bool nonBlack0(int x, int y)
 {
-    return any(Pic0.SampleLevel(Samp0, (float2(x, y) + 0.5f) * kInvSize, 0.0f).rgb > 0.0f);
+    return any(Pic0.SampleLevel(Samp0, (float2(x, y) + 0.5f) * gInvSize, 0.0f).rgb > 0.0f);
 }
 
 bool nonBlack1(int x, int y)
 {
-    return any(Pic1.SampleLevel(Samp1, (float2(x, y) + 0.5f) * kInvSize, 0.0f).rgb > 0.0f);
+    return any(Pic1.SampleLevel(Samp1, (float2(x, y) + 0.5f) * gInvSize, 0.0f).rgb > 0.0f);
 }
 
 bool nonBlack2(int x, int y)
 {
-    return any(Pic2.SampleLevel(Samp2, (float2(x, y) + 0.5f) * kInvSize, 0.0f).rgb > 0.0f);
+    return any(Pic2.SampleLevel(Samp2, (float2(x, y) + 0.5f) * gInvSize, 0.0f).rgb > 0.0f);
 }
 
 float4 main(PSInput input) : SV_Target0
 {
     const float4 position = input.Position;
+    uint textureWidth, textureHeight;
+    Pic0.GetDimensions(textureWidth, textureHeight);
+    gInvSize = float2(1.0f / (float)textureWidth, 1.0f / (float)textureHeight);
     const int x = (int)position.x;
     if (x >= (int)Info.x)
         return float4(0.0f, 0.0f, 0.0f, 0.0f);

@@ -69,21 +69,39 @@ namespace GSGpu
     // How GS pixels map to target pixels: `sx` and `sy` target pixels per GS pixel along each axis.
     //
     // Weave mode (progressive == false) draws each of the game's 640 x 224 fields as it is, at `scale` times that size
-    // (sx == sy == scale), and a later pass weaves the fields into 448 lines.
+    // (sx == sy == scale), and a later pass weaves the fields into 448 lines. The weave picture is only built at scale 1.
     //
     // Progressive mode draws every field as a full-height picture: the target is twice as tall (sy == 2 * scale) and the
     // two kinds of field of the game come out identical, which needs one thing here. The game draws alternate fields with
     // the XYOFFSET Y offset (OFY) half a line apart (1936.0 and 1936.5; bringup.md "GPU renderer", M4a) and sends the same
     // vertices in both. The fraction of OFY is the half line, so it is dropped: a field then has the geometry of the
     // first kind of field, and the second kind's half-line lower sampling grid becomes the odd lines of the target.
-    // That is the 448-line grid a TV lays the two fields on, so the sample of target row j is at GS position j / sy
-    // (rows 2k and 2k+1 sample the field at y = k and y = k + 1/2), where weave mode samples target pixel centres.
+    //
+    // The sample grid. The GS samples a primitive at integer positions and a pixel x shows the sample at x, so a GS
+    // coordinate is a pixel's top-left corner (a sprite from x0 to x1 covers the pixels x0 .. x1 - 1, and a triangle with
+    // its left edge at e covers x >= e). A larger target keeps that convention: target pixel X (row J) samples the primitive at
+    // GS position X / sx (and J / sy, which in progressive mode is the 448-line grid a TV lays the fields on: rows 2k and
+    // 2k + 1 sample the field at y = k and y = k + 1/2). The same rule serves both axes and every scale:
+    //   - at scale 1 it is the pixel-centre shift this file always had (vertex + 0.5, so that the GPU, which samples at
+    //     pixel centres, takes the sample at the corner), and the pictures are bit-for-bit the earlier ones;
+    //   - a triangle edge lands on the same target pixel boundary as a sprite edge at the same GS coordinate (coverage
+    //     starts at X >= sx * e), so 3D and 2D parts do not move against each other;
+    //   - a texture that is sampled nearest and shown 1:1 is the scale-1 picture with every texel repeated sx times, as the
+    //     samples X / sx for X = sx * x .. sx * x + sx - 1 all lie in the texel of pixel x.
+    // The price is that a block of sx x sy target pixels samples positions x .. x + (sx-1)/sx, so its average is
+    // (sx-1)/(2 sx) of a scale-1 pixel (a quarter at 2, three eighths at 4) further down and to the right than the scale-1
+    // pixel's own sample. Content with gradients, bilinear textures and edges therefore shows that sub-pixel difference when
+    // a scaled picture is averaged down and compared with the scale-1 picture. `centred` puts the sample of a block's
+    // pixels around the scale-1 sample instead (X samples (X - (sx-1)/2) / sx), which removes that difference but halves
+    // nearest texels at the edges of every pixel block and moves triangles half a block against sprites. It exists for
+    // measurement (PS2X_GS_SAMPLE_GRID=centre); the corner rule is the default.
     // Sprites need no such step: their coordinates are truncated to whole pixels (BuildSprite), which already ignores
-    // the fraction of OFY.
+    // the fraction of OFY, and they cover the block of target pixels of each GS pixel they cover.
     struct TargetMapping
     {
         uint32_t sx = 1, sy = 1;
         bool progressive = false;
+        bool centred = false;
     };
 
     // TRIANGLE / TRISTRIP / TRIFAN: the batch holds one triangle. Returns false for a triangle with no
@@ -106,6 +124,12 @@ namespace GSGpu
 
         const float fscaleX = static_cast<float>(map.sx);
         const float fscaleY = static_cast<float>(map.sy);
+        // One scale-1 pixel is a block of blockX x blockY target pixels (in progressive mode a block row is one line of the
+        // 448-line grid, half a GS row).
+        const float blockX = fscaleX;
+        const float blockY = map.progressive ? fscaleY * 0.5f : fscaleY;
+        const float offsetX = map.centred ? blockX * 0.5f : 0.5f;
+        const float offsetY = map.centred ? blockY * 0.5f : 0.5f;
         float fx[3], fy[3];
         for (int i = 0; i < 3; ++i)
         {
@@ -123,10 +147,10 @@ namespace GSGpu
         {
             const GSVertex &src = batch.vertices[static_cast<size_t>(i)];
             Vertex &dst = out.v[i];
-            // The GS samples at integer positions; the GPU at pixel centres, half a pixel further. In progressive
-            // mode the rows of the target are the lines of the 448-line grid, which sample at j / sy (TargetMapping).
-            dst.x = (fx[i] + 0.5f) * fscaleX;
-            dst.y = map.progressive ? fy[i] * fscaleY + 0.5f : (fy[i] + 0.5f) * fscaleY;
+            // The GS samples at integer positions (pixel corners); the GPU at pixel centres, half a target pixel further, so
+            // target pixel X takes the sample at GS position X / sx and row J the one at J / sy (see TargetMapping).
+            dst.x = fx[i] * fscaleX + offsetX;
+            dst.y = fy[i] * fscaleY + offsetY;
             dst.z = static_cast<float>(src.z * static_cast<double>(kDepthScale));
             const GSVertex &colour = state.prim.iip ? src : last; // flat shading takes the last vertex
             dst.rgba = PackRgba(colour.r, colour.g, colour.b, colour.a);
@@ -333,12 +357,17 @@ namespace GSGpu
     constexpr uint32_t kFlagQuantizeFloor = 1u << 8; // truncated to 1/16 (a triangle with UV: the GS interpolates 12.4 fixed point)
     // A sprite on a target larger than the GS frame (flags[1] target rows and flags[2] target columns per GS pixel): the shader
     // samples the texture at the centre of the GS pixel the target pixel belongs to, like the GS does, instead of at the
-    // target pixel's own centre. See gs.frag.hlsl.
+    // target pixel's own centre. See gs.frag.hlsl. The picture is then the scale-1 picture with every GS pixel repeated.
     constexpr uint32_t kFlagSnapToGsPixel = 1u << 9;
+    // With kFlagSnapToGsPixel set: sample at the target pixel after all (the texture is shown at the finer resolution, a
+    // magnified bilinear sprite comes out smooth), but keep a bilinear sample on the two texels (per axis) that the GS pixel's
+    // own sample would have used, so the finer sampling does not reach new neighbours at the edge of a sprite's texture area.
+    constexpr uint32_t kFlagSpriteAtTarget = 1u << 10;
 
     // `snapX` and `snapY` are the target pixels per GS pixel along each axis for a sprite (0 or 1: no snapping, see
-    // kFlagSnapToGsPixel); other primitives pass 0.
-    inline FragUniforms BuildFragUniforms(const GSDrawState &state, bool texelCoords, bool blendUsesFix, uint32_t snapX = 0u, uint32_t snapY = 0u)
+    // kFlagSnapToGsPixel); other primitives pass 0. `spriteAtTarget` selects kFlagSpriteAtTarget for a snapped sprite.
+    inline FragUniforms BuildFragUniforms(const GSDrawState &state, bool texelCoords, bool blendUsesFix, uint32_t snapX = 0u, uint32_t snapY = 0u,
+                                          bool spriteAtTarget = false)
     {
         FragUniforms u;
         std::memset(&u, 0, sizeof(u));
@@ -359,6 +388,8 @@ namespace GSGpu
             if (texelCoords && (snapX > 1u || snapY > 1u))
             {
                 u.flags[0] |= kFlagSnapToGsPixel;
+                if (spriteAtTarget)
+                    u.flags[0] |= kFlagSpriteAtTarget;
                 u.flags[1] = snapY;
                 u.flags[2] = snapX;
             }
