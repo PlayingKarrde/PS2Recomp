@@ -60,6 +60,19 @@ namespace ps2x_host
             GpuOverlay overlay;
             PictureSource source; // set: the picture comes from the GS GPU renderer's texture, not from stagePicture()
             bool loggedProblem = false;
+
+            // Task g5: the window command buffer acquires the swapchain texture before it takes the Vulkan defragmentation
+            // guard (gs_gpu_threads.h). PS2X_GPU_ACQUIRE_FIRST=0 restores the old order (guard held across the acquire).
+            bool acquireFirst = true;
+            // PS2X_GPU_GUARD_STATS=1: once a second, how long the swapchain acquire blocked and how long each thread waited
+            // for and held the guard.
+            bool guardStats = false;
+            // PS2X_TEST_ACQUIRE_DELAY_MS=<n>: sleep n ms after every swapchain acquire, imitating a driver whose acquire
+            // blocks until the display has freed an image (FIFO/vsync-only drivers: Wayland, Android).
+            uint32_t testAcquireDelayMs = 0;
+            uint64_t statsLastNs = 0, statsFrames = 0, statsAcquireNs = 0, statsAcquireMaxNs = 0, statsPresentNs = 0, statsPresentMaxNs = 0;
+            // where present() spends its time (ms summed per second): waiting for the guard, recording the picture and the overlay, the blit, the submit
+            uint64_t statsLockNs = 0, statsRecordNs = 0, statsBlitNs = 0, statsSubmitNs = 0;
         };
         Presenter g;
 
@@ -108,6 +121,32 @@ namespace ps2x_host
         {
             const char *value = std::getenv(name);
             return value && value[0] == '0';
+        }
+
+        uint64_t nowNs()
+        {
+            return ps2x_gs::guardNowNs();
+        }
+
+        // PS2X_GPU_PRESENT_MODE=immediate|mailbox|vsync asks for a present mode (a test hook: a driver that offers only
+        // vsync, the usual case on Linux/Wayland and Android, can be imitated on a desktop GPU).
+        bool presentModeFromEnv(SDL_GPUPresentMode &mode)
+        {
+            const char *value = std::getenv("PS2X_GPU_PRESENT_MODE");
+            if (!value || !value[0])
+                return false;
+            if (std::strcmp(value, "immediate") == 0)
+                mode = SDL_GPU_PRESENTMODE_IMMEDIATE;
+            else if (std::strcmp(value, "mailbox") == 0)
+                mode = SDL_GPU_PRESENTMODE_MAILBOX;
+            else if (std::strcmp(value, "vsync") == 0)
+                mode = SDL_GPU_PRESENTMODE_VSYNC;
+            else
+            {
+                std::fprintf(stderr, "[host] PS2X_GPU_PRESENT_MODE=%s is not immediate, mailbox or vsync, ignored\n", value);
+                return false;
+            }
+            return true;
         }
 
         // Reasons are collected into one string, which the caller prints with the fallback notice.
@@ -277,6 +316,12 @@ namespace ps2x_host
             g.scale = scale;
             g.debugMode = envFlag("PS2X_GPU_DEBUG");
             ps2x_gs::debugPassSerialization().store(g.debugMode); // the GS thread and this one both record render passes
+            ps2x_gs::guardThreadIsMain() = true; // this is the host's main thread (for PS2X_GPU_GUARD_STATS)
+            g.acquireFirst = !envOff("PS2X_GPU_ACQUIRE_FIRST");
+            g.guardStats = envFlag("PS2X_GPU_GUARD_STATS");
+            if (const char *delay = std::getenv("PS2X_TEST_ACQUIRE_DELAY_MS"))
+                g.testAcquireDelayMs = static_cast<uint32_t>(std::max(0, std::atoi(delay)));
+            ps2x_gs::defragGuardStatsEnabled().store(g.guardStats);
 
             // All three shader formats are allowed so SDL can pick whichever driver the machine has: Vulkan
             // takes SPIR-V, Direct3D 12 takes DXIL, Metal takes MSL. SDL_GPU_DRIVER (SDL_HINT_GPU_DRIVER)
@@ -304,7 +349,10 @@ namespace ps2x_host
 
             // The host loop paces itself at 60 Hz, so the swapchain must not also wait for the display:
             // immediate if the window can do it, else mailbox, else vsync (always available).
-            if (SDL_WindowSupportsGPUPresentMode(g.device, window, SDL_GPU_PRESENTMODE_IMMEDIATE))
+            SDL_GPUPresentMode forced = SDL_GPU_PRESENTMODE_VSYNC;
+            if (presentModeFromEnv(forced) && (forced == SDL_GPU_PRESENTMODE_VSYNC || SDL_WindowSupportsGPUPresentMode(g.device, window, forced)))
+                g.presentMode = forced;
+            else if (SDL_WindowSupportsGPUPresentMode(g.device, window, SDL_GPU_PRESENTMODE_IMMEDIATE))
                 g.presentMode = SDL_GPU_PRESENTMODE_IMMEDIATE;
             else if (SDL_WindowSupportsGPUPresentMode(g.device, window, SDL_GPU_PRESENTMODE_MAILBOX))
                 g.presentMode = SDL_GPU_PRESENTMODE_MAILBOX;
@@ -410,6 +458,7 @@ namespace ps2x_host
             }
             ps2x_gs::debugPassSerialization().store(false);
             ps2x_gs::defragGuardEnabled().store(false);
+            ps2x_gs::defragGuardStatsEnabled().store(false);
             g = Presenter{};
         }
 
@@ -469,11 +518,58 @@ namespace ps2x_host
             g.boxAspect = aspect;
         }
 
+        void printGuardStats()
+        {
+            const uint64_t now = nowNs();
+            if (g.statsLastNs == 0)
+            {
+                g.statsLastNs = now;
+                return;
+            }
+            if (now - g.statsLastNs < 1000000000ull)
+                return;
+            const double seconds = static_cast<double>(now - g.statsLastNs) / 1e9;
+            const double frames = static_cast<double>(std::max<uint64_t>(g.statsFrames, 1));
+            uint64_t cur[2][6];
+            for (int role = 0; role < 2; ++role)
+            {
+                ps2x_gs::GuardRoleStats &r = ps2x_gs::guardStats(role == 1);
+                cur[role][0] = r.acquisitions.exchange(0);
+                cur[role][1] = r.waits.exchange(0);
+                cur[role][2] = r.waitNs.exchange(0);
+                cur[role][3] = r.waitMaxNs.exchange(0);
+                cur[role][4] = r.holdNs.exchange(0);
+                cur[role][5] = r.holdMaxNs.exchange(0);
+            }
+            // gs / main: acquisitions per second, how many had to wait, wait ms per second (and per presented frame), the worst
+            // wait, ms per second the guard was held, the longest hold
+            std::fprintf(stderr,
+                         "[gpu:guard] t=%.1fs present-mode=%s acquire-first=%d frames=%llu | swapchain acquire avg %.3f max %.3f ms, present() avg %.3f max %.3f ms"
+                         " | gs: acq %.0f/s waited %.0f/s wait %.3f ms/s (%.3f ms/frame) max %.3f ms, hold %.2f ms/s max %.3f ms"
+                         " | main: acq %.0f/s waited %.0f/s wait %.3f ms/s max %.3f ms, hold %.2f ms/s max %.3f ms\n",
+                         static_cast<double>(SDL_GetTicksNS()) / 1e9, presentModeName(g.presentMode), g.acquireFirst ? 1 : 0, static_cast<unsigned long long>(g.statsFrames),
+                         static_cast<double>(g.statsAcquireNs) / 1e6 / frames, static_cast<double>(g.statsAcquireMaxNs) / 1e6,
+                         static_cast<double>(g.statsPresentNs) / 1e6 / frames, static_cast<double>(g.statsPresentMaxNs) / 1e6,
+                         cur[0][0] / seconds, cur[0][1] / seconds, cur[0][2] / 1e6 / seconds, cur[0][2] / 1e6 / frames, cur[0][3] / 1e6,
+                         cur[0][4] / 1e6 / seconds, cur[0][5] / 1e6,
+                         cur[1][0] / seconds, cur[1][1] / seconds, cur[1][2] / 1e6 / seconds, cur[1][3] / 1e6, cur[1][4] / 1e6 / seconds, cur[1][5] / 1e6);
+            std::fprintf(stderr, "[gpu:present-phases] ms per frame: guard wait %.3f, record picture+overlay %.3f, blit %.3f, submit %.3f\n",
+                         static_cast<double>(g.statsLockNs) / 1e6 / frames, static_cast<double>(g.statsRecordNs) / 1e6 / frames,
+                         static_cast<double>(g.statsBlitNs) / 1e6 / frames, static_cast<double>(g.statsSubmitNs) / 1e6 / frames);
+            g.statsLockNs = g.statsRecordNs = g.statsBlitNs = g.statsSubmitNs = 0;
+            g.statsLastNs = now;
+            g.statsFrames = g.statsAcquireNs = g.statsAcquireMaxNs = g.statsPresentNs = g.statsPresentMaxNs = 0;
+        }
+
         void present()
         {
             if (!active())
                 return;
-            ps2x_gs::DefragGuard window; // Vulkan only: held from here to the submit, see gs_gpu_threads.h
+            const uint64_t presentStart = g.guardStats ? nowNs() : 0;
+            // Vulkan only: the guard is held from before the first command that uses a texture to the submit, see
+            // gs_gpu_threads.h. With acquireFirst the swapchain image is acquired before that (a wait for the display
+            // must not keep the GS thread out); otherwise (PS2X_GPU_ACQUIRE_FIRST=0) the guard is held from here, as in M3.
+            ps2x_gs::DefragGuard window(!g.acquireFirst);
             SDL_GPUCommandBuffer *commandBuffer = SDL_AcquireGPUCommandBuffer(g.device);
             if (!commandBuffer)
             {
@@ -482,6 +578,47 @@ namespace ps2x_host
                 g.loggedProblem = true;
                 g.overlay = GpuOverlay{};
                 return;
+            }
+
+            // Blocks until the swapchain has a free image, then hands one over. The texture is null
+            // (without an error) when the window cannot be drawn to, for example while minimised; the
+            // frame is then skipped, but the commands so far (the picture upload) are still submitted.
+            SDL_GPUTexture *swapchain = nullptr;
+            Uint32 width = 0, height = 0;
+            const auto acquireSwapchain = [&]()
+            {
+                const uint64_t acquireStart = g.guardStats ? nowNs() : 0;
+                if (!SDL_WaitAndAcquireGPUSwapchainTexture(commandBuffer, g.window, &swapchain, &width, &height))
+                {
+                    if (!g.loggedProblem)
+                        std::fprintf(stderr, "[host] could not acquire the swapchain image: %s\n", SDL_GetError());
+                    g.loggedProblem = true;
+                    swapchain = nullptr;
+                }
+                if (g.testAcquireDelayMs)
+                    SDL_Delay(g.testAcquireDelayMs);
+                if (g.guardStats)
+                {
+                    const uint64_t ns = nowNs() - acquireStart;
+                    g.statsAcquireNs += ns;
+                    g.statsAcquireMaxNs = std::max(g.statsAcquireMaxNs, ns);
+                }
+            };
+            uint64_t phaseStart = g.guardStats ? nowNs() : 0;
+            const auto endPhase = [&](uint64_t &sum)
+            {
+                if (!g.guardStats)
+                    return;
+                const uint64_t now = nowNs();
+                sum += now - phaseStart;
+                phaseStart = now;
+            };
+            if (g.acquireFirst)
+            {
+                acquireSwapchain();
+                phaseStart = g.guardStats ? nowNs() : 0;
+                window.Lock();
+                endPhase(g.statsLockNs);
             }
 
             // The picture: built on the GPU by the GS renderer's presenter (path B), or the CPU picture uploaded here.
@@ -502,18 +639,12 @@ namespace ps2x_host
             }
             if (g.overlay.prepare)
                 g.overlay.prepare(commandBuffer, g.overlay.user);
+            endPhase(g.statsRecordNs);
 
-            // Blocks until the swapchain has a free image, then hands one over. The texture is null
-            // (without an error) when the window cannot be drawn to, for example while minimised; the
-            // frame is then skipped, but the commands so far (the picture upload) are still submitted.
-            SDL_GPUTexture *swapchain = nullptr;
-            Uint32 width = 0, height = 0;
-            if (!SDL_WaitAndAcquireGPUSwapchainTexture(commandBuffer, g.window, &swapchain, &width, &height))
+            if (!g.acquireFirst)
             {
-                if (!g.loggedProblem)
-                    std::fprintf(stderr, "[host] could not acquire the swapchain image: %s\n", SDL_GetError());
-                g.loggedProblem = true;
-                swapchain = nullptr;
+                acquireSwapchain();
+                phaseStart = g.guardStats ? nowNs() : 0;
             }
             if (swapchain && width != 0 && height != 0)
             {
@@ -521,9 +652,11 @@ namespace ps2x_host
                 const int textureHeight = g.source.record ? static_cast<int>(g.source.textureHeight) : kPictureHeight;
                 recordBlit(commandBuffer, swapchain, width, height, picture, textureWidth, textureHeight);
             }
+            endPhase(g.statsBlitNs);
 
             const bool submitted = SDL_SubmitGPUCommandBuffer(commandBuffer);
             window.Unlock();
+            endPhase(g.statsSubmitNs);
             if (!submitted && !g.loggedProblem)
             {
                 std::fprintf(stderr, "[host] SDL_SubmitGPUCommandBuffer failed: %s\n", SDL_GetError());
@@ -533,6 +666,14 @@ namespace ps2x_host
             if (g.source.submitted)
                 g.source.submitted(g.source.user);
             g.overlay = GpuOverlay{};
+            if (g.guardStats)
+            {
+                const uint64_t ns = nowNs() - presentStart;
+                g.statsPresentNs += ns;
+                g.statsPresentMaxNs = std::max(g.statsPresentMaxNs, ns);
+                ++g.statsFrames;
+                printGuardStats();
+            }
         }
     } // namespace gpu_present
 } // namespace ps2x_host

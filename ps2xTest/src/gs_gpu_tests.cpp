@@ -1,6 +1,7 @@
 #include "MiniTest.h"
 #include "runtime/gs/gs_cpu_backend.h"
 #include "runtime/gs/gs_gpu_backend.h"
+#include "runtime/gs/gs_fast_hash.h"
 #include "runtime/gs/gs_field_deinterlacer.h"
 #include "runtime/gs/gs_gpu_math.h"
 #include "runtime/gs/gs_gpu_present.h"
@@ -12,6 +13,7 @@
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_gpu.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -1341,6 +1343,44 @@ void register_gs_gpu_tests()
                 }
             }
             SDL_DestroyGPUDevice(device);
+        });
+    });
+
+    MiniTest::Case("GSFastHash", [](TestCase &tc)
+    {
+        tc.Run("the SSE2 and the portable loop give the same value, for every length", [](TestCase &t)
+        {
+            std::vector<uint8_t> data(8192 + 61);
+            uint64_t x = 0x1234567;
+            for (uint8_t &v : data)
+            {
+                x = x * 6364136223846793005ull + 1442695040888963407ull;
+                v = static_cast<uint8_t>(x >> 56);
+            }
+            bool same = true;
+            for (size_t len : {0u, 1u, 7u, 63u, 64u, 65u, 127u, 128u, 1000u, 8192u, 8192u + 61u})
+                same = same && GSFastHash::Hash(data.data(), len, 5, false) == GSFastHash::Hash(data.data(), len, 5, true);
+            t.IsTrue(same, "SSE2 == portable");
+        });
+        tc.Run("a changed byte, a swapped pair of stripes, another length or another seed change the hash", [](TestCase &t)
+        {
+            std::vector<uint8_t> data(8192);
+            for (size_t i = 0; i < data.size(); ++i)
+                data[i] = static_cast<uint8_t>((i / 64u) * 7u + (i % 64u)); // stripes that differ from each other
+            const uint64_t base = GSFastHash::Hash(data.data(), data.size(), 0);
+            std::vector<uint8_t> flipped = data;
+            flipped[5000] ^= 1u;
+            t.IsTrue(GSFastHash::Hash(flipped.data(), flipped.size(), 0) != base, "one bit");
+            std::vector<uint8_t> swapped = data;
+            std::swap_ranges(swapped.begin() + 64 * 3, swapped.begin() + 64 * 4, swapped.begin() + 64 * 9);
+            t.IsTrue(GSFastHash::Hash(swapped.data(), swapped.size(), 0) != base, "two stripes swapped");
+            std::vector<uint8_t> swapped16 = data; // the swap that the accumulation would not see without the sliding secret
+            std::swap_ranges(swapped16.begin() + 64 * 2, swapped16.begin() + 64 * 3, swapped16.begin() + 64 * 18);
+            t.IsTrue(GSFastHash::Hash(swapped16.data(), swapped16.size(), 0) != base, "two stripes a secret period apart swapped");
+            t.IsTrue(GSFastHash::Hash(data.data(), data.size() - 64, 0) != base, "shorter");
+            t.IsTrue(GSFastHash::Hash(data.data(), data.size(), 1) != base, "another seed");
+            std::vector<uint8_t> zeros(8192, 0), zeros2(8192 + 64, 0);
+            t.IsTrue(GSFastHash::Hash(zeros.data(), zeros.size(), 0) != GSFastHash::Hash(zeros2.data(), zeros2.size(), 0), "all-zero data of two lengths");
         });
     });
 }

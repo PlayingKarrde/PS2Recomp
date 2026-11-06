@@ -31,8 +31,23 @@
 //    for longer than that, and nothing waits for the GPU inside a window except the swapchain acquire.
 //
 // Code inside a DebugPassLock must not take other locks. Lock order: DefragGuard first, then DebugPassLock.
+//
+// What the guard costs, and where it is held (task g5):
+//    SDL 3.4.18 runs the defragmentation (and the other clean-ups) only inside the submit of a command buffer that
+//    asked for a swapchain texture (SDL_gpu_vulkan.c, VULKAN_Submit: performCleanups = swapchainRequested), so it is
+//    the host's window command buffer that defragments, never the GS thread's. The host used to take the guard before
+//    acquiring that command buffer and keep it across SDL_WaitAndAcquireGPUSwapchainTexture, which blocks until the
+//    display has freed an image: on a driver that offers only FIFO/vsync that is up to a frame, and the GS thread,
+//    waiting for the guard to record its next flush, waited with it. The window command buffer now acquires the
+//    swapchain texture first, outside the guard, and takes the guard (Lock()) only once it is about to record
+//    commands that use textures. Nothing it did between acquiring the command buffer and taking the guard touches a
+//    texture or buffer that the other thread could release or the defragmentation could move, so the reasons above
+//    still hold. PS2X_GPU_ACQUIRE_FIRST=0 restores the old order, for comparing. PS2X_GPU_GUARD_STATS=1 prints, once
+//    a second, how long each thread waited for the guard and held it (the host prints the line).
 
 #include <atomic>
+#include <chrono>
+#include <cstdint>
 #include <mutex>
 
 namespace ps2x_gs
@@ -83,7 +98,122 @@ namespace ps2x_gs
 
     // Put it before SDL_BeginGPURenderPass.
     using DebugPassLock = ConditionalLock<std::mutex, debugPassSerialization, debugPassMutex>;
-    // Put it before SDL_AcquireGPUCommandBuffer and call Unlock() after SDL_Submit*; also around SDL_ReleaseGPU*
-    // (texture, buffer, transfer buffer).
-    using DefragGuard = ConditionalLock<std::recursive_mutex, defragGuardEnabled, defragMutex>;
+
+    // ---- opt-in measurement of the guard (PS2X_GPU_GUARD_STATS=1; the host switches it on and prints it)
+    // Two kinds of thread take the guard: the GS thread (flushes, releases) and the host's main thread (the window
+    // command buffer). The thread that creates the presenter marks itself as the main thread.
+    inline std::atomic<bool> &defragGuardStatsEnabled()
+    {
+        static std::atomic<bool> on{false};
+        return on;
+    }
+    inline bool &guardThreadIsMain() // thread_local: set once on the host's main thread
+    {
+        static thread_local bool main = false;
+        return main;
+    }
+    struct GuardRoleStats
+    {
+        std::atomic<uint64_t> acquisitions{0}; // outermost acquisitions (a recursive one inside a window is not counted)
+        std::atomic<uint64_t> waits{0};        // ... that had to wait for the other thread
+        std::atomic<uint64_t> waitNs{0};
+        std::atomic<uint64_t> waitMaxNs{0};
+        std::atomic<uint64_t> holdNs{0};
+        std::atomic<uint64_t> holdMaxNs{0};
+    };
+    inline GuardRoleStats &guardStats(bool mainThread)
+    {
+        static GuardRoleStats gs, main;
+        return mainThread ? main : gs;
+    }
+    inline uint64_t guardNowNs()
+    {
+        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+    }
+    inline void guardMax(std::atomic<uint64_t> &slot, uint64_t value)
+    {
+        uint64_t seen = slot.load(std::memory_order_relaxed);
+        while (value > seen && !slot.compare_exchange_weak(seen, value, std::memory_order_relaxed))
+        {
+        }
+    }
+
+    // The Vulkan defragmentation guard: a recursive mutex held from before the first command that uses a texture
+    // or buffer to the end of the submit, and around every release. `lockNow = false` makes a guard that is not
+    // held yet: the host acquires its command buffer and the swapchain texture first and calls Lock() afterwards.
+    // Does nothing unless the host turned it on (the Vulkan driver). Unlocks at the end of its scope, or at Unlock().
+    class DefragGuard
+    {
+    public:
+        explicit DefragGuard(bool lockNow = true)
+        {
+            if (lockNow)
+                Lock();
+        }
+        ~DefragGuard() { Unlock(); }
+        DefragGuard(const DefragGuard &) = delete;
+        DefragGuard &operator=(const DefragGuard &) = delete;
+
+        void Lock()
+        {
+            if (m_held || !defragGuardEnabled().load(std::memory_order_relaxed))
+                return;
+            std::recursive_mutex &mutex = defragMutex();
+            if (!defragGuardStatsEnabled().load(std::memory_order_relaxed))
+            {
+                mutex.lock();
+                m_held = true;
+                return;
+            }
+            // Measuring: note how long this acquisition waited, and (outermost only) how long it holds the guard.
+            m_main = guardThreadIsMain();
+            GuardRoleStats &s = guardStats(m_main);
+            const uint64_t t0 = guardNowNs();
+            const bool free = mutex.try_lock();
+            if (!free)
+                mutex.lock();
+            const uint64_t t1 = guardNowNs();
+            m_held = true;
+            m_outermost = depthRef()++ == 0;
+            m_inDepth = true;
+            if (m_outermost)
+            {
+                s.acquisitions.fetch_add(1, std::memory_order_relaxed);
+                if (!free)
+                {
+                    s.waits.fetch_add(1, std::memory_order_relaxed);
+                    s.waitNs.fetch_add(t1 - t0, std::memory_order_relaxed);
+                    guardMax(s.waitMaxNs, t1 - t0);
+                }
+                m_acquiredNs = t1;
+            }
+        }
+        void Unlock()
+        {
+            if (!m_held)
+                return;
+            if (m_inDepth)
+            {
+                --depthRef();
+                if (m_outermost)
+                {
+                    GuardRoleStats &s = guardStats(m_main);
+                    const uint64_t held = guardNowNs() - m_acquiredNs;
+                    s.holdNs.fetch_add(held, std::memory_order_relaxed);
+                    guardMax(s.holdMaxNs, held);
+                }
+            }
+            defragMutex().unlock();
+            m_held = m_inDepth = m_outermost = false;
+        }
+
+    private:
+        static int &depthRef()
+        {
+            static thread_local int depth = 0;
+            return depth;
+        }
+        bool m_held = false, m_main = false, m_outermost = false, m_inDepth = false;
+        uint64_t m_acquiredNs = 0;
+    };
 } // namespace ps2x_gs

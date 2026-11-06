@@ -72,6 +72,7 @@
 
 #include "runtime/gs/gs_gpu_backend.h"
 
+#include "runtime/gs/gs_fast_hash.h"
 #include "runtime/gs/gs_gpu_threads.h"
 #include "runtime/gs/gs_gpu_math.h"
 #include "runtime/gs/gs_presentation.h"
@@ -94,11 +95,13 @@
 #include <bitset>
 #include <chrono>
 #include <cstdio>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -109,13 +112,17 @@ namespace
 {
     constexpr uint32_t kPageCount = 512u;
     constexpr uint32_t kPageBytes = 8192u;
-    constexpr uint32_t kTargetRows = 512u;                 // rows of a frame or depth target (GS limit used by the CPU renderer)
-    constexpr uint64_t kTextureBudget = 384ull << 20;      // bytes of cached GPU textures before eviction starts
+    constexpr uint32_t kTargetRows = 512u;                 // the most rows a frame or depth target can have (GS limit used by the CPU renderer)
+    // Rows of a frame or depth target when PS2X_GS_TARGET_ROWS is not set. The game draws 640 x 224 fields (a 7-page-high
+    // buffer, scissor rows 0..223) into three buffers, and the 512-row targets the first versions made were more than twice
+    // what it uses: at 4x that is 42 MB for each of the three. A draw whose scissor reaches below this is clipped to the
+    // target (the scissor is clamped to the target's size) and logged once. 256 covers the 240-row NTSC field.
+    constexpr uint32_t kDefaultTargetRows = 256u;
+    constexpr uint64_t kDefaultTextureBudget = 384ull << 20; // bytes of cached GPU textures before eviction starts (PS2X_GS_GPU_TEXTURE_BUDGET_MB)
     // Evicted textures are pooled for reuse. Creating one costs about the same whatever its size, so the many small ones
     // are pooled by count (kSmallPoolEntries of up to kSmallTextureBytes: 64 MB at most) and the large ones by bytes
-    // (kTexturePoolBudget), or a few portraits would fill the pool and every small texture would still be created anew.
-    // At most 160 MB of GPU textures exist beyond the live budget.
-    constexpr uint64_t kTexturePoolBudget = kTextureBudget / 4u; // bytes of large evicted GPU textures kept for reuse
+    // (a quarter of the texture budget, 96 MB by default), or a few portraits would fill the pool and every small texture
+    // would still be created anew. At most 160 MB of GPU textures exist beyond the live budget (by default).
     constexpr uint64_t kSmallTextureBytes = 32u << 10;
     constexpr uint64_t kSmallPoolEntries = 2048;
     // A texture is only pooled if a texture of its size was created in the last kPoolWantedFlushes flushes (about ten
@@ -297,6 +304,7 @@ struct GSGpuBackend::Impl
     uint32_t scale = 1;                 // the scale in use: the constructor's, except that weave mode only draws at 1
     uint32_t scaleX = 1, scaleY = 1;    // target pixels per GS pixel along each axis (see the comment at the top)
     GSGpuBackend::FieldMode mode = GSGpuBackend::FieldMode::Weave;
+    uint64_t textureBudget = kDefaultTextureBudget; // bytes of cached textures before eviction starts
     // PS2X_GS_SAMPLE_GRID=centre: put the samples of a block of target pixels around the scale-1 sample (gs_gpu_math.h,
     // TargetMapping), for measuring against the corner rule that is the default.
     bool centredGrid = false;
@@ -358,6 +366,37 @@ struct GSGpuBackend::Impl
     uint64_t poolSmallCount = 0;
     bool poolEnabled = true; // PS2X_GS_GPU_TEXTURE_POOL=0 turns it off
     uint64_t flushIndex = 1;
+    std::atomic<uint64_t> flushIndexShared{1}; // flushIndex for the helper thread
+
+    // ---- pool textures made ahead on a helper thread (task g5; PS2X_GS_GPU_PRECREATE=0 turns it off)
+    // The first time the wrestler select scrolls after the game started, the pool is empty and every step needs about 20
+    // large textures and as many small ones, and creating one costs 0.3 to 0.9 ms on the game thread (SDL_CreateGPUTexture,
+    // almost whatever its size): a hitch of ten to twenty milliseconds per step. When creations of one size repeat, the
+    // helper thread keeps a few of that size in the pool, so the game thread finds one there. `poolMutex` guards the pool
+    // (texturePool, poolBytes, poolSmallBytes, poolSmallCount) and the wishes; SDL_CreateGPUTexture runs outside it.
+    // The helper thread only creates textures and stocks the pool; it records no commands and touches no other state.
+    struct Wish
+    {
+        uint32_t target = 0;       // how many textures of the size the pool should hold
+        uint64_t lastFlush = 0;    // flush index of the latest request of this size
+        uint64_t windowStart = 0;  // flush index at which the count below started
+        uint32_t requests = 0;     // textures of this size asked for since windowStart
+    };
+    std::mutex poolMutex;
+    std::condition_variable poolCv;
+    std::unordered_map<uint32_t, Wish> wishes;
+    std::thread maker;
+    bool makerStop = false; // poolMutex
+    bool makerEnabled = true;
+    std::atomic<uint64_t> texturesPrecreated{0};
+    void makerLoop();
+    void stopMaker();
+    void wishFor(uint32_t sizeKey); // poolMutex held
+    uint64_t poolBytesNow()
+    {
+        std::lock_guard<std::mutex> lock(poolMutex);
+        return poolBytes;
+    }
     bool recentValid = false;
     SigKey recentKey{};
     uint64_t recentEpoch = 0;
@@ -381,6 +420,10 @@ struct GSGpuBackend::Impl
     GSPresentationRequest lastMarker{};
     bool hasMarker = false;
     bool loggedUnsupported[16] = {};
+    // GS rows in a frame or depth target (kDefaultTargetRows, or PS2X_GS_TARGET_ROWS up to kTargetRows).
+    uint32_t targetRows = kDefaultTargetRows;
+    bool loggedTargetRows = false;
+    bool slowHash = false; // PS2X_GS_GPU_HASH=xxh64
 
     std::deque<SDL_GPUFence *> frameFences; // one per submitted marker, oldest first
 
@@ -419,6 +462,10 @@ struct GSGpuBackend::Impl
         uint64_t createNs = 0, stageNs = 0, decodeNs = 0, hashNs = 0;
         std::bitset<4096> tiles16; // 16 x 16 texel tiles the draws can reach (a 1024 x 1024 texture has 64 x 64)
     };
+    // PS2X_GS_GPU_UPLOAD_LOG=<file>: one CSV row per UploadImage call: where it lands, how big it is, and whether the same call
+    // (same destination, same position in the transfer) carried the same bytes the last time. Finds the identical re-uploads.
+    std::FILE *uploadLog = nullptr;
+    std::unordered_map<uint64_t, uint64_t> uploadPrevHash;
     std::string missLogPath;
     std::vector<MissRecord> missRecords;
     std::unordered_map<SDL_GPUTexture *, size_t> missIndex;
@@ -506,6 +553,24 @@ bool GSGpuBackend::Impl::init(SDL_GPUDevice *device, uint32_t s, GSGpuBackend::F
         else
             std::fprintf(stderr, "[gs:gpu] PS2X_GS_SPRITE_SAMPLE=%s is not gs or target, using %s\n", sprite, spriteAtTarget ? "target" : "gs");
     }
+    if (const char *hash = std::getenv("PS2X_GS_GPU_HASH"))
+        slowHash = std::strcmp(hash, "xxh64") == 0;
+    if (const char *mb = std::getenv("PS2X_GS_GPU_TEXTURE_BUDGET_MB"))
+    {
+        const long wanted = std::atol(mb);
+        if (wanted >= 8 && wanted <= 4096)
+            textureBudget = static_cast<uint64_t>(wanted) << 20;
+        else
+            std::fprintf(stderr, "[gs:gpu] PS2X_GS_GPU_TEXTURE_BUDGET_MB=%s is not 8..4096, using %llu MB\n", mb, static_cast<unsigned long long>(textureBudget >> 20));
+    }
+    if (const char *rows = std::getenv("PS2X_GS_TARGET_ROWS"))
+    {
+        const long wanted = std::atol(rows);
+        if (wanted >= 32 && wanted <= static_cast<long>(kTargetRows))
+            targetRows = static_cast<uint32_t>((wanted + 31) / 32 * 32);
+        else
+            std::fprintf(stderr, "[gs:gpu] PS2X_GS_TARGET_ROWS=%s is not 32..%u, using %u\n", rows, kTargetRows, targetRows);
+    }
     {
         const char *value = std::getenv("PS2X_GS_GPU_STATS");
         statsOn = value && value[0] == '1';
@@ -513,6 +578,8 @@ bool GSGpuBackend::Impl::init(SDL_GPUDevice *device, uint32_t s, GSGpuBackend::F
         fullDecode = full && full[0] == '1';
         const char *pool = std::getenv("PS2X_GS_GPU_TEXTURE_POOL");
         poolEnabled = !(pool && pool[0] == '0');
+        const char *precreate = std::getenv("PS2X_GS_GPU_PRECREATE");
+        makerEnabled = poolEnabled && !(precreate && precreate[0] == '0');
         if (const char *path = std::getenv("PS2X_GS_GPU_MARKER_LOG"))
             if (path[0] != '\0')
             {
@@ -520,6 +587,13 @@ bool GSGpuBackend::Impl::init(SDL_GPUDevice *device, uint32_t s, GSGpuBackend::F
                 if (markerLog)
                     std::fprintf(markerLog, "marker,t_ns,mark_us,flushes,flush_us,map_us,record_us,submit_us,evict_us,backlog_us,misses,content_lookups,hash_us,"
                                             "create_us,stage_us,decode_us,texels_declared,texels_decoded,created_kb,evicted,live_mb,upload_kb,reused,pool_mb\n");
+            }
+        if (const char *path = std::getenv("PS2X_GS_GPU_UPLOAD_LOG"))
+            if (path[0] != '\0')
+            {
+                uploadLog = std::fopen(path, "w");
+                if (uploadLog)
+                    std::fprintf(uploadLog, "marker,dbp,dbw,dpsm,dsax,dsay,rrw,rrh,copied_before,size,same,pages,epoch_before\n");
             }
         if (const char *path = std::getenv("PS2X_GS_GPU_MISS_LOG"))
             if (path[0] != '\0')
@@ -575,15 +649,134 @@ bool GSGpuBackend::Impl::init(SDL_GPUDevice *device, uint32_t s, GSGpuBackend::F
     const uint32_t white = 0xFFFFFFFFu;
     std::memcpy(stage.data() + offset, &white, 4);
     pendingUploads.push_back({dummy, 1, 1, offset});
+    if (makerEnabled)
+        maker = std::thread([this] { makerLoop(); });
     return true;
+}
+
+void GSGpuBackend::Impl::stopMaker()
+{
+    if (!maker.joinable())
+        return;
+    {
+        std::lock_guard<std::mutex> lock(poolMutex);
+        makerStop = true;
+    }
+    poolCv.notify_all();
+    maker.join();
+}
+
+// The caller holds poolMutex. Notes that a texture of this size is being asked for, and when they come in numbers
+// (six within about two seconds) asks the helper to keep some in the pool, a few more the more are asked for.
+void GSGpuBackend::Impl::wishFor(uint32_t sizeKey)
+{
+    Wish &w = wishes[sizeKey];
+    if (flushIndex > w.windowStart + 120u)
+    {
+        w.windowStart = flushIndex;
+        w.requests = 0;
+    }
+    ++w.requests;
+    w.lastFlush = flushIndex;
+    if (w.requests >= 6u)
+    {
+        const uint32_t target = std::min<uint32_t>(48u, 8u + w.requests / 2u);
+        if (target > w.target)
+            w.target = target;
+        poolCv.notify_one();
+    }
+}
+
+void GSGpuBackend::Impl::makerLoop()
+{
+    std::unique_lock<std::mutex> lock(poolMutex);
+    bool loggedFailure = false;
+    while (!makerStop)
+    {
+        const uint64_t nowFlush = flushIndexShared.load(std::memory_order_relaxed);
+        uint32_t pick = 0;
+        bool found = false;
+        for (auto &entry : wishes)
+        {
+            Wish &w = entry.second;
+            if (w.lastFlush + kPoolWantedFlushes < nowFlush)
+            {
+                w.target = 0; // nobody asked for this size in a long time
+                continue;
+            }
+            const uint32_t sizeKey = entry.first;
+            const auto bucket = texturePool.find(sizeKey);
+            if (bucket != texturePool.end() && bucket->second.size() >= w.target)
+                continue;
+            const uint64_t bytes = static_cast<uint64_t>(sizeKey >> 16) * (sizeKey & 0xFFFFu) * 4u;
+            const bool small = bytes <= kSmallTextureBytes;
+            if (w.target == 0 || (small ? poolSmallCount >= kSmallPoolEntries : poolBytes - poolSmallBytes + bytes > textureBudget / 4u))
+                continue; // nothing wanted, or the pool is full for textures of this kind
+            pick = sizeKey;
+            found = true;
+            break;
+        }
+        if (!found)
+        {
+            poolCv.wait_for(lock, std::chrono::milliseconds(100));
+            continue;
+        }
+        lock.unlock();
+        SDL_GPUTextureCreateInfo ti = {};
+        ti.type = SDL_GPU_TEXTURETYPE_2D;
+        ti.format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
+        ti.usage = SDL_GPU_TEXTUREUSAGE_SAMPLER;
+        ti.width = pick >> 16;
+        ti.height = pick & 0xFFFFu;
+        ti.layer_count_or_depth = 1;
+        ti.num_levels = 1;
+        ti.sample_count = SDL_GPU_SAMPLECOUNT_1;
+        SDL_GPUTexture *tex = nullptr;
+        {
+            ps2x_gs::DefragGuard defragGuard; // Vulkan only, see gs_gpu_threads.h
+            tex = SDL_CreateGPUTexture(dev, &ti);
+        }
+        lock.lock();
+        if (!tex)
+        {
+            if (!loggedFailure)
+                std::fprintf(stderr, "[gs:gpu] pre-creating a %ux%u texture failed: %s (logged once)\n", ti.width, ti.height, SDL_GetError());
+            loggedFailure = true;
+            wishes[pick].target = 0;
+            continue;
+        }
+        const uint64_t bytes = static_cast<uint64_t>(ti.width) * ti.height * 4u;
+        const bool small = bytes <= kSmallTextureBytes;
+        if (makerStop || (small ? poolSmallCount >= kSmallPoolEntries : poolBytes - poolSmallBytes + bytes > textureBudget / 4u))
+        {
+            lock.unlock();
+            {
+                ps2x_gs::DefragGuard defragGuard;
+                SDL_ReleaseGPUTexture(dev, tex);
+            }
+            lock.lock();
+            continue;
+        }
+        texturePool[pick].push_back({tex, bytes, flushIndexShared.load(std::memory_order_relaxed)});
+        poolBytes += bytes;
+        if (small)
+        {
+            poolSmallBytes += bytes;
+            ++poolSmallCount;
+        }
+        texturesPrecreated.fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 GSGpuBackend::Impl::~Impl()
 {
+    stopMaker();
     if (!missLogPath.empty())
         writeMissLog();
     if (markerLog)
         std::fclose(markerLog);
+    if (uploadLog)
+        std::fclose(uploadLog);
     if (!dev)
         return;
     SDL_WaitForGPUIdle(dev);
@@ -801,7 +994,7 @@ uint32_t GSGpuBackend::Impl::frameIndex(const GSFrameReg &frame)
     t.fbw = fbw;
     t.psm = frame.psm;
     t.w = fbw * 64u * scaleX;
-    t.h = kTargetRows * scaleY;
+    t.h = targetRows * scaleY;
     SDL_GPUTextureCreateInfo ci = {};
     ci.type = SDL_GPU_TEXTURETYPE_2D;
     ci.format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
@@ -826,7 +1019,7 @@ uint32_t GSGpuBackend::Impl::frameIndex(const GSFrameReg &frame)
     uint32_t *px = reinterpret_cast<uint32_t *>(stage.data() + offset);
     const uint32_t basePtr = frame.fbp << 5u;
     const bool sixteen = frame.psm == GS_PSM_CT16 || frame.psm == GS_PSM_CT16S;
-    for (uint32_t gy = 0; gy < kTargetRows; ++gy)
+    for (uint32_t gy = 0; gy < targetRows; ++gy)
     {
         // One memory row covers scaleY target rows, and one memory pixel scaleX target pixels.
         uint32_t *first = px + static_cast<size_t>(gy) * scaleY * t.w;
@@ -856,7 +1049,7 @@ uint32_t GSGpuBackend::Impl::depthIndex(const GSZbufReg &zbuf, uint32_t fbw)
     d.zbp = zbuf.zbp;
     d.fbw = std::max(fbw, 1u);
     d.w = w;
-    d.h = kTargetRows * scaleY;
+    d.h = targetRows * scaleY;
     SDL_GPUTextureCreateInfo ci = {};
     ci.type = SDL_GPU_TEXTURETYPE_2D;
     ci.format = SDL_GPU_TEXTUREFORMAT_D32_FLOAT;
@@ -993,6 +1186,7 @@ GpuTexture *GSGpuBackend::Impl::createTexture(const GSDrawState &state, uint64_t
     bool reusedFromPool = false;
     if (poolEnabled)
     {
+        std::lock_guard<std::mutex> lock(poolMutex);
         poolWanted[(w << 16) | h] = flushIndex;
         const auto bucket = texturePool.find((w << 16) | h);
         if (bucket != texturePool.end() && !bucket->second.empty())
@@ -1009,6 +1203,8 @@ GpuTexture *GSGpuBackend::Impl::createTexture(const GSDrawState &state, uint64_t
             ++stats.texturesReused;
             reusedFromPool = true;
         }
+        if (makerEnabled)
+            wishFor((w << 16) | h);
     }
     if (!tex)
         tex = SDL_CreateGPUTexture(dev, &ti);
@@ -1242,8 +1438,13 @@ GpuTexture *GSGpuBackend::Impl::resolveTexture(const GSDrawState &state)
     // 3. content: the bytes of the pages the texture can live in, with everything else the decode depends on
     const uint64_t hashStart = nowNanos();
     uint64_t hash = SigKeyHash{}(key);
+    // PS2X_GS_GPU_HASH=xxh64 hashes the pages with XXH64, as before task g5, for comparing the cost (the hit and miss decisions
+    // are the same; only the key values differ).
     for (uint32_t i = 0; i < span.count; ++i)
-        hash = GSRec::Hash64(vram + static_cast<size_t>((span.first + i) & (kPageCount - 1u)) * kPageBytes, kPageBytes, hash);
+    {
+        const uint8_t *page = vram + static_cast<size_t>((span.first + i) & (kPageCount - 1u)) * kPageBytes;
+        hash = slowHash ? GSRec::Hash64(page, kPageBytes, hash) : GSFastHash::Hash(page, kPageBytes, hash);
+    }
     lastHashNs = nowNanos() - hashStart;
     ++stats.texContentLookups;
     stats.texHashNanos += lastHashNs;
@@ -1271,7 +1472,7 @@ GpuTexture *GSGpuBackend::Impl::resolveTexture(const GSDrawState &state)
 
 void GSGpuBackend::Impl::evictTextures()
 {
-    if (textureBytes <= kTextureBudget)
+    if (textureBytes <= textureBudget)
         return;
     // Least recently used first, never what the list just submitted used.
     std::vector<std::pair<uint64_t, uint64_t>> order; // lastUsedFlush, key
@@ -1280,7 +1481,7 @@ void GSGpuBackend::Impl::evictTextures()
         if (e.second.lastUsedFlush + 1u < flushIndex)
             order.emplace_back(e.second.lastUsedFlush, e.first);
     std::sort(order.begin(), order.end());
-    const uint64_t target = kTextureBudget / 4u * 3u;
+    const uint64_t target = textureBudget / 4u * 3u;
     for (const auto &o : order)
     {
         if (textureBytes <= target)
@@ -1298,21 +1499,24 @@ void GSGpuBackend::Impl::evictTextures()
         const bool small = evicted.bytes <= kSmallTextureBytes;
         const auto wanted = poolWanted.find(sizeKey);
         const bool recentlyWanted = wanted != poolWanted.end() && wanted->second + kPoolWantedFlushes >= flushIndex;
-        if (poolEnabled && recentlyWanted &&
-            (small ? poolSmallCount < kSmallPoolEntries : poolBytes - poolSmallBytes + evicted.bytes <= kTexturePoolBudget))
+        bool pooled = false;
+        if (poolEnabled && recentlyWanted)
         {
-            texturePool[sizeKey].push_back(evicted);
-            poolBytes += evicted.bytes;
-            if (small)
+            std::lock_guard<std::mutex> lock(poolMutex);
+            if (small ? poolSmallCount < kSmallPoolEntries : poolBytes - poolSmallBytes + evicted.bytes <= textureBudget / 4u)
             {
-                poolSmallBytes += evicted.bytes;
-                ++poolSmallCount;
+                texturePool[sizeKey].push_back(evicted);
+                poolBytes += evicted.bytes;
+                if (small)
+                {
+                    poolSmallBytes += evicted.bytes;
+                    ++poolSmallCount;
+                }
+                pooled = true;
             }
         }
-        else
-        {
+        if (!pooled)
             releaseTexture(evicted.tex);
-        }
     }
     // Signatures pointing at evicted textures miss on lookup and are rebuilt; nothing to fix here.
     recentValid = false;
@@ -1327,22 +1531,27 @@ void GSGpuBackend::Impl::releaseTexture(SDL_GPUTexture *tex)
 // Releases the pooled textures that were not asked for in a long time (the oldest of each size), a few per flush.
 void GSGpuBackend::Impl::trimTexturePool()
 {
-    if (poolBytes == 0)
-        return;
-    int budget = 8;
-    for (auto &bucket : texturePool)
-        while (budget > 0 && !bucket.second.empty() && bucket.second.front().pooledAtFlush + kPoolMaxAgeFlushes < flushIndex)
-        {
-            poolBytes -= bucket.second.front().bytes;
-            if (bucket.second.front().bytes <= kSmallTextureBytes)
+    SDL_GPUTexture *expired[8];
+    int count = 0;
+    {
+        std::lock_guard<std::mutex> lock(poolMutex);
+        if (poolBytes == 0)
+            return;
+        for (auto &bucket : texturePool)
+            while (count < 8 && !bucket.second.empty() && bucket.second.front().pooledAtFlush + kPoolMaxAgeFlushes < flushIndex)
             {
-                poolSmallBytes -= bucket.second.front().bytes;
-                --poolSmallCount;
+                poolBytes -= bucket.second.front().bytes;
+                if (bucket.second.front().bytes <= kSmallTextureBytes)
+                {
+                    poolSmallBytes -= bucket.second.front().bytes;
+                    --poolSmallCount;
+                }
+                expired[count++] = bucket.second.front().tex;
+                bucket.second.pop_front();
             }
-            releaseTexture(bucket.second.front().tex);
-            bucket.second.pop_front();
-            --budget;
-        }
+    }
+    for (int i = 0; i < count; ++i)
+        releaseTexture(expired[i]);
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -1369,6 +1578,14 @@ void GSGpuBackend::Impl::submitSetup(const GSDrawState &state, const Setup &setu
     if (((ctx.test >> 14) & 1ull) != 0u) note(7, "destination alpha test (DATE)");
     if (ctx.zbuf.psm != GS_PSM_Z24 && ctx.zbuf.psm != 0u) note(8, "Z buffer formats other than Z24");
     if (ctx.frame.psm != GS_PSM_CT32) note(9, "frame buffer formats other than CT32 (drawn as 32-bit)");
+
+    if (!loggedTargetRows && static_cast<uint32_t>(ctx.scissor.y1) + 1u > targetRows)
+    {
+        loggedTargetRows = true;
+        std::fprintf(stderr, "[gs:gpu] a draw's scissor reaches row %u, below the %u rows of the frame and depth targets: it is clipped "
+                             "(PS2X_GS_TARGET_ROWS=512 gives the targets all the rows the GS can address) (logged once)\n",
+                     static_cast<uint32_t>(ctx.scissor.y1), targetRows);
+    }
 
     const uint32_t frame = frameIndex(ctx.frame);
     const uint32_t depth = depthIndex(ctx.zbuf, ctx.frame.fbw);
@@ -1713,6 +1930,7 @@ void GSGpuBackend::Impl::flushLocked(bool wait, const FieldCopy *fieldCopies, in
     }
     transientTextures.clear();
     ++flushIndex;
+    flushIndexShared.store(flushIndex, std::memory_order_relaxed);
     evictTextures();
     trimTexturePool();
     const uint64_t flushEnd = nowNanos();
@@ -2201,7 +2419,7 @@ void GSGpuBackend::Impl::printStats()
     const auto ms = [](uint64_t x, uint64_t y) { return static_cast<double>(x - y) / 1e6; };
     std::printf("[gs:gpu-cost] misses=%llu reused=%llu pool=%.1fMB content_lookups=%llu hash=%.1fms (%.1f MB) create=%.1fms stage=%.1fms decode=%.1fms "
                 "(texels declared %.2fM, decoded %.2fM) | flushes=%llu total=%.1fms map=%.1fms record=%.1fms submit=%.1fms evict=%.1fms backlog=%.1fms | mark=%.1fms\n",
-                d(a.texMisses, b.texMisses), d(a.texturesReused, b.texturesReused), static_cast<double>(poolBytes) / 1048576.0,
+                d(a.texMisses, b.texMisses), d(a.texturesReused, b.texturesReused), static_cast<double>(poolBytesNow()) / 1048576.0,
                 d(a.texContentLookups, b.texContentLookups), ms(a.texHashNanos, b.texHashNanos),
                 static_cast<double>(a.texHashBytes - b.texHashBytes) / 1048576.0, ms(a.texCreateNanos, b.texCreateNanos),
                 ms(a.texStageNanos, b.texStageNanos), ms(a.texDecodeNanos, b.texDecodeNanos),
@@ -2212,11 +2430,11 @@ void GSGpuBackend::Impl::printStats()
     std::fflush(stdout);
     const double mb = 1.0 / 1048576.0;
     std::printf("[gs:gpu-mem] scale %u (%u x %u target pixels per GS pixel): frame targets %.1f MB (%llu), depth targets %.1f MB (%llu), field ring %.1f MB, "
-                "upload buffer %.1f MB, vertex buffer %.1f MB, textures live %.1f MB, texture pool %.1f MB\n",
+                "upload buffer %.1f MB, vertex buffer %.1f MB, textures live %.1f MB, texture pool %.1f MB (%llu made ahead since start)\n",
                 scale, scaleX, scaleY, static_cast<double>(frameTargetBytes) * mb, static_cast<unsigned long long>(frames.size()),
                 static_cast<double>(depthTargetBytes) * mb, static_cast<unsigned long long>(depths.size()), static_cast<double>(fieldTextureBytes) * mb,
                 static_cast<double>(uploadBufferBytes) * mb, static_cast<double>(vertexBufferBytes) * mb, static_cast<double>(textureBytes) * mb,
-                static_cast<double>(poolBytes) * mb);
+                static_cast<double>(poolBytesNow()) * mb, static_cast<unsigned long long>(texturesPrecreated.load()));
     std::fflush(stdout);
     statsPrev = stats;
     statsMarkers = 0;
@@ -2239,7 +2457,7 @@ void GSGpuBackend::Impl::logMarkerRow(uint64_t markNs)
                  us(a.texDecodeNanos, b.texDecodeNanos), n(a.texTexelsDeclared, b.texTexelsDeclared), n(a.texTexelsDecoded, b.texTexelsDecoded),
                  n(a.textureBytesCreated, b.textureBytesCreated) / 1024u, n(a.texturesEvicted, b.texturesEvicted),
                  static_cast<double>(textureBytes) / 1048576.0, n(a.uploadBytes, b.uploadBytes) / 1024u, n(a.texturesReused, b.texturesReused),
-                 static_cast<double>(poolBytes) / 1048576.0);
+                 static_cast<double>(poolBytesNow()) / 1048576.0);
     if ((markerSeq % 30u) == 0u)
         std::fflush(markerLog);
     markerPrev = stats;
@@ -2445,6 +2663,21 @@ void GSGpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
     std::lock_guard<std::mutex> lock(s.mutex);
     if (!data || sizeBytes == 0u || !s.vram || s.transferState.direction != 0u)
         return;
+    if (s.uploadLog)
+    {
+        const auto &tb = s.transfer.bitbltbuf;
+        const auto &tp = s.transfer.trxpos;
+        const auto &tr = s.transfer.trxreg;
+        const uint32_t kv[8] = {tb.dbp, tb.dbw, tb.dpsm, tp.dsax, tp.dsay, tr.rrw, tr.rrh, s.transferState.copiedPixels};
+        const uint64_t key = GSRec::Hash64(kv, sizeof(kv), 0);
+        const uint64_t h = GSRec::Hash64(data, sizeBytes, sizeBytes);
+        const auto prev = s.uploadPrevHash.find(key);
+        const bool same = prev != s.uploadPrevHash.end() && prev->second == h;
+        s.uploadPrevHash[key] = h;
+        const PageSpan span = BufferPageSpan(tb.dpsm, tb.dbp, std::max<uint32_t>(tb.dbw, 1u), tp.dsax, tp.dsay, tr.rrw, tr.rrh);
+        std::fprintf(s.uploadLog, "%llu,%u,%u,%u,%u,%u,%u,%u,%u,%u,%d,%u,%llu\n", static_cast<unsigned long long>(s.markerSeq), tb.dbp, tb.dbw, tb.dpsm,
+                     tp.dsax, tp.dsay, tr.rrw, tr.rrh, s.transferState.copiedPixels, sizeBytes, same ? 1 : 0, span.count, static_cast<unsigned long long>(s.epoch));
+    }
     GSTransfer::UploadImage(s.vram, s.transfer, s.transferState, data, sizeBytes);
     const auto &b = s.transfer.bitbltbuf;
     s.touchBuffer(b.dpsm, b.dbp, std::max<uint32_t>(b.dbw, 1u), s.transfer.trxpos.dsax, s.transfer.trxpos.dsay,
@@ -2728,7 +2961,10 @@ GSGpuBackend::Stats GSGpuBackend::GetStats() const
     Stats result = m_impl->stats;
     result.signaturesLive = m_impl->signatures.size();
     result.textureBytesLive = m_impl->textureBytes;
-    result.texturePoolBytes = m_impl->poolBytes;
+    {
+        std::lock_guard<std::mutex> poolLock(m_impl->poolMutex);
+        result.texturePoolBytes = m_impl->poolBytes;
+    }
     result.frameTargetBytes = m_impl->frameTargetBytes;
     result.depthTargetBytes = m_impl->depthTargetBytes;
     result.fieldTextureBytes = m_impl->fieldTextureBytes;
