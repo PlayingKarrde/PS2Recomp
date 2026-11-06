@@ -59,10 +59,19 @@ namespace ps2x_gs
 
     std::unique_ptr<GSRasterBackend> createConfiguredBackend()
     {
+        // gpu is the default (decided at M5, 2026-11-06). Without a usable SDL_GPU device it falls back to the
+        // CPU renderer below. PS2X_GS_RECORD alone also picks cpu: only the CPU renderer records GS traffic.
         const char *wanted = std::getenv("PS2X_GS_BACKEND");
-        const bool gpu = wanted && std::strcmp(wanted, "gpu") == 0;
-        if (wanted && !gpu && std::strcmp(wanted, "cpu") != 0)
-            std::fprintf(stderr, "[gs] PS2X_GS_BACKEND=%s is not cpu or gpu, using cpu\n", wanted);
+        bool gpu = true;
+        if (wanted && std::strcmp(wanted, "cpu") == 0)
+            gpu = false;
+        else if (wanted && std::strcmp(wanted, "gpu") != 0)
+            std::fprintf(stderr, "[gs] PS2X_GS_BACKEND=%s is not cpu or gpu, using the default, gpu\n", wanted);
+        if (!wanted && std::getenv("PS2X_GS_RECORD"))
+        {
+            say("[gs] PS2X_GS_RECORD is set: using the CPU renderer, the only one that records GS traffic (PS2X_GS_BACKEND=gpu overrides)");
+            gpu = false;
+        }
         const bool stats = envFlag("PS2X_GS_STATS");
 
         std::unique_ptr<GSRasterBackend> backend;
@@ -100,14 +109,14 @@ namespace ps2x_gs
             SDL_GPUDevice *device = ps2x_host::gpuDevice();
             if (!device)
             {
-                say("[gs] PS2X_GS_BACKEND=gpu needs the SDL_GPU presenter, which is not in use (PS2X_PRESENT=renderer, or its device could not be created); keeping the CPU renderer");
+                say("[gs] the GPU renderer needs the SDL_GPU presenter, which is not in use (PS2X_PRESENT=renderer, or its device could not be created); using the CPU renderer");
             }
             else
             {
                 auto candidate = std::make_unique<GSGpuBackend>(device, scale, g.fields);
                 if (!candidate->Ready())
                 {
-                    say("[gs] the GPU renderer could not be set up (see above); keeping the CPU renderer");
+                    say("[gs] the GPU renderer could not be set up (see above); using the CPU renderer");
                 }
                 else
                 {
@@ -154,7 +163,7 @@ namespace ps2x_gs
                     {
                         say(line);
                         if (std::getenv("PS2X_GS_RECORD"))
-                            say("[gs] PS2X_GS_RECORD is set, but only the CPU renderer records GS traffic; nothing is recorded with PS2X_GS_BACKEND=gpu");
+                            say("[gs] PS2X_GS_RECORD is set, but only the CPU renderer records GS traffic; nothing is recorded with the GPU renderer (PS2X_GS_BACKEND=cpu records)");
                         backend = std::move(candidate);
                     }
                 }

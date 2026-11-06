@@ -913,7 +913,8 @@ bool PS2Runtime::initialize(const char *title)
                 return false;
             }
         }
-        // The GS renderer: the CPU one the GS starts with, unless PS2X_GS_BACKEND=gpu (or a stats wrapper) asks for another.
+        // The GS renderer: the GPU one by default, or the CPU one the GS starts with when PS2X_GS_BACKEND=cpu, when
+        // PS2X_GS_RECORD alone is set, or when no SDL_GPU device exists (gs_gpu_host.h).
         // It needs the window's SDL_GPU device, so it is chosen here, after the window exists.
         if (std::unique_ptr<GSRasterBackend> backend = ps2x_gs::createConfiguredBackend())
             m_gs.setRasterBackend(std::move(backend));

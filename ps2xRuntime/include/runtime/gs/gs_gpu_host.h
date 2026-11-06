@@ -6,7 +6,9 @@
 // to this one.
 //
 // Environment variables (all read once, at start):
-//   PS2X_GS_BACKEND=cpu|gpu     the GS renderer; cpu is the default and behaves exactly as before.
+//   PS2X_GS_BACKEND=cpu|gpu     the GS renderer; gpu is the default (since M5). Without an SDL_GPU device it falls
+//                               back to cpu with one log line. Unset with PS2X_GS_RECORD set picks cpu, the only
+//                               renderer that records; the debug panel's VRAM views also need cpu.
 //   PS2X_GS_SCALE=1..4          internal resolution multiplier N (default 1): the targets are 640N x 448N per field
 //                               (progressive mode), and the picture the host shows is that size, scaled to the window
 //                               with linear filtering. Anything else than 1 to 4 is refused with a log line and 1 is
