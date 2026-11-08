@@ -410,6 +410,9 @@ GSGpuPresenter::Size GSGpuPresenter::Pull()
             s.pending = Impl::Pending::Field;
             s.cur = f;
             s.shown = Size{f.width, isFieldPicture(f) ? f.height * 2u : f.height};
+            // A picture wider than the game's 640 GS pixels (PS2X_GS_WIDE) says what shape it should be shown in.
+            if (f.scaleX != 0u && f.width / f.scaleX > 640u)
+                s.shown.aspect = static_cast<float>(f.width / f.scaleX) / 480.0f;
         }
     }
     return s.shown;

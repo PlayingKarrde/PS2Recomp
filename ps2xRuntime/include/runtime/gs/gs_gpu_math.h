@@ -13,6 +13,8 @@
 //   - Z is the 24-bit GS value divided by 2^24, which a 32-bit float holds exactly.
 //   - The target can be larger than the GS frame by a factor per axis (TargetMapping); in progressive field mode
 //     (GPU renderer M4a) it is twice as tall and the half line by which the game offsets alternate fields is removed.
+//   - The target can also be wider than the screen (widescreen prototype, task w1): TargetMapping::padLeft GS pixels are added on the
+//     left, so screen x = 0 lands at target pixel padLeft * sx; Setup::minX/maxX stay in screen pixels.
 // Nothing here includes SDL, and no header that generated game code includes refers to this one.
 
 #include "runtime/gs/gs_types.h"
@@ -66,6 +68,13 @@ namespace GSGpu
                s.maxY < static_cast<int32_t>(sc.y0) || s.minY > static_cast<int32_t>(sc.y1);
     }
 
+    // The same test with a scissor given as signed screen pixels (x may be negative or beyond 639 for a scissor widened for a
+    // wider target, see TargetMapping::padLeft).
+    inline bool BoxOutsideScissorWide(const Setup &s, int32_t x0, int32_t x1, int32_t y0, int32_t y1)
+    {
+        return s.maxX < x0 || s.minX > x1 || s.maxY < y0 || s.minY > y1;
+    }
+
     // How GS pixels map to target pixels: `sx` and `sy` target pixels per GS pixel along each axis.
     //
     // Weave mode (progressive == false) draws each of the game's 640 x 224 fields as it is, at `scale` times that size
@@ -97,11 +106,16 @@ namespace GSGpu
     // measurement (PS2X_GS_SAMPLE_GRID=centre); the corner rule is the default.
     // Sprites need no such step: their coordinates are truncated to whole pixels (BuildSprite), which already ignores
     // the fraction of OFY, and they cover the block of target pixels of each GS pixel they cover.
+    //
+    // Widescreen (task w1): `padLeft` GS pixels are added to the left of the screen, so a primitive's screen x (the GS position minus
+    // OFX, 0 at the screen's left edge) lands at target pixel (x + padLeft) * sx. The screen then reaches from -padLeft to
+    // 639 + padRight, and the target is (640 + padLeft + padRight) * sx wide. Setup::minX and maxX stay in screen pixels.
     struct TargetMapping
     {
         uint32_t sx = 1, sy = 1;
         bool progressive = false;
         bool centred = false;
+        uint32_t padLeft = 0;
     };
 
     // TRIANGLE / TRISTRIP / TRIFAN: the batch holds one triangle. Returns false for a triangle with no
@@ -128,7 +142,7 @@ namespace GSGpu
         // 448-line grid, half a GS row).
         const float blockX = fscaleX;
         const float blockY = map.progressive ? fscaleY * 0.5f : fscaleY;
-        const float offsetX = map.centred ? blockX * 0.5f : 0.5f;
+        const float offsetX = (map.centred ? blockX * 0.5f : 0.5f) + static_cast<float>(map.padLeft) * fscaleX;
         const float offsetY = map.centred ? blockY * 0.5f : 0.5f;
         float fx[3], fy[3];
         for (int i = 0; i < 3; ++i)
@@ -230,9 +244,10 @@ namespace GSGpu
 
         const float fscaleX = static_cast<float>(map.sx);
         const float fscaleY = static_cast<float>(map.sy);
-        const float left = static_cast<float>(x0) * fscaleX;
+        const float padX = static_cast<float>(map.padLeft);
+        const float left = (static_cast<float>(x0) + padX) * fscaleX;
         const float top = static_cast<float>(y0) * fscaleY;
-        const float right = static_cast<float>(x0 + spanX) * fscaleX;
+        const float right = (static_cast<float>(x0 + spanX) + padX) * fscaleX;
         const float bottom = static_cast<float>(y0 + spanY) * fscaleY;
         const float z = static_cast<float>(v1.z * static_cast<double>(kDepthScale));
         const uint32_t rgba = PackRgba(v1.r, v1.g, v1.b, v1.a);

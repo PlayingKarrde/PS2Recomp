@@ -434,6 +434,52 @@ void register_gs_gpu_tests()
             t.IsTrue((BuildFragUniforms(textured, true, false, 0u, 0u, true).flags[0] & kFlagSpriteAtTarget) == 0u, "no flag without snapping (scale 1, weave)");
         });
 
+        tc.Run("a widened target puts screen x = 0 at pixel padLeft * scale and keeps the box in screen pixels", [](TestCase &t)
+        {
+            // Widescreen prototype (task w1): padLeft extra GS pixels on the left; with padLeft 0 nothing changes.
+            for (uint32_t n : {1u, 2u})
+            {
+                const TargetMapping plain{n, 2u * n, true};
+                TargetMapping wide{n, 2u * n, true};
+                wide.padLeft = 107;
+                GSPrimitiveBatch tri = triangleBatch(10.0f, 20.0f, 50.0f, 20.0f, 10.0f, 60.0f);
+                GSPrimitiveBatch spr = spriteBatch(10.0f, 20.0f, 50.0f, 60.0f);
+                Setup tp, tw, sp, sw;
+                t.IsTrue(BuildTriangle(tri, plain, tp) && BuildTriangle(tri, wide, tw), "triangle converts");
+                t.IsTrue(BuildSprite(spr, plain, sp) && BuildSprite(spr, wide, sw), "sprite converts");
+                const float shift = 107.0f * static_cast<float>(n);
+                for (int i = 0; i < 3; ++i)
+                {
+                    t.Equals(tw.v[i].x, tp.v[i].x + shift, "triangle x moves by padLeft * scale");
+                    t.Equals(tw.v[i].y, tp.v[i].y, "triangle y does not move");
+                }
+                for (uint32_t i = 0; i < sp.count; ++i)
+                {
+                    t.Equals(sw.v[i].x, sp.v[i].x + shift, "sprite x moves by padLeft * scale");
+                    t.Equals(sw.v[i].y, sp.v[i].y, "sprite y does not move");
+                    t.Equals(sw.v[i].u, sp.v[i].u, "texture coordinates do not move");
+                }
+                t.Equals(tw.minX, tp.minX, "triangle box stays in screen pixels (min x)");
+                t.Equals(tw.maxX, tp.maxX, "triangle box stays in screen pixels (max x)");
+                t.Equals(sw.minX, sp.minX, "sprite box stays in screen pixels");
+                t.Equals(sw.maxX, sp.maxX, "sprite box stays in screen pixels (max x)");
+            }
+            // A primitive left of the screen has a negative box and passes a scissor that was widened to the left only.
+            GSPrimitiveBatch left = triangleBatch(-60.0f, 20.0f, -30.0f, 20.0f, -60.0f, 60.0f);
+            Setup sl;
+            t.IsTrue(BuildTriangle(left, TargetMapping{1, 2, true}, sl), "off-screen triangle converts");
+            t.IsTrue(sl.maxX < 0, "its box is left of the screen");
+            t.IsTrue(BoxOutsideScissorWide(sl, 0, 639, 0, 223), "outside the game's scissor");
+            t.IsTrue(!BoxOutsideScissorWide(sl, -107, 746, 0, 223), "inside a scissor widened by 107 on each side");
+            t.IsTrue(BoxOutsideScissorWide(sl, -20, 746, 0, 223), "outside one widened by only 20");
+            GSScissorReg sc;
+            sc.x0 = 0;
+            sc.x1 = 639;
+            sc.y0 = 0;
+            sc.y1 = 223;
+            t.IsTrue(BoxOutsideScissorWide(sl, sc.x0, sc.x1, sc.y0, sc.y1) == BoxOutsideScissor(sl, sc), "the signed test agrees with the unsigned one");
+        });
+
         tc.Run("blend equations map to fixed-function blending", [](TestCase &t)
         {
             BlendState a = BlendFromAlpha(true, alphaReg(0, 1, 0, 1)); // (Cs-Cd)*As+Cd

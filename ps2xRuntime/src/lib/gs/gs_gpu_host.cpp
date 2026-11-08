@@ -114,6 +114,11 @@ namespace ps2x_gs
             else
             {
                 auto candidate = std::make_unique<GSGpuBackend>(device, scale, g.fields);
+                if (candidate->Ready() && g.readback && candidate->WidePadLeft() + candidate->WidePadRight() != 0u)
+                {
+                    std::fprintf(stderr, "[gs] PS2X_GS_WIDE needs path B; PS2X_GS_GPU_READBACK=1 carries the host's 640x512 CPU picture only, widescreen off\n");
+                    candidate->DisableWide();
+                }
                 if (!candidate->Ready())
                 {
                     say("[gs] the GPU renderer could not be set up (see above); using the CPU renderer");
@@ -191,6 +196,7 @@ namespace ps2x_gs
             const GSGpuPresenter::Size s = g.presenter->Pull();
             size.width = s.width;
             size.height = s.height;
+            size.aspect = s.aspect;
         }
         return size;
     }

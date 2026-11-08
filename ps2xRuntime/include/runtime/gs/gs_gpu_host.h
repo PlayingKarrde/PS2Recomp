@@ -33,6 +33,16 @@
 //                               it the GPU renderer uses path B, the direct path (see gs_gpu_present.h).
 //                               Both paths follow PS2X_GS_FIELDS (in progressive mode path A's pictures are
 //                               448 lines, which the CPU deinterlacer leaves alone).
+//   PS2X_GS_WIDE=<W:H>          widescreen prototype (task w1; progressive mode and path B only, off by default): the targets and
+//                               the picture are wider than the game's 640 GS pixels, so a 4:3 picture becomes W:H and shows the
+//                               extra scene left and right of it (see GSGpuBackend, WidePadLeft). PS2X_GS_WIDE_FILL=0 stops
+//                               full-screen fills and fades being stretched over the new columns. PS2X_ASPECT still overrides the
+//                               shape the picture is shown in.
+//   PS2X_GS_W1_LOG=<file>       test aid: one CSV row per VBlank with where the primitives lie against the 640-wide screen.
+//   PS2X_GS_W1_PRIMS=<file>     test aid (with PS2X_GS_W1_LOG): one line per primitive for the VBlanks that draw at most 150.
+//   PS2X_GS_W1_REGS=1           test aid (gs_frontend.cpp): each distinct value written to PRIM, PRMODE(CONT), FRAME, ZBUF, XYOFFSET,
+//                               SCISSOR and TEST is logged once.
+//   PS2X_WINDOW=<W>x<H>         the host window's size (default 640x480), to look at a widened picture at its own shape.
 //   PS2X_GS_STABILITY=<file>    test aid, path B: after each new picture, append a CSV row with the share of pixels
 //                               that differ from the previous picture (waits for the GPU; see gs_gpu_present.cpp).
 //   PS2X_GS_STATS=1             wrap the chosen renderer in GSBackendProbe: per-call timing and calling
@@ -62,6 +72,8 @@ namespace ps2x_gs
     {
         uint32_t width = 640;
         uint32_t height = 448;
+        // The shape (width / height) the picture should be shown in when it is a widened one (PS2X_GS_WIDE); 0 for the usual 4:3.
+        float aspect = 0.0f;
     };
 
     // Path B, main thread, once per guest VBlank: takes the newest finished field from the GS thread (never

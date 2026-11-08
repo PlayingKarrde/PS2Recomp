@@ -202,6 +202,15 @@ public:
     // publishing Present() returns GS-pixel pictures, 640 pixels per row (kPresentationStride).
     uint32_t PictureStride() const;
     uint32_t PictureRows() const;
+    // Widescreen prototype (task w1; PS2X_GS_WIDE=<W:H>, read when the backend is created, progressive mode only, off by default):
+    // the targets and field textures are (640 + WidePadLeft() + WidePadRight()) GS pixels wide, so the picture shows that many extra
+    // columns of the scene left and right of the game's 640. Both are 0 when it is off. The picture's shape, as width / height
+    // of the box it should be shown in, is WideAspect() (4/3 when off); it is the width in GS pixels over 480.
+    uint32_t WidePadLeft() const;
+    uint32_t WidePadRight() const;
+    float WideAspect() const;
+    // Turns widescreen off again; call before the first draw and before SetFieldPublishing (the host does for path A, which carries a 640-wide picture).
+    void DisableWide();
 
     void Initialize(uint8_t *vram, uint32_t vramSize) override;
     void Reset() override;

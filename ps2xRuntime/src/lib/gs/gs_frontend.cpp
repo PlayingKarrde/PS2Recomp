@@ -11,6 +11,10 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <chrono>
+#include <cstdlib>
+#include <map>
+#include <mutex>
 #include <iostream>
 #include <sstream>
 
@@ -1118,8 +1122,58 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
     writeRegisterUnlocked(regAddr, value);
 }
 
+namespace
+{
+    // PS2X_GS_W1_REGS=1 (widescreen investigation, task w1): every distinct value written to PRIM, PRMODE, PRMODECONT, the frame,
+    // Z buffer, offset, scissor and test registers of both contexts is logged once, with the time and how many writes of that register
+    // came before it. A scene's state shows up as the lines that appear when the scene starts.
+    bool w1RegsEnabled()
+    {
+        static const bool on = []()
+        {
+            const char *v = std::getenv("PS2X_GS_W1_REGS");
+            return v && v[0] == '1';
+        }();
+        return on;
+    }
+
+    void w1NoteRegister(uint8_t regAddr, uint64_t value)
+    {
+        const char *name = nullptr;
+        switch (regAddr)
+        {
+        case GS_REG_PRIM: name = "PRIM"; break;
+        case GS_REG_PRMODE: name = "PRMODE"; break;
+        case GS_REG_PRMODECONT: name = "PRMODECONT"; break;
+        case GS_REG_FRAME_1: name = "FRAME_1"; break;
+        case GS_REG_FRAME_2: name = "FRAME_2"; break;
+        case GS_REG_ZBUF_1: name = "ZBUF_1"; break;
+        case GS_REG_ZBUF_2: name = "ZBUF_2"; break;
+        case GS_REG_XYOFFSET_1: name = "XYOFFSET_1"; break;
+        case GS_REG_XYOFFSET_2: name = "XYOFFSET_2"; break;
+        case GS_REG_SCISSOR_1: name = "SCISSOR_1"; break;
+        case GS_REG_SCISSOR_2: name = "SCISSOR_2"; break;
+        case GS_REG_TEST_1: name = "TEST_1"; break;
+        case GS_REG_TEST_2: name = "TEST_2"; break;
+        default: return;
+        }
+        static std::mutex m;
+        static std::map<std::pair<uint8_t, uint64_t>, uint64_t> seen;
+        static std::map<uint8_t, uint64_t> writes;
+        static const auto start = std::chrono::steady_clock::now();
+        std::lock_guard<std::mutex> lock(m);
+        const uint64_t count = ++writes[regAddr];
+        if (seen.emplace(std::make_pair(regAddr, value), count).second && seen.size() < 20000)
+            std::fprintf(stderr, "[w1:reg] t=%lldms %s = 0x%llx (write %llu of this register)\n",
+                         static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count()), name,
+                         static_cast<unsigned long long>(value), static_cast<unsigned long long>(count));
+    }
+}
+
 void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
 {
+    if (w1RegsEnabled())
+        w1NoteRegister(regAddr, value);
     const bool interestingReg =
         regAddr == GS_REG_PRIM ||
         regAddr == GS_REG_RGBAQ ||

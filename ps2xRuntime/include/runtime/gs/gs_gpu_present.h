@@ -48,6 +48,9 @@ public:
     {
         uint32_t width = 640;
         uint32_t height = 448;
+        // Width / height of the box the picture should be shown in, or 0 for the usual 4:3. Not 0 when the picture is a widened one
+        // (PS2X_GS_WIDE, task w1): its width in GS pixels over 480.
+        float aspect = 0.0f;
     };
     Size Pull();
     SDL_GPUTexture *Record(SDL_GPUCommandBuffer *commandBuffer);

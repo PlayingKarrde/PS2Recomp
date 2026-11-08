@@ -114,6 +114,7 @@ namespace
         std::string directDir;
         bool states = false;
         bool offsets = false;   // investigation: how the half-line field offset is applied (see reportOffsets)
+        bool extent = false;    // investigation (task w1): how far the clip's primitives reach outside x 0..639 (see reportExtent)
         bool prims = false;     // investigation (task g4b): which primitive kinds the clip draws and how its sprites are scaled (see reportPrims)
         bool vsScale1 = false;  // task g4b: also run a scale-1 GPU renderer and compare the scaled pictures, averaged down, with its pictures
         int onlyState = -1;     // debugging: draw only primitives of this recorded state id
@@ -160,6 +161,9 @@ namespace
                      "  --presents      list the distinct presentation requests in the file and stop\n"
                      "  --offsets       list how the half-line field offset is applied in the file and stop\n"
                      "  --prims         list which primitive kinds the file draws and how its sprites are scaled and filtered, and stop\n"
+                     "  --wide W:H      widescreen prototype (task w1): the gpu renderer's targets and pictures are wider, as PS2X_GS_WIDE=W:H does in the game\n"
+                     "  --extent        list the GS state the clip draws with (scissor, offsets, frame, Z) and how far its primitives reach outside\n"
+                     "                  x 0..639 (widescreen investigation, task w1), and stop\n"
                      "  --vs-scale1     with --backend gpu --fields progressive --scale N (N > 1): also run a scale-1 GPU renderer and compare every\n"
                      "                  picture, averaged down by N in both directions, with its scale-1 picture (share of pixels differing by more than\n"
                      "                  8 in any colour channel); --diff-dir D writes the scale-1, averaged and difference pictures of the worst frames\n");
@@ -337,6 +341,16 @@ namespace
             else if (arg == "--prims")
             {
                 o.prims = true;
+            }
+            else if (arg == "--extent")
+            {
+                o.extent = true;
+            }
+            else if (arg == "--wide")
+            {
+                const char *v = value("--wide");
+                if (!v) return false;
+                setEnv("PS2X_GS_WIDE", v); // read by the GPU renderer when it is created (widescreen prototype, task w1)
             }
             else if (arg == "--vs-scale1")
             {
@@ -812,6 +826,189 @@ namespace
         return 0;
     }
 
+
+    // --extent (widescreen investigation, task w1): what state the clip draws with, and how far its primitives reach outside
+    // the 640-wide screen. For every primitive the screen-space bounding box is built the way the GPU renderer builds it
+    // (gs_gpu_math.h; X is the GS position minus OFX, so the screen is x 0..639), and the primitive is put in one class:
+    // inside, straddling the left edge, straddling the right edge, spanning both edges, entirely left, entirely right. The
+    // same is repeated for the scissor, which is what the GS itself keeps: a primitive entirely outside the scissor draws
+    // nothing. The report also lists the distinct SCISSOR, XYOFFSET, FRAME, ZBUF and PRIM attributes (primitives counted),
+    // and how far out the primitives that touch the screen reach (the histogram bins are in GS pixels beyond the edge).
+    int reportExtent(GSRec::Reader &reader)
+    {
+        static const char *const kType[] = {"POINT", "LINE", "LINESTRIP", "TRIANGLE", "TRISTRIP", "TRIFAN", "SPRITE"};
+        static const char *const kClass[] = {"inside", "left edge", "right edge", "both edges", "all left", "all right"};
+        struct Counts
+        {
+            uint64_t n[6] = {};
+        };
+        Counts byKind[2][2];                         // [sprite 0 / triangle 1][untextured 0 / textured 1]
+        uint64_t total = 0, markers = 0, inScissor = 0, emptyScissor = 0;
+        std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>, uint64_t> scissors;                           // x0 x1 y0 y1
+        std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>, uint64_t> frames;                             // fbp fbw psm zbp
+        std::map<std::tuple<uint32_t, uint32_t>, uint64_t> offsets;                                                // ofx ofy
+        std::map<std::string, uint64_t> prims;
+        const int32_t kBins[] = {1, 20, 40, 80, 160, 320, 640, 1280, 100000};
+        uint64_t leftReach[9] = {}, rightReach[9] = {}; // by how far a straddling primitive's far corner is beyond the edge
+        int32_t minOfAll = 0, maxOfAll = 639;
+        uint64_t outsideThisMarker = 0, outsideMarkers = 0, maxOutsideInMarker = 0;
+        std::map<uint32_t, uint64_t> widthHist; // bounding-box width of triangles, in 80 pixel bins: how large single prims are
+        // The 2D elements of a 3D scene (the HUD): textured primitives with UV coordinates (FST) and flat shading, as opposed to the
+        // perspective (STQ) prims of the 3D world. Counted by the screen x range they cover, in 40 pixel bins by their left edge.
+        std::map<int32_t, uint64_t> hudByLeft;
+        uint64_t hudPrims = 0;
+        int32_t hudMin = 100000, hudMax = -100000;
+        GSRec::Record r;
+        while (reader.next(r) == GSRec::Reader::Status::Ok)
+        {
+            if (r.type == GSRec::RT_Marker)
+            {
+                ++markers;
+                if (outsideThisMarker)
+                    ++outsideMarkers;
+                maxOutsideInMarker = std::max(maxOutsideInMarker, outsideThisMarker);
+                outsideThisMarker = 0;
+                continue;
+            }
+            if (r.type != GSRec::RT_Submit)
+                continue;
+            const GSDrawState &st = r.batch.state;
+            const unsigned type = std::min<unsigned>(st.prim.type, 6);
+            const GSContext &c = st.context;
+            ++scissors[{c.scissor.x0, c.scissor.x1, c.scissor.y0, c.scissor.y1}];
+            ++frames[{c.frame.fbp, c.frame.fbw, c.frame.psm, c.zbuf.zbp}];
+            ++offsets[{c.xyoffset.ofx, c.xyoffset.ofy}];
+            {
+                char key[160];
+                std::snprintf(key, sizeof(key), "%-9s iip %d tme %d fst %d abe %d fge %d aa1 %d ctxt %d", kType[type], st.prim.iip, st.prim.tme, st.prim.fst, st.prim.abe, st.prim.fge,
+                              st.prim.aa1, st.prim.ctxt);
+                ++prims[key];
+            }
+            if (type == GS_PRIM_POINT || type == GS_PRIM_LINE || type == GS_PRIM_LINESTRIP)
+                continue;
+            GSGpu::Setup setup;
+            const bool sprite = type == GS_PRIM_SPRITE;
+            if (sprite ? (r.batch.vertexCount < 2 || !GSGpu::BuildSprite(r.batch, GSGpu::TargetMapping{1, 1, false}, setup))
+                       : !GSGpu::BuildTriangle(r.batch, GSGpu::TargetMapping{1, 1, false}, setup))
+                continue;
+            ++total;
+            const int32_t minX = setup.minX, maxX = setup.maxX;
+            int cls;
+            if (maxX < 0)
+                cls = 4;
+            else if (minX > 639)
+                cls = 5;
+            else if (minX < 0 && maxX > 639)
+                cls = 3;
+            else if (minX < 0)
+                cls = 1;
+            else if (maxX > 639)
+                cls = 2;
+            else
+                cls = 0;
+            ++byKind[sprite ? 0 : 1][st.prim.tme ? 1 : 0].n[cls];
+            if (!sprite && st.prim.tme && st.prim.fst && !st.prim.iip)
+            {
+                ++hudPrims;
+                hudMin = std::min(hudMin, minX);
+                hudMax = std::max(hudMax, maxX);
+                ++hudByLeft[(minX >= 0 ? minX / 40 : -1) * 40];
+            }
+            if (cls != 0)
+                ++outsideThisMarker;
+            minOfAll = std::min(minOfAll, minX);
+            maxOfAll = std::max(maxOfAll, maxX);
+            if (!sprite)
+                ++widthHist[static_cast<uint32_t>(std::max<int32_t>(0, std::min<int32_t>(maxX - minX, 4000)) / 80)];
+            // scissor test, as the GPU renderer's BoxOutsideScissor
+            if (GSGpu::BoxOutsideScissor(setup, c.scissor))
+                ++emptyScissor;
+            else
+                ++inScissor;
+            if (minX < 0 && maxX >= 0)
+            {
+                for (int b = 0; b < 9; ++b)
+                    if (-minX <= kBins[b] || b == 8)
+                    {
+                        ++leftReach[b];
+                        break;
+                    }
+            }
+            if (maxX > 639 && minX <= 639)
+            {
+                for (int b = 0; b < 9; ++b)
+                    if (maxX - 639 <= kBins[b] || b == 8)
+                    {
+                        ++rightReach[b];
+                        break;
+                    }
+            }
+        }
+        std::printf("markers: %llu; triangles and sprites with area: %llu\n", static_cast<unsigned long long>(markers), static_cast<unsigned long long>(total));
+        std::printf("SCISSOR x0 x1 y0 y1 (prims):\n");
+        for (const auto &e : scissors)
+            std::printf("  %u %u %u %u : %llu\n", std::get<0>(e.first), std::get<1>(e.first), std::get<2>(e.first), std::get<3>(e.first), static_cast<unsigned long long>(e.second));
+        std::printf("XYOFFSET ofx ofy (1/16 pixel; prims):\n");
+        for (const auto &e : offsets)
+            std::printf("  %u (%.4f) %u (%.4f) : %llu\n", std::get<0>(e.first), std::get<0>(e.first) / 16.0, std::get<1>(e.first), std::get<1>(e.first) / 16.0, static_cast<unsigned long long>(e.second));
+        std::printf("FRAME fbp fbw psm / ZBUF zbp (prims):\n");
+        for (const auto &e : frames)
+            std::printf("  fbp %u fbw %u psm 0x%02x zbp %u : %llu\n", std::get<0>(e.first), std::get<1>(e.first), std::get<2>(e.first), std::get<3>(e.first), static_cast<unsigned long long>(e.second));
+        std::printf("PRIM attributes (prims):\n");
+        for (const auto &e : prims)
+            std::printf("  %s : %llu\n", e.first.c_str(), static_cast<unsigned long long>(e.second));
+        std::printf("screen x extent of all primitives: %d .. %d (screen is 0..639)\n", minOfAll, maxOfAll);
+        std::printf("class by screen position (x 0..639) of the bounding box:\n");
+        std::printf("  %-22s", "");
+        for (int cl = 0; cl < 6; ++cl)
+            std::printf(" %10s", kClass[cl]);
+        std::printf("\n");
+        for (int k = 0; k < 2; ++k)
+            for (int t = 0; t < 2; ++t)
+            {
+                std::printf("  %-9s %-12s", k ? "triangle" : "sprite", t ? "textured" : "untextured");
+                for (int cl = 0; cl < 6; ++cl)
+                    std::printf(" %10llu", static_cast<unsigned long long>(byKind[k][t].n[cl]));
+                std::printf("\n");
+            }
+        uint64_t outside = 0, entirelyOut = 0;
+        for (int k = 0; k < 2; ++k)
+            for (int t = 0; t < 2; ++t)
+                for (int cl = 1; cl < 6; ++cl)
+                {
+                    outside += byKind[k][t].n[cl];
+                    if (cl >= 4)
+                        entirelyOut += byKind[k][t].n[cl];
+                }
+        std::printf("primitives not entirely inside x 0..639: %llu of %llu (%.1f%%); entirely outside it: %llu (%.1f%%)\n", static_cast<unsigned long long>(outside),
+                    static_cast<unsigned long long>(total), 100.0 * static_cast<double>(outside) / std::max<double>(1.0, static_cast<double>(total)),
+                    static_cast<unsigned long long>(entirelyOut), 100.0 * static_cast<double>(entirelyOut) / std::max<double>(1.0, static_cast<double>(total)));
+        std::printf("with the clip's scissor: %llu primitives have a box that reaches it, %llu are entirely outside it (the GS draws nothing for those)\n",
+                    static_cast<unsigned long long>(inScissor), static_cast<unsigned long long>(emptyScissor));
+        std::printf("fields (markers) with at least one primitive not inside x 0..639: %llu of %llu; most in one field: %llu\n", static_cast<unsigned long long>(outsideMarkers),
+                    static_cast<unsigned long long>(markers), static_cast<unsigned long long>(maxOutsideInMarker));
+        std::printf("how far straddling primitives reach beyond an edge (GS pixels), count by bin <=");
+        for (int b = 0; b < 8; ++b)
+            std::printf(" %d", kBins[b]);
+        std::printf(" and more:\n  left : ");
+        for (int b = 0; b < 9; ++b)
+            std::printf(" %llu", static_cast<unsigned long long>(leftReach[b]));
+        std::printf("\n  right: ");
+        for (int b = 0; b < 9; ++b)
+            std::printf(" %llu", static_cast<unsigned long long>(rightReach[b]));
+        std::printf("\n");
+        std::printf("2D elements (textured, UV, flat shaded triangle strips): %llu primitives, screen x %d .. %d; by left edge in 40 pixel bins (bin: count):", static_cast<unsigned long long>(hudPrims),
+                    hudPrims ? hudMin : 0, hudPrims ? hudMax : 0);
+        for (const auto &e : hudByLeft)
+            std::printf(" %d:%llu", e.first, static_cast<unsigned long long>(e.second));
+        std::printf("\n");
+        std::printf("triangle bounding-box width in 80 pixel bins (bin: count):");
+        for (const auto &e : widthHist)
+            std::printf(" %u:%llu", e.first * 80, static_cast<unsigned long long>(e.second));
+        std::printf("\n");
+        return 0;
+    }
+
     int reportOffsets(GSRec::Reader &reader)
     {
         using Key4 = std::tuple<uint32_t, uint32_t, uint32_t, int, int>;
@@ -1246,6 +1443,8 @@ int main(int argc, char **argv)
         return reportOffsets(reader);
     if (opt.prims)
         return reportPrims(reader);
+    if (opt.extent)
+        return reportExtent(reader);
 
     if (opt.states)
     {

@@ -308,6 +308,38 @@ struct GSGpuBackend::Impl
     // PS2X_GS_SAMPLE_GRID=centre: put the samples of a block of target pixels around the scale-1 sample (gs_gpu_math.h,
     // TargetMapping), for measuring against the corner rule that is the default.
     bool centredGrid = false;
+    // ---- widescreen prototype (task w1). PS2X_GS_WIDE=<W:H> (progressive mode only) makes the frame and depth targets, the field
+    // textures and so the picture wider than the game's 640 GS pixels: `padLeft` extra GS pixels left of the screen (screen x < 0) and
+    // `padRight` right of it (x > 639), so a 4:3 picture becomes W:H. The game computes and sends geometry far beyond the screen (the
+    // GS scissor cuts it; replayer --extent), so the extra columns hold real scene. What changes:
+    //   - vertices: target x = (screen x + padLeft) * scaleX (TargetMapping::padLeft);
+    //   - the scissor: an edge that sits on the screen edge (x0 == 0, x1 == 639) moves out with it. Any other scissor (the select
+    //     screen's boxes) only moves with the pad, it is not widened;
+    //   - fills: an untextured primitive that spans the screen (a clear, a fade) has its screen-edge vertices pushed out to the
+    //     target's edge, so full-screen fades and flashes cover the new columns too (PS2X_GS_WIDE_FILL=0 turns that off);
+    //   - Z pages restored from memory, the seeding of a new target and the region copied into the field texture follow the pad.
+    uint32_t padLeft = 0, padRight = 0;
+    bool wideFills = true;
+    bool wide() const { return padLeft + padRight != 0u; }
+    // The screen-pixel range [x0, x1] the scissor allows for this draw (widened at the screen's edges).
+    int32_t scissorX0(const GSScissorReg &sc) const { return sc.x0 == 0u ? -static_cast<int32_t>(padLeft) : static_cast<int32_t>(sc.x0); }
+    int32_t scissorX1(const GSScissorReg &sc) const { return sc.x1 >= 639u ? 639 + static_cast<int32_t>(padRight) : static_cast<int32_t>(sc.x1); }
+    // Opt-in log of what a scene draws (PS2X_GS_W1_LOG=<file>): one CSV row per marker, see logWideRow.
+    std::FILE *wideLog = nullptr;
+    // PS2X_GS_W1_PRIMS=<file> (with PS2X_GS_W1_LOG): one line per primitive for the markers that draw at most 150 of them (for larger ones only those that span the screen) (2D scenes, fades,
+    // wipes): the marker number, kind, state and screen-space box. For finding out what a transition effect draws.
+    std::FILE *primLog = nullptr;
+    std::vector<std::string> primLines, spanLines; // the first 150 primitives of a marker; and those that span the screen (at most 40)
+    struct WideCounts
+    {
+        uint64_t prims = 0, inside = 0, leftEdge = 0, rightEdge = 0, both = 0, allLeft = 0, allRight = 0, ztest = 0, flatSpan = 0, texSpan = 0, filled = 0;
+        int32_t minX = 0, maxX = 0;
+        uint32_t scissorFull = 0, scissorOther = 0, ofx = 0, ofy = 0, fbp = 0, fbw = 0;
+        uint32_t scissorLast[4] = {0, 0, 0, 0};
+    } wc;
+    uint64_t wideMarker = 0;
+    void noteWide(const GSPrimitiveBatch &batch, const Setup &setup);
+    void logWideRow(const GSPresentationRequest &request);
     // PS2X_GS_SPRITE_SAMPLE=gs|target: how a textured sprite is sampled on a target larger than the GS frame (see
     // GSGpu::kFlagSnapToGsPixel and kFlagSpriteAtTarget). The default is gs at scale 1 (the M4a picture) and target above.
     bool spriteAtTarget = false;
@@ -474,7 +506,8 @@ struct GSGpuBackend::Impl
     ~Impl();
     bool init(SDL_GPUDevice *device, uint32_t s, GSGpuBackend::FieldMode fieldMode);
     bool progressive() const { return mode == GSGpuBackend::FieldMode::Progressive; }
-    GSGpu::TargetMapping mapping() const { return GSGpu::TargetMapping{scaleX, scaleY, progressive(), centredGrid}; }
+    GSGpu::TargetMapping mapping() const { return GSGpu::TargetMapping{scaleX, scaleY, progressive(), centredGrid, padLeft}; }
+    uint32_t targetWidth(uint32_t fbw) const { return (fbw * 64u + padLeft + padRight) * scaleX; } // a frame or depth target's width in pixels
 
     // memory
     void touchSpan(const PageSpan &span);
@@ -534,7 +567,54 @@ bool GSGpuBackend::Impl::init(SDL_GPUDevice *device, uint32_t s, GSGpuBackend::F
     }
     scaleX = scale;
     scaleY = progressive() ? scale * 2u : scale;
-    fieldTexW = GSGpuBackend::kFieldTextureWidth * scale;
+    if (const char *wideSpec = std::getenv("PS2X_GS_WIDE"))
+    {
+        float aw = 0.0f, ah = 0.0f;
+        if (wideSpec[0] == '\0' || std::strcmp(wideSpec, "off") == 0 || std::strcmp(wideSpec, "0") == 0)
+        {
+        }
+        else if (std::sscanf(wideSpec, "%f:%f", &aw, &ah) != 2 || !(aw > 0.0f) || !(ah > 0.0f))
+            std::fprintf(stderr, "[gs:gpu] PS2X_GS_WIDE=%s is not W:H (for example 16:9), widescreen off\n", wideSpec);
+        else if (!progressive())
+            std::fprintf(stderr, "[gs:gpu] PS2X_GS_WIDE=%s needs PS2X_GS_FIELDS=progressive, widescreen off\n", wideSpec);
+        else
+        {
+            // The game's 640 GS pixels are a 4:3 picture, so a W:H picture is 480 * W / H of them. Kept even, with equal pads.
+            const float total = 480.0f * aw / ah;
+            if (total < 642.0f)
+                std::fprintf(stderr, "[gs:gpu] PS2X_GS_WIDE=%s is not wider than 4:3, widescreen off\n", wideSpec);
+            else
+            {
+                const uint32_t pad = static_cast<uint32_t>(std::lround((total - 640.0f) * 0.5f));
+                if (pad > 640u)
+                    std::fprintf(stderr, "[gs:gpu] PS2X_GS_WIDE=%s is wider than 4:1, widescreen off\n", wideSpec);
+                else
+                {
+                    padLeft = padRight = pad;
+                    std::fprintf(stderr, "[gs:gpu] widescreen prototype: PS2X_GS_WIDE=%s, %u + 640 + %u = %u GS pixels wide (aspect %.4f)\n", wideSpec, padLeft,
+                                 padRight, 640u + padLeft + padRight, (640.0 + padLeft + padRight) / 480.0);
+                }
+            }
+        }
+        if (const char *fill = std::getenv("PS2X_GS_WIDE_FILL"))
+            wideFills = !(fill[0] == '0');
+    }
+    if (const char *path = std::getenv("PS2X_GS_W1_PRIMS"))
+        if (path[0] != '\0')
+        {
+            primLog = std::fopen(path, "w");
+            if (primLog)
+                std::fprintf(primLog, "marker,type,tme,fst,abe,iip,x0,x1,y0,y1,rgba_v2,z_v2,tbp0,tex_w,tex_h,tex_psm,alpha_reg,test_reg,scissor\n");
+        }
+    if (const char *path = std::getenv("PS2X_GS_W1_LOG"))
+        if (path[0] != '\0')
+        {
+            wideLog = std::fopen(path, "w");
+            if (wideLog)
+                std::fprintf(wideLog, "marker,t_ms,prims,inside,left_edge,right_edge,both_edges,all_left,all_right,min_x,max_x,z_gequal,flat_span,tex_span,filled,"
+                                      "scissor_full,scissor_other,scissor_last,ofx,ofy,fbp,fbw,pmode,smode2,dispfb1,display1,dispfb2,display2\n");
+        }
+    fieldTexW = (GSGpuBackend::kFieldTextureWidth + padLeft + padRight) * scale;
     fieldTexH = GSGpuBackend::kFieldTextureHeight * scale;
     spriteAtTarget = scale > 1u;
     if (const char *grid = std::getenv("PS2X_GS_SAMPLE_GRID"))
@@ -777,6 +857,10 @@ GSGpuBackend::Impl::~Impl()
         std::fclose(markerLog);
     if (uploadLog)
         std::fclose(uploadLog);
+    if (wideLog)
+        std::fclose(wideLog);
+    if (primLog)
+        std::fclose(primLog);
     if (!dev)
         return;
     SDL_WaitForGPUIdle(dev);
@@ -942,6 +1026,7 @@ void GSGpuBackend::Impl::restoreDepth(uint32_t depthIdx, uint32_t frameIdx, uint
     draw.sw = static_cast<int32_t>(target.w);
     draw.sh = static_cast<int32_t>(target.h);
     const float fsx = static_cast<float>(scaleX), fsy = static_cast<float>(scaleY);
+    const float zPad = static_cast<float>(padLeft); // a widened target holds GS x = 0 at pixel padLeft * scaleX
     for (const auto &t : tiles)
     {
         const float x0 = static_cast<float>(t.second * 64u), y0 = static_cast<float>(t.first * 32u);
@@ -950,7 +1035,7 @@ void GSGpuBackend::Impl::restoreDepth(uint32_t depthIdx, uint32_t frameIdx, uint
         auto make = [&](float x, float y, float u, float v)
         {
             Vertex r;
-            r.x = x * fsx;
+            r.x = (x + zPad) * fsx;
             r.y = y * fsy;
             r.z = 0.0f;
             r.rgba = 0xFFFFFFFFu;
@@ -993,7 +1078,7 @@ uint32_t GSGpuBackend::Impl::frameIndex(const GSFrameReg &frame)
     t.fbp = frame.fbp;
     t.fbw = fbw;
     t.psm = frame.psm;
-    t.w = fbw * 64u * scaleX;
+    t.w = targetWidth(fbw);
     t.h = targetRows * scaleY;
     SDL_GPUTextureCreateInfo ci = {};
     ci.type = SDL_GPU_TEXTURETYPE_2D;
@@ -1023,12 +1108,14 @@ uint32_t GSGpuBackend::Impl::frameIndex(const GSFrameReg &frame)
     {
         // One memory row covers scaleY target rows, and one memory pixel scaleX target pixels.
         uint32_t *first = px + static_cast<size_t>(gy) * scaleY * t.w;
+        if (wide())
+            std::memset(first, 0, static_cast<size_t>(t.w) * 4u); // the columns outside the game's screen start black
         for (uint32_t gx = 0; gx < fbw * 64u; ++gx)
         {
             const uint32_t raw = GSTransfer::ReadPixel(vram, frame.psm, basePtr, fbw, gx, gy);
             const uint32_t value = sixteen ? Rgba5551ToRgba8888(static_cast<uint16_t>(raw)) : raw;
             for (uint32_t k = 0; k < scaleX; ++k)
-                first[gx * scaleX + k] = value;
+                first[(gx + padLeft) * scaleX + k] = value;
         }
         for (uint32_t k = 1; k < scaleY; ++k)
             std::memcpy(first + static_cast<size_t>(k) * t.w, first, static_cast<size_t>(t.w) * 4u);
@@ -1040,7 +1127,7 @@ uint32_t GSGpuBackend::Impl::frameIndex(const GSFrameReg &frame)
 
 uint32_t GSGpuBackend::Impl::depthIndex(const GSZbufReg &zbuf, uint32_t fbw)
 {
-    const uint32_t w = std::max(fbw, 1u) * 64u * scaleX;
+    const uint32_t w = targetWidth(std::max(fbw, 1u));
     for (uint32_t i = 0; i < depths.size(); ++i)
         if (depths[i].zbp == zbuf.zbp && depths[i].w == w)
             return i;
@@ -1561,7 +1648,8 @@ void GSGpuBackend::Impl::submitSetup(const GSDrawState &state, const Setup &setu
 {
     const GSContext &ctx = state.context;
     ++stats.primitives;
-    if (BoxOutsideScissor(setup, ctx.scissor))
+    const int32_t scX0 = scissorX0(ctx.scissor), scX1 = scissorX1(ctx.scissor); // screen pixels; the game's own range unless widened
+    if (BoxOutsideScissorWide(setup, scX0, scX1, static_cast<int32_t>(ctx.scissor.y0), static_cast<int32_t>(ctx.scissor.y1)))
     {
         ++stats.primitivesCulled;
         return;
@@ -1625,9 +1713,10 @@ void GSGpuBackend::Impl::submitSetup(const GSDrawState &state, const Setup &setu
     }
     const FrameTarget &target = frames[frame];
     const int32_t mx = static_cast<int32_t>(scaleX), my = static_cast<int32_t>(scaleY);
-    d.sx = std::min<int32_t>(static_cast<int32_t>(ctx.scissor.x0) * mx, static_cast<int32_t>(target.w));
+    const int32_t padL = static_cast<int32_t>(padLeft);
+    d.sx = std::min<int32_t>((scX0 + padL) * mx, static_cast<int32_t>(target.w));
     d.sy = std::min<int32_t>(static_cast<int32_t>(ctx.scissor.y0) * my, static_cast<int32_t>(target.h));
-    d.sw = std::min<int32_t>((static_cast<int32_t>(ctx.scissor.x1) + 1) * mx, static_cast<int32_t>(target.w)) - d.sx;
+    d.sw = std::min<int32_t>((scX1 + 1 + padL) * mx, static_cast<int32_t>(target.w)) - d.sx;
     d.sh = std::min<int32_t>((static_cast<int32_t>(ctx.scissor.y1) + 1) * my, static_cast<int32_t>(target.h)) - d.sy;
     if (d.sw <= 0 || d.sh <= 0)
     {
@@ -1678,6 +1767,26 @@ void GSGpuBackend::Impl::submit(const GSPrimitiveBatch &batch)
         ++stats.primitivesUnsupported;
         note(11, "points and lines");
         return;
+    }
+    if (wideLog)
+        noteWide(batch, setup);
+    if (wide() && wideFills && !batch.state.prim.tme && setup.minX <= 1 && setup.maxX >= 638)
+    {
+        // An untextured primitive that spans the screen is a clear or a fade: push the vertices on the screen's edges out to
+        // the target's edge (the vertices are in target pixels; screen x = vertex x / scale - padLeft, give or take the 0.5 of a triangle).
+        const float fsx = static_cast<float>(scaleX);
+        const float outLeft = static_cast<float>(padLeft) * fsx, outRight = static_cast<float>(padRight) * fsx;
+        for (uint32_t i = 0; i < setup.count; ++i)
+        {
+            const float screenX = setup.v[i].x / fsx - static_cast<float>(padLeft);
+            if (screenX <= 1.0f)
+                setup.v[i].x -= outLeft;
+            else if (screenX >= 638.0f)
+                setup.v[i].x += outRight;
+        }
+        setup.minX = -static_cast<int32_t>(padLeft);
+        setup.maxX = 639 + static_cast<int32_t>(padRight);
+        ++wc.filled;
     }
     submitSetup(batch.state, setup);
     if (vertices.size() >= kMaxVerticesPerFlush || stage.size() >= kMaxStageBytes)
@@ -2005,12 +2114,12 @@ bool GSGpuBackend::Impl::copyFrame(const GSFrameReg &frame, uint32_t width, uint
         for (const FrameTarget &f : frames)
             if (f.fbp == frame.fbp && f.fbw == fbw && f.psm == frame.psm)
                 target = &f;
-    if (!target || (originX + width) * scaleX > target->w || (originY + height) * scaleY > target->h)
+    if (!target || (originX + padLeft + width) * scaleX > target->w || (originY + height) * scaleY > target->h)
         return GSPresent::CopyFrameFromMemory(vram, vramSize, frame, width, height, out, preserveAlpha, useLocalMemoryLayout,
                                               frameBaseIsPages, originX, originY);
 
     std::vector<uint8_t> region;
-    if (!downloadRegion(target->color, originX * scaleX, originY * scaleY, width * scaleX, height * scaleY, region))
+    if (!downloadRegion(target->color, (originX + padLeft) * scaleX, originY * scaleY, width * scaleX, height * scaleY, region))
         return false;
     out.assign(static_cast<size_t>(GSPresent::kHostFrameWidth) * GSPresent::kHostFrameHeight * 4u, 0u);
     const uint32_t regionWidth = width * scaleX;
@@ -2145,8 +2254,10 @@ GSGpuBackend::MarkResult GSGpuBackend::Impl::produceField(const GSPresentationRe
         // `copyWidth` x `copyHeight` target pixels (the GS size times the scales: 640 x 448 for a field in progressive
         // mode), at (copyX, copyY).
         const uint32_t fbw = plan.frame.fbw ? plan.frame.fbw : GSPresent::kHostFrameWidth / 64u;
-        const uint32_t copyWidth = plan.width * scaleX, copyHeight = plan.height * scaleY;
-        const uint32_t copyX = plan.originX * scaleX, copyY = plan.originY * scaleY;
+        // A widened target (task w1): a display of the game's whole 640 columns takes the extra columns with it.
+        const bool wideRegion = wide() && plan.originX == 0u && plan.width == 640u;
+        const uint32_t copyWidth = (plan.width + (wideRegion ? padLeft + padRight : 0u)) * scaleX, copyHeight = plan.height * scaleY;
+        const uint32_t copyX = (wideRegion ? 0u : plan.originX + padLeft) * scaleX, copyY = plan.originY * scaleY;
         const FrameTarget *target = nullptr;
         for (const FrameTarget &f : frames)
             if (f.fbp == plan.frame.fbp && f.fbw == fbw && f.psm == plan.frame.psm)
@@ -2192,7 +2303,7 @@ GSGpuBackend::MarkResult GSGpuBackend::Impl::produceField(const GSPresentationRe
                 FieldCopy copies[3];
                 copies[0] = {target->color, copyX, copyY, copyWidth, copyHeight, slots[static_cast<size_t>(got[0])].tex};
                 for (int i = 0; i < candidateCount; ++i)
-                    copies[1 + i] = {candidates[i]->color, 0u, 0u, copyWidth, copyHeight, slots[static_cast<size_t>(got[1 + i])].tex};
+                    copies[1 + i] = {candidates[i]->color, wideRegion ? 0u : padLeft * scaleX, 0u, copyWidth, copyHeight, slots[static_cast<size_t>(got[1 + i])].tex};
                 flushLocked(false, copies, 1 + candidateCount);
                 ++stats.fieldsFast;
                 if (candidateCount != 0)
@@ -2514,6 +2625,99 @@ void GSGpuBackend::Impl::writeMissLog()
 }
 
 // ------------------------------------------------------------------------------------------------
+// the widescreen investigation log (PS2X_GS_W1_LOG)
+
+// Called for every drawable primitive with its Setup (screen-space box, before any widening): counts where it lies against the
+// game's 640-wide screen. One row per marker is written by logWideRow.
+void GSGpuBackend::Impl::noteWide(const GSPrimitiveBatch &batch, const Setup &setup)
+{
+    const GSContext &c = batch.state.context;
+    ++wc.prims;
+    const int32_t minX = setup.minX, maxX = setup.maxX;
+    if (maxX < 0)
+        ++wc.allLeft;
+    else if (minX > 639)
+        ++wc.allRight;
+    else if (minX < 0 && maxX > 639)
+        ++wc.both;
+    else if (minX < 0)
+        ++wc.leftEdge;
+    else if (maxX > 639)
+        ++wc.rightEdge;
+    else
+        ++wc.inside;
+    if (wc.prims == 1u)
+        wc.minX = minX, wc.maxX = maxX;
+    wc.minX = std::min(wc.minX, minX);
+    wc.maxX = std::max(wc.maxX, maxX);
+    if ((c.test & (1ull << 16)) != 0ull && ((c.test >> 17) & 3u) >= 2u) // ZTE on and ZTST GEQUAL or GREATER: a test that can reject
+        ++wc.ztest;
+    if (minX <= 1 && maxX >= 638)
+    {
+        if (batch.state.prim.tme)
+            ++wc.texSpan;
+        else
+            ++wc.flatSpan;
+    }
+    if (c.scissor.x0 == 0u && c.scissor.x1 >= 639u)
+        ++wc.scissorFull;
+    else
+        ++wc.scissorOther;
+    wc.scissorLast[0] = c.scissor.x0;
+    wc.scissorLast[1] = c.scissor.x1;
+    wc.scissorLast[2] = c.scissor.y0;
+    wc.scissorLast[3] = c.scissor.y1;
+    wc.ofx = c.xyoffset.ofx;
+    wc.ofy = c.xyoffset.ofy;
+    wc.fbp = c.frame.fbp;
+    wc.fbw = c.frame.fbw;
+    const bool spans = setup.minX <= 1 && setup.maxX >= 638;
+    if (primLog && (primLines.size() < 150 || (spans && spanLines.size() < 40)))
+    {
+        const GSVertex &v = batch.vertices[batch.vertexCount > 0u ? batch.vertexCount - 1u : 0u];
+        char line[320];
+        std::snprintf(line, sizeof(line), "%llu,%u,%d,%d,%d,%d,%d,%d,%d,%d,%02x%02x%02x%02x,%u,%u,%u,%u,%u,%llx,%llx,%u/%u/%u/%u\n", static_cast<unsigned long long>(wideMarker),
+                      static_cast<unsigned>(batch.state.prim.type), batch.state.prim.tme ? 1 : 0, batch.state.prim.fst ? 1 : 0, batch.state.prim.abe ? 1 : 0,
+                      batch.state.prim.iip ? 1 : 0, setup.minX, setup.maxX, setup.minY, setup.maxY, v.r, v.g, v.b, v.a, static_cast<unsigned>(v.z),
+                      static_cast<unsigned>(c.tex0.tbp0), static_cast<unsigned>(batch.state.textureWidth), static_cast<unsigned>(batch.state.textureHeight),
+                      static_cast<unsigned>(c.tex0.psm), static_cast<unsigned long long>(c.alpha), static_cast<unsigned long long>(c.test), c.scissor.x0, c.scissor.x1,
+                      c.scissor.y0, c.scissor.y1);
+        if (primLines.size() < 150)
+            primLines.emplace_back(line);
+        if (spans && spanLines.size() < 40)
+            spanLines.emplace_back(line);
+    }
+}
+
+void GSGpuBackend::Impl::logWideRow(const GSPresentationRequest &request)
+{
+    if (!wideLog)
+        return;
+    static const uint64_t startNs = nowNanos();
+    std::fprintf(wideLog, "%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%d,%d,%llu,%llu,%llu,%llu,%u,%u,%u/%u/%u/%u,%u,%u,%u,%u,%llx,%llx,%llx,%llx,%llx,%llx\n",
+                 static_cast<unsigned long long>(wideMarker++), static_cast<unsigned long long>((nowNanos() - startNs) / 1000000ull),
+                 static_cast<unsigned long long>(wc.prims), static_cast<unsigned long long>(wc.inside), static_cast<unsigned long long>(wc.leftEdge),
+                 static_cast<unsigned long long>(wc.rightEdge), static_cast<unsigned long long>(wc.both), static_cast<unsigned long long>(wc.allLeft),
+                 static_cast<unsigned long long>(wc.allRight), wc.minX, wc.maxX, static_cast<unsigned long long>(wc.ztest),
+                 static_cast<unsigned long long>(wc.flatSpan), static_cast<unsigned long long>(wc.texSpan), static_cast<unsigned long long>(wc.filled),
+                 wc.scissorFull, wc.scissorOther, wc.scissorLast[0], wc.scissorLast[1], wc.scissorLast[2], wc.scissorLast[3], wc.ofx, wc.ofy, wc.fbp, wc.fbw,
+                 static_cast<unsigned long long>(request.pmode), static_cast<unsigned long long>(request.smode2),
+                 static_cast<unsigned long long>(request.dispfb1), static_cast<unsigned long long>(request.display1),
+                 static_cast<unsigned long long>(request.dispfb2), static_cast<unsigned long long>(request.display2));
+    if ((wideMarker % 30u) == 0u)
+        std::fflush(wideLog);
+    if (primLog)
+    {
+        // a small marker in full, a large one (a 3D scene) only through the primitives that span the screen: its clears and overlays
+        for (const std::string &l : wc.prims <= 150u ? primLines : spanLines)
+            std::fputs(l.c_str(), primLog);
+        primLines.clear();
+        spanLines.clear();
+    }
+    wc = WideCounts{};
+}
+
+// ------------------------------------------------------------------------------------------------
 // GSGpuBackend
 
 GSGpuBackend::GSGpuBackend(SDL_GPUDevice *device, uint32_t scale, FieldMode fields) : m_impl(std::make_unique<Impl>())
@@ -2552,6 +2756,36 @@ uint32_t GSGpuBackend::PictureStride() const
 uint32_t GSGpuBackend::PictureRows() const
 {
     return m_impl->fields ? m_impl->fieldTexH : GSPresent::kHostFrameHeight;
+}
+
+uint32_t GSGpuBackend::WidePadLeft() const
+{
+    return m_impl->padLeft;
+}
+
+uint32_t GSGpuBackend::WidePadRight() const
+{
+    return m_impl->padRight;
+}
+
+float GSGpuBackend::WideAspect() const
+{
+    return static_cast<float>(640u + m_impl->padLeft + m_impl->padRight) / 480.0f;
+}
+
+void GSGpuBackend::DisableWide()
+{
+    Impl &s = *m_impl;
+    std::lock_guard<std::mutex> lock(s.mutex);
+    if (s.padLeft + s.padRight == 0u)
+        return;
+    if (!s.frames.empty() || s.fields)
+    {
+        std::fprintf(stderr, "[gs:gpu] DisableWide() after the first draw is ignored\n");
+        return;
+    }
+    s.padLeft = s.padRight = 0u;
+    s.fieldTexW = kFieldTextureWidth * s.scale;
 }
 
 void GSGpuBackend::Initialize(uint8_t *vram, uint32_t vramSize)
@@ -2731,6 +2965,8 @@ GSGpuBackend::MarkResult GSGpuBackend::MarkPresentation(const GSPresentationRequ
     const uint64_t markNs = nowNanos() - markStart;
     s.stats.markNanos += markNs;
     ++s.markerSeq;
+    if (s.wideLog)
+        s.logWideRow(request);
     if (s.markerLog)
         s.logMarkerRow(markNs);
     if (!s.missLogPath.empty() && s.markerSeq % 300u == 0u)

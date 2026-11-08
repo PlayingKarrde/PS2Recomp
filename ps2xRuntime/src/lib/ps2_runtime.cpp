@@ -33,6 +33,9 @@
 #include <thread>
 #include <unordered_map>
 #include <sstream>
+#include <map>
+#include <mutex>
+#include <string>
 
 namespace ps2_stubs
 {
@@ -76,6 +79,14 @@ static float hostDisplayAspect()
     }();
     return s_aspect;
 }
+// True when PS2X_ASPECT is set: then it decides the shape of the picture even if the GPU renderer made a widened one.
+static bool hostDisplayAspectIsExplicit()
+{
+    const char *value = std::getenv("PS2X_ASPECT");
+    return value && *value;
+}
+// The shape the GPU renderer's direct path says its latest picture should be shown in (a widened picture, PS2X_GS_WIDE), or 0.
+static float s_directPictureAspect = 0.0f;
 // Scaling filter for the picture on screen. PS2X_SCALE picks it: "sharp" (default), "nearest" or
 // "bilinear". Sharp blows each pixel up by a whole number, which keeps it crisp and even, and only
 // smooths the last fraction of a pixel where the window size doesn't divide evenly.
@@ -485,6 +496,7 @@ static void UploadFrameDirect(PS2Runtime *rt, uint32_t &outWidth, uint32_t &outH
     }
     outWidth = s_size.width;
     outHeight = s_size.height;
+    s_directPictureAspect = s_size.aspect;
 }
 #endif
 
@@ -907,7 +919,20 @@ bool PS2Runtime::initialize(const char *title)
             const ps2x_host::ScaleMode mode = filter == HostScaleFilter::Nearest    ? ps2x_host::ScaleMode::Nearest
                                               : filter == HostScaleFilter::Bilinear ? ps2x_host::ScaleMode::Bilinear
                                                                                     : ps2x_host::ScaleMode::Sharp;
-            if (!ps2x_host::createWindow(title, HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, mode))
+            // PS2X_WINDOW=<W>x<H> opens the window at that size (default 640x480), for looking at a widened picture (PS2X_GS_WIDE).
+            int windowWidth = HOST_WINDOW_WIDTH, windowHeight = HOST_WINDOW_HEIGHT;
+            if (const char *size = std::getenv("PS2X_WINDOW"))
+            {
+                int w = 0, h = 0;
+                if (std::sscanf(size, "%dx%d", &w, &h) == 2 && w >= 160 && h >= 120 && w <= 7680 && h <= 4320)
+                {
+                    windowWidth = w;
+                    windowHeight = h;
+                }
+                else
+                    std::fprintf(stderr, "[host] PS2X_WINDOW=%s is not <W>x<H>, using %dx%d\n", size, windowWidth, windowHeight);
+            }
+            if (!ps2x_host::createWindow(title, windowWidth, windowHeight, mode))
             {
                 std::cerr << "Failed to create the host window" << std::endl;
                 return false;
@@ -2713,7 +2738,9 @@ void PS2Runtime::run()
         }
 #else
         // A TV stretches any display area to its own shape, 4:3 unless PS2X_ASPECT says otherwise.
-        const float aspect = hostDisplayAspect() > 0.0f
+        const float aspect = (s_directPictureAspect > 0.0f && !hostDisplayAspectIsExplicit())
+                                 ? s_directPictureAspect
+                             : hostDisplayAspect() > 0.0f
                                  ? hostDisplayAspect()
                                  : static_cast<float>(std::max<uint32_t>(1u, presentWidth)) /
                                        static_cast<float>(std::max<uint32_t>(1u, presentHeight));
