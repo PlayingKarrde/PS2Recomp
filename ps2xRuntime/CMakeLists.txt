@@ -587,6 +587,13 @@ endif()
 
 ps2x_stage_ffmpeg_runtime_dlls(ps2EntryRunner)
 
+# The RmlUi UI layer (src/lib/ui). Off by default: turning it on fetches RmlUi and FreeType and defines the
+# static library ps2_ui, which nothing in the game links yet.
+option(PS2X_BUILD_UI "Build the RmlUi UI layer (ps2_ui); fetches RmlUi and FreeType" OFF)
+if(PS2X_BUILD_UI AND NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
+    add_subdirectory(src/lib/ui)
+endif()
+
 if(PS2X_IS_VITA)
     set(VITA_MKSFOEX_FLAGS "${VITA_MKSFOEX_FLAGS} -d PARENTAL_LEVEL=1") 
     set(VITA_MKSFOEX_FLAGS "${VITA_MKSFOEX_FLAGS} -d ATTRIBUTE2=12")

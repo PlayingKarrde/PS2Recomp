@@ -1,0 +1,270 @@
+/*
+ * Theme "fpr": the overlay's look, taken from the menus of Fire Pro Wrestling Returns.
+ *
+ * What the game's own screens look like (from screenshots of its Options, wrestler select, edit and main menu):
+ *   - panels: near-black translucent fill with a thick cream border (#d1caaf, about 4 px at 640x480) and rounded
+ *     corners, drawn over a busy yellow and grey background;
+ *   - the cursor is a bar across the row, a steel-blue vertical gradient (#2c68a3 at the top to #4d8cc6), with
+ *     the row's text staying white;
+ *   - all text is white, bold and italic, widely spaced, with a black drop shadow;
+ *   - values sit at the right of a row in square brackets, "[Stereo]", "[85%]", "[OFF]";
+ *   - a description of the highlighted row in a separate bar at the bottom ("Adjust sound options.");
+ *   - the main menu's items are khaki bevelled bars (#c3bda4, light top edge, dark underside) under a gold band
+ *     (#cba32c to #e7bc3d); scroll bars are a bright blue thumb (#40a0ff) in a cream frame.
+ *
+ * Nothing from the game is used here: the font is Lato (SIL OFL 1.1, ../fonts), the colours are measured from the
+ * screenshots, the shapes are RCSS. Using the game's own font (fpr.fnt on the disc) and textures at run time would
+ * be a later step and is not needed for this look.
+ *
+ * Units: dp, the UI scale (1 dp = 1 pixel in a 720 pixel high window).
+ * RmlUi limits the theme works within: no box-shadow or filters (the renderer has no offscreen layers), so depth
+ * comes from borders and gradients.
+ */
+
+/* RmlUi has no built-in HTML defaults: an element is inline unless told otherwise, which makes a div ignore its
+   width and height. The samples ship rml.rcss for this; the theme needs only div. */
+div
+{
+    display: block;
+}
+
+body
+{
+    font-family: LatoLatin;
+    font-weight: bold;
+    font-style: italic;
+    font-size: 28dp;
+    letter-spacing: 1.8dp;
+    color: #ffffff;
+    font-effect: shadow(2dp 2dp #000000);
+    width: 100%;
+    height: 100%;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    /* A dim over the whole game picture, so the overlay reads as in front of it. */
+    background-color: #00000078;
+}
+
+/* ---- The window: a gold title band over the panels ---------------------------------------------------- */
+
+#window
+{
+    width: 960dp;
+    padding: 0;
+}
+
+#header
+{
+    display: flex;
+    flex-direction: row;
+    justify-content: space-between;
+    align-items: center;
+    height: 46dp;
+    padding: 0 20dp;
+    decorator: linear-gradient(180deg, #cba32c, #e7bc3d 70%, #d4ac32);
+    border-bottom: 3dp #7b735d;
+    border-top-left-radius: 10dp;
+    border-top-right-radius: 10dp;
+}
+
+#brand
+{
+    font-size: 18dp;
+    font-weight: normal;
+    font-effect: none;
+    color: #1c1a14;
+}
+
+#page-title
+{
+    font-size: 30dp;
+    color: #1c1a14;
+    font-effect: shadow(1dp 1dp #f6e7a8);
+}
+
+/* ---- Tabs: khaki bars like the main menu's items; the current one takes the blue cursor ------------------- */
+
+#tabs
+{
+    display: flex;
+    flex-direction: row;
+    padding: 12dp 0 0 0;
+}
+
+.tab
+{
+    display: block;
+    tab-index: auto;
+    nav: auto;
+    width: 210dp;
+    height: 52dp;
+    margin-right: 10dp;
+    padding-top: 9dp;
+    text-align: center;
+    color: #1c1a14;
+    font-effect: outline(1dp #ffffff);
+    decorator: linear-gradient(180deg, #efefef, #c3bda4 14%, #a59f89 80%, #6b6759);
+    border: 2dp #3c3b32;
+    border-radius: 4dp;
+}
+
+.tab:hover
+{
+    decorator: linear-gradient(180deg, #ffffff, #d8d2b8 14%, #b8b29a 80%, #7c7868);
+}
+
+.tab.selected
+{
+    color: #ffffff;
+    font-effect: shadow(2dp 2dp #000000);
+    decorator: linear-gradient(180deg, #2c68a3, #4d8cc6);
+    border-color: #d1caaf;
+}
+
+.tab:focus
+{
+    border-color: #ffffff;
+}
+
+/* ---- Panels: dark, translucent, cream border, rounded ----------------------------------------------------- */
+
+.panel
+{
+    box-sizing: border-box;
+    margin-top: 10dp;
+    padding: 12dp 14dp;
+    background-color: #000000d6;
+    border: 5dp #d1caaf;
+    border-radius: 10dp;
+}
+
+.row
+{
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    tab-index: auto;
+    nav: auto;
+    height: 52dp;
+    padding: 0 14dp;
+    border-radius: 3dp;
+}
+
+.row:hover,
+.row:focus
+{
+    decorator: linear-gradient(180deg, #2c68a3, #3a76b2 45%, #4d8cc6);
+}
+
+.row .label
+{
+    flex: 1 1 0;
+}
+
+.row .value
+{
+    width: 150dp;
+    text-align: right;
+}
+
+/* A slider is a cream-framed dark trough with a blue fill, between the label and the value. */
+.row .slider
+{
+    width: 300dp;
+    height: 20dp;
+    margin-right: 18dp;
+}
+
+.row .track
+{
+    width: 100%;
+    height: 20dp;
+    box-sizing: border-box;
+    background-color: #000000;
+    border: 3dp #d1caaf;
+    border-radius: 10dp;
+    overflow: hidden;
+}
+
+.row .fill
+{
+    width: 50%;
+    height: 14dp;
+    decorator: linear-gradient(180deg, #8ec7ff, #40a0ff 45%, #2a68a6);
+}
+
+.row:focus .track
+{
+    border-color: #ffffff;
+}
+
+/* ---- The help line and the footer ------------------------------------------------------------------------ */
+
+#help
+{
+    box-sizing: border-box;
+    margin-top: 10dp;
+    height: 58dp;
+    padding: 8dp 14dp 0 14dp;
+    text-align: center;
+    background-color: #000000d6;
+    border: 5dp #d1caaf;
+    border-radius: 10dp;
+}
+
+#footer
+{
+    display: flex;
+    flex-direction: row;
+    justify-content: space-between;
+    align-items: center;
+    margin-top: 12dp;
+}
+
+#hints
+{
+    font-size: 19dp;
+    font-weight: normal;
+    color: #e6e0c8;
+    /* Over a bright game picture the bare text is hard to read. */
+    padding: 5dp 14dp 3dp 14dp;
+    background-color: #000000b4;
+    border-radius: 6dp;
+}
+
+#hints span
+{
+    margin-right: 22dp;
+}
+
+.button
+{
+    display: block;
+    tab-index: auto;
+    nav: auto;
+    width: 190dp;
+    height: 50dp;
+    padding-top: 9dp;
+    text-align: center;
+    color: #1c1a14;
+    font-effect: outline(1dp #ffffff);
+    decorator: linear-gradient(180deg, #efefef, #c3bda4 14%, #a59f89 80%, #6b6759);
+    border: 2dp #3c3b32;
+    border-radius: 4dp;
+}
+
+.button:hover,
+.button:focus
+{
+    color: #ffffff;
+    font-effect: shadow(2dp 2dp #000000);
+    decorator: linear-gradient(180deg, #2c68a3, #4d8cc6);
+    border-color: #d1caaf;
+}
+
+/* Last, so that it wins over the display set on .panel above. */
+.hidden
+{
+    display: none;
+}

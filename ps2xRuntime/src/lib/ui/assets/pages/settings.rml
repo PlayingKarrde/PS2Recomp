@@ -1,0 +1,96 @@
+<rml>
+<head>
+    <title>Settings</title>
+    <link type="text/rcss" href="../theme/fpr.rcss"/>
+</head>
+<body>
+    <div id="window">
+        <div id="header">
+            <span id="brand">Fire Pro Wrestling Returns</span>
+            <span id="page-title">Settings</span>
+        </div>
+
+        <div id="tabs">
+            <div class="tab selected" id="tab-graphics" data-tab="graphics" data-help="Picture options.">Graphics</div>
+            <div class="tab" id="tab-controls" data-tab="controls" data-help="Controller options.">Controls</div>
+            <div class="tab" id="tab-audio" data-tab="audio" data-help="Sound options.">Audio</div>
+        </div>
+
+        <div class="panel" id="panel-graphics">
+            <div class="row" data-kind="choice" data-key="aspect" data-choices="4:3|16:9|21:9" data-value="4:3"
+                 data-help="Shape of the picture. 4:3 is the original; wider shows more of the ring.">
+                <span class="label">Aspect Ratio</span><span class="value">[4:3]</span>
+            </div>
+            <div class="row" data-kind="choice" data-key="resolution" data-choices="1x|2x|3x|4x" data-value="2x"
+                 data-help="How sharply the game is drawn.">
+                <span class="label">Internal Resolution</span><span class="value">[2x]</span>
+            </div>
+            <div class="row" data-kind="toggle" data-key="fullscreen" data-value="off"
+                 data-help="Play full screen instead of in a window.">
+                <span class="label">Full Screen</span><span class="value">[OFF]</span>
+            </div>
+            <div class="row" data-kind="toggle" data-key="vsync" data-value="on"
+                 data-help="Wait for the screen to refresh. Stops tearing.">
+                <span class="label">V-Sync</span><span class="value">[ON]</span>
+            </div>
+            <div class="row" data-kind="slider" data-key="brightness" data-min="0" data-max="100" data-step="5" data-value="100"
+                 data-suffix="%" data-help="Brightness of the picture.">
+                <span class="label">Brightness</span>
+                <div class="slider"><div class="track"><div class="fill"></div></div></div>
+                <span class="value">[100%]</span>
+            </div>
+        </div>
+
+        <div class="panel hidden" id="panel-controls">
+            <div class="row" data-kind="toggle" data-key="vibration" data-value="on"
+                 data-help="Rumble in the controller.">
+                <span class="label">Vibration</span><span class="value">[ON]</span>
+            </div>
+            <div class="row" data-kind="choice" data-key="layout" data-choices="PlayStation|Xbox|Nintendo" data-value="Xbox"
+                 data-help="Which button names to show.">
+                <span class="label">Button Names</span><span class="value">[Xbox]</span>
+            </div>
+            <div class="row" data-kind="slider" data-key="deadzone" data-min="0" data-max="50" data-step="5" data-value="15"
+                 data-suffix="%" data-help="How far the stick must move before the game notices it.">
+                <span class="label">Stick Dead Zone</span>
+                <div class="slider"><div class="track"><div class="fill"></div></div></div>
+                <span class="value">[15%]</span>
+            </div>
+            <div class="row" data-kind="toggle" data-key="shortcut" data-value="on"
+                 data-help="Allow the button shortcuts in the ring.">
+                <span class="label">Shortcut</span><span class="value">[ON]</span>
+            </div>
+        </div>
+
+        <div class="panel hidden" id="panel-audio">
+            <div class="row" data-kind="choice" data-key="sound" data-choices="Stereo|Mono" data-value="Stereo"
+                 data-help="Adjust sound output.">
+                <span class="label">Sound</span><span class="value">[Stereo]</span>
+            </div>
+            <div class="row" data-kind="slider" data-key="bgm" data-min="0" data-max="100" data-step="5" data-value="85"
+                 data-suffix="%" data-help="Volume of the music.">
+                <span class="label">BGM Volume</span>
+                <div class="slider"><div class="track"><div class="fill"></div></div></div>
+                <span class="value">[85%]</span>
+            </div>
+            <div class="row" data-kind="slider" data-key="sfx" data-min="0" data-max="100" data-step="5" data-value="100"
+                 data-suffix="%" data-help="Volume of the crowd and the moves.">
+                <span class="label">Effects Volume</span>
+                <div class="slider"><div class="track"><div class="fill"></div></div></div>
+                <span class="value">[100%]</span>
+            </div>
+            <div class="row" data-kind="toggle" data-key="entrance" data-value="on"
+                 data-help="Play the entrance music.">
+                <span class="label">Entrance Music</span><span class="value">[ON]</span>
+            </div>
+        </div>
+
+        <div id="help"><span id="help-text">Shape of the picture.</span></div>
+
+        <div id="footer">
+            <div id="hints"><span>A: Select</span><span>B: Back</span><span>LB / RB: Tab</span></div>
+            <div class="button" id="back" data-help="Close the settings.">Back</div>
+        </div>
+    </div>
+</body>
+</rml>

@@ -155,6 +155,13 @@ if(PS2X_BUILD_GPU_SMOKE)
     endif()
 endif()
 
+# ps2x_ui_demo shows the RmlUi overlay (ps2xRuntime/src/lib/ui) over a stand-in game picture, windowed or headless.
+# Only when PS2X_BUILD_UI is ON (it needs the ps2_ui library); no generated game code is involved.
+option(PS2X_BUILD_UI_DEMO "Build ps2x_ui_demo, the standalone RmlUi overlay demo" ON)
+if(PS2X_BUILD_UI_DEMO AND TARGET ps2_ui)
+    add_subdirectory(ui_demo)
+endif()
+
 if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
     EnableFastReleaseMode(ps2_test_lib)
     EnableFastReleaseMode(ps2x_tests)
