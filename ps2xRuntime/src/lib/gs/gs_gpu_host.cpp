@@ -201,6 +201,14 @@ namespace ps2x_gs
         return size;
     }
 
+    // How many GS pixels the widescreen picture (PS2X_GS_WIDE) adds right of the game's 640-wide screen (equal to the pad on the
+    // left); 0 when wide is off, the CPU renderer draws, or path A turned it off. Any thread; used by the game override that keeps
+    // the match clock at the right edge (src/overrides/fpwr_overrides.cpp, task w2). Declared there, not in a header.
+    uint32_t widePadRight()
+    {
+        return g.backend ? g.backend->WidePadRight() : 0u;
+    }
+
     bool shutdown()
     {
         // The presenter and the backend hold GPU objects, so they must go before the host destroys the device.

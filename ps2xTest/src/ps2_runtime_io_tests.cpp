@@ -2,10 +2,14 @@
 #include "ps2_runtime.h"
 #include "ps2_syscalls.h"
 #include "ps2_stubs.h"
+#include "runtime/ps2_card_activity.h"
+#include "runtime/ps2_pause.h"
 
+#include <atomic>
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 #include <cstring>
@@ -541,6 +545,132 @@ void register_ps2_runtime_io_tests()
 
             const std::filesystem::path hostPath = test.paths.mcRoot / "SAVEDATA" / "test.bin";
             t.IsTrue(std::filesystem::exists(hostPath), "sceMcOpen/sceMcWrite should create the host file under mcRoot");
+        });
+
+        // The settings overlay's Quit Game button reads this (ps2_card_activity.h, ps2_host_ui.cpp): a file the game has open for
+        // writing is a save under way.
+        tc.Run("sceMc reports files open for writing to the host", [](TestCase &t)
+        {
+            TestContext test;
+
+            const uint32_t fileAddr = GUEST_STRING_AREA_START + 0x500;
+            const uint32_t writeBufAddr = GUEST_BUFFER_AREA_START + 0x300;
+            const std::string payload = "save data";
+            writeGuestString(test.rdram.data(), fileAddr, "/activity.bin");
+            std::memcpy(test.rdram.data() + writeBufAddr, payload.data(), payload.size());
+            int32_t cmd = 0;
+
+            const uint32_t openBefore = ps2x_host::cardWriteStatus().writeHandlesOpen;
+            const uint64_t commandsBefore = ps2x_host::cardActivityState().writeCommands.load();
+
+            // Opening a file for writing starts a save: one more write handle, and a card write just now.
+            clearContext(test.ctx);
+            setRegU32(test.ctx, 4, 0u);
+            setRegU32(test.ctx, 5, 0u);
+            setRegU32(test.ctx, 6, fileAddr);
+            setRegU32(test.ctx, 7, PS2_FIO_O_RDWR | PS2_FIO_O_CREAT | PS2_FIO_O_TRUNC);
+            ps2_stubs::sceMcOpen(test.rdram.data(), &test.ctx, nullptr);
+            const int32_t fd = syncMc(test.rdram, &cmd);
+            t.IsTrue(fd > 0, "the file opens for writing");
+            ps2x_host::CardWriteStatus status = ps2x_host::cardWriteStatus();
+            t.Equals(status.writeHandlesOpen, openBefore + 1u, "an open write handle is reported");
+            t.IsTrue(status.anyWriteYet, "a card write is on record");
+            t.IsTrue(status.msSinceLastWrite < 1000u, "and it is recent");
+
+            clearContext(test.ctx);
+            setRegU32(test.ctx, 4, static_cast<uint32_t>(fd));
+            setRegU32(test.ctx, 5, writeBufAddr);
+            setRegU32(test.ctx, 6, static_cast<uint32_t>(payload.size()));
+            ps2_stubs::sceMcWrite(test.rdram.data(), &test.ctx, nullptr);
+            syncMc(test.rdram, &cmd);
+            t.Equals(ps2x_host::cardWriteStatus().writeHandlesOpen, openBefore + 1u, "writing leaves the handle open");
+
+            // Closing swaps the working copy in: no write handle is left, and that was a card write too.
+            clearContext(test.ctx);
+            setRegU32(test.ctx, 4, static_cast<uint32_t>(fd));
+            ps2_stubs::sceMcClose(test.rdram.data(), &test.ctx, nullptr);
+            syncMc(test.rdram, &cmd);
+            t.Equals(ps2x_host::cardWriteStatus().writeHandlesOpen, openBefore, "closing the file ends the save");
+            t.IsTrue(ps2x_host::cardActivityState().writeCommands.load() >= commandsBefore + 3u,
+                     "open, write and close each count as a card write");
+
+            // Reading a file is not a save.
+            const uint64_t commandsAfterSave = ps2x_host::cardActivityState().writeCommands.load();
+            clearContext(test.ctx);
+            setRegU32(test.ctx, 4, 0u);
+            setRegU32(test.ctx, 5, 0u);
+            setRegU32(test.ctx, 6, fileAddr);
+            setRegU32(test.ctx, 7, PS2_FIO_O_RDONLY);
+            ps2_stubs::sceMcOpen(test.rdram.data(), &test.ctx, nullptr);
+            const int32_t readFd = syncMc(test.rdram, &cmd);
+            t.IsTrue(readFd > 0, "the file opens for reading");
+            t.Equals(ps2x_host::cardWriteStatus().writeHandlesOpen, openBefore, "a file open for reading is not a write handle");
+            clearContext(test.ctx);
+            setRegU32(test.ctx, 4, static_cast<uint32_t>(readFd));
+            ps2_stubs::sceMcClose(test.rdram.data(), &test.ctx, nullptr);
+            syncMc(test.rdram, &cmd);
+            t.Equals(ps2x_host::cardActivityState().writeCommands.load(), commandsAfterSave, "reading is not counted as a card write");
+        });
+
+        tc.Run("Quit Game's card rule: a save under way or just done dims it", [](TestCase &t)
+        {
+            using ps2x_host::CardWriteStatus;
+            using ps2x_host::cardQuitBlockReason;
+            CardWriteStatus status;
+            t.Equals(std::string(cardQuitBlockReason(status)), std::string(), "a card nothing was written to does not dim it");
+
+            status.anyWriteYet = true;
+            status.msSinceLastWrite = 5000;
+            t.Equals(std::string(cardQuitBlockReason(status)), std::string(), "a save that finished 5 s ago does not dim it");
+            status.msSinceLastWrite = ps2x_host::kCardQuietMs;
+            t.Equals(std::string(cardQuitBlockReason(status)), std::string(), "the quiet time is over at exactly kCardQuietMs");
+
+            status.msSinceLastWrite = ps2x_host::kCardQuietMs - 1;
+            t.IsTrue(std::string(cardQuitBlockReason(status)).find("just saved") != std::string::npos,
+                     "a write just before the pause dims it (the gap between two files of one save)");
+            status.msSinceLastWrite = 8;
+            t.IsTrue(std::string(cardQuitBlockReason(status)).find("just saved") != std::string::npos, "8 ms after a close dims it");
+
+            status.writeHandlesOpen = 1;
+            t.IsTrue(std::string(cardQuitBlockReason(status)).find("is saving") != std::string::npos,
+                     "a file open for writing dims it, whatever the time");
+            status.msSinceLastWrite = 60000;
+            t.IsTrue(std::string(cardQuitBlockReason(status)).find("is saving") != std::string::npos, "even if the last write was long ago");
+            status.anyWriteYet = false;
+            t.IsTrue(std::string(cardQuitBlockReason(status)).find("is saving") != std::string::npos, "or none is on record");
+        });
+
+        tc.Run("the guest pause says when the game thread has really stopped", [](TestCase &t)
+        {
+            // Quit Game reads the memory card only once guestBlocked() is true: setGuestPaused only asks.
+            t.IsFalse(ps2x_host::guestBlocked(), "not blocked at the start");
+            const uint64_t entriesBefore = ps2x_host::guestBlockEntries();
+            ps2x_host::setGuestPaused(true);
+            t.IsFalse(ps2x_host::guestBlocked(), "asking for a pause does not block anyone");
+            std::atomic<bool> stop{false};
+            std::thread guest([&]() { ps2x_host::waitWhileGuestPaused([&]() { return stop.load(); }); });
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+            while (!ps2x_host::guestBlocked() && std::chrono::steady_clock::now() < deadline)
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            t.IsTrue(ps2x_host::guestBlocked(), "the thread is reported blocked once it waits");
+            t.IsTrue(ps2x_host::guestBlockEntries() == entriesBefore + 1u, "and that wait is counted as a new entry");
+            ps2x_host::setGuestPaused(false);
+            guest.join();
+            t.IsFalse(ps2x_host::guestBlocked(), "and not blocked after the pause ends");
+
+            // A stop request ends the wait even though the pause is still on (Quit Game while the menu is open).
+            ps2x_host::setGuestPaused(true);
+            stop.store(false);
+            std::thread guest2([&]() { ps2x_host::waitWhileGuestPaused([&]() { return stop.load(); }); });
+            while (!ps2x_host::guestBlocked() && std::chrono::steady_clock::now() < deadline)
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            const auto stopAt = std::chrono::steady_clock::now();
+            stop.store(true);
+            guest2.join();
+            const auto waited = std::chrono::steady_clock::now() - stopAt;
+            t.IsTrue(waited < std::chrono::milliseconds(500), "a stop request ends the wait within a poll or two");
+            t.IsFalse(ps2x_host::guestBlocked(), "the thread is not reported blocked after it left");
+            ps2x_host::setGuestPaused(false);
         });
 
         tc.Run("sceMcGetDir includes dot entries and file metadata", [](TestCase &t)

@@ -9,7 +9,9 @@
 //     for why these and not others);
 //   - while it is open: it takes all keyboard, mouse and controller input (the host hides the pad from the game),
 //     the guest is paused (ps2_pause.h), and the sound is silent;
-//   - the settings it shows, kept in the settings file (ps2_settings.h) and applied through the setters below.
+//   - the settings it shows, kept in the settings file (ps2_settings.h) and applied through the setters below;
+//   - Quit Game, which asks first and then ends the run through requestQuit() below (see ps2_host_ui.cpp for the memory
+//     card rule that can dim it).
 //
 // When the build has no UI (PS2X_BUILD_UI off) or the SDL_GPU presenter is not in use, every function here does
 // nothing and active() is false: the game runs as before, with one log line saying why.
@@ -26,6 +28,10 @@
 
 namespace ps2x_host
 {
+    // Quit Game: ends the run exactly as the window's close button does (pumpEvents() returns false at its next call, the
+    // run loop calls PS2Runtime::requestStop and unwinds). Defined in ps2_host_sdl.cpp. Any thread.
+    void requestQuit();
+
     // Settings the overlay changes live. Defined in ps2_host_sdl.cpp and ps2_host_gpu.cpp.
     bool windowFullscreen();
     void setWindowFullscreen(bool fullscreen);

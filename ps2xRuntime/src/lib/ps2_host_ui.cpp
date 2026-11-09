@@ -18,6 +18,24 @@
 // mouse and controller events, and the game's pad readers see no input (setInputCapturedByOverlay). On close, a button
 // that is still held (the one that closed the menu) stays hidden from the game until it is released.
 //
+// ---- Quit Game (task q1) ----
+//
+// The menu's Quit Game button asks "Quit to the desktop?" (Cancel has the focus) and then calls GameHost::quitRequested.
+// update() saves the settings and calls requestQuit(), which sets the flag the window's close button sets: pumpEvents()
+// returns false, the run loop calls PS2Runtime::requestStop and joins the game thread. The guest is paused at that moment;
+// waitWhileGuestPaused polls the stop flag every 20 ms, so the pause cannot hold the shutdown up.
+//
+// The memory card: a file the game writes is a working copy (<name>.mctmp) that replaces the real one only when the game
+// closes it, so quitting never damages a save that is already on the card. It can lose the save that was being written:
+// one save is three files (the data, view.ico, icon.sys) written within about 17 ms, and the data file is open for 4 ms of
+// that. The game is paused while the menu is open and cannot finish, so waiting is not possible; instead Quit Game is dimmed,
+// with a reason in the help line, when the card was being written at the moment the game stopped:
+//   - the stubs report a file open for writing (ps2_card_activity.h): "The game is saving...";
+//   - or the last card write was less than kCardQuietMs ago (the gap between two of the three files): "...just saved...".
+//   The rule is cardQuitBlockReason() in ps2_card_activity.h, where the unit tests reach it.
+// The state is read once, when the guest has really stopped (guestBlocked()), not when the menu opens: the guest runs on
+// until its next vertical blank. Until then the button is dimmed with "Waiting for the game to pause.".
+//
 // Test hook: PS2X_TEST_PAD=<file> makes the host attach an SDL virtual gamepad and apply the lines a script appends to
 // the file ("down south", "up south", "axis leftx 20000"...). Real controllers are untouched; scripted runs set
 // SDL_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT so only this one is seen (tools/drive_game.py does).
@@ -27,6 +45,7 @@
 #include "ps2_host_backend.h"
 #include "ps2_settings.h"
 #include "runtime/gs/gs_gpu_threads.h"
+#include "runtime/ps2_card_activity.h"
 #include "runtime/ps2_pause.h"
 
 #include <SDL3/SDL.h>
@@ -77,6 +96,12 @@ namespace ps2x_host::ui
             uint64_t chordSinceNs = 0;
             bool chordFired = false;
             TestPad testPad;
+            // Quit Game
+            bool quitAsked = false;     // the player confirmed; update() carries it out
+            bool quitChecked = false;   // the card was looked at for this opening of the menu
+            uint64_t blockEntriesAtOpen = 0; // guestBlockEntries() when the menu opened: only a later pause counts
+            std::string quitBlock;      // why Quit Game is dimmed ("" = it is not)
+            bool testOpenOnCardWrite = false; // PS2X_TEST_OPEN_ON_CARD_WRITE=1
         } g;
 
         // ---- test pad -------------------------------------------------------------------------------------------
@@ -240,6 +265,14 @@ namespace ps2x_host::ui
 
             void closeRequested() override { g.closeRequested = true; }
 
+            void quitRequested() override { g.quitAsked = true; }
+
+            std::string quitBlockedReason() override
+            {
+                // Until the guest has stopped its state is not known (it may be in the middle of a save).
+                return g.quitChecked ? g.quitBlock : std::string("Waiting for the game to pause.");
+            }
+
             std::vector<ps2x::ui::ControlLine> controls() override
             {
                 return {
@@ -273,12 +306,35 @@ namespace ps2x_host::ui
         }
 #endif
 
+#if defined(PS2X_HAS_UI)
+        // Once per opening of the menu, as soon as the guest has really stopped: is the memory card being written? Sets
+        // Quit Game's state (see the comment at the top of this file).
+        void checkQuit()
+        {
+            if (g.quitChecked || !guestBlocked() || guestBlockEntries() == g.blockEntriesAtOpen)
+                return;
+            const CardWriteStatus card = cardWriteStatus();
+            g.quitBlock = cardQuitBlockReason(card);
+            g.quitChecked = true;
+            std::printf("[ui] Quit Game %s (card files open for writing: %u, ms since the last card write: %lld)\n",
+                        g.quitBlock.empty() ? "is available" : "is dimmed", card.writeHandlesOpen,
+                        card.anyWriteYet ? static_cast<long long>(card.msSinceLastWrite) : -1ll);
+            std::fflush(stdout);
+            menu().refresh();
+        }
+#endif
+
         void openOverlay(const char *how)
         {
 #if defined(PS2X_HAS_UI)
             if (!g.created || g.visible.load())
                 return;
             setInputCapturedByOverlay(true);
+            // Quit Game starts dimmed ("Waiting for the game to pause.") until the guest has stopped: see checkQuit.
+            g.quitChecked = false;
+            g.quitBlock.clear();
+            g.quitAsked = false;
+            g.blockEntriesAtOpen = guestBlockEntries();
             menu().open();
             if (!menu().visible())
             {
@@ -353,6 +409,7 @@ namespace ps2x_host::ui
         }
         g.window = window;
         g.created = true;
+        g.testOpenOnCardWrite = std::getenv("PS2X_TEST_OPEN_ON_CARD_WRITE") != nullptr && std::getenv("PS2X_TEST_OPEN_ON_CARD_WRITE")[0] == '1';
         createTestPad();
         std::printf("[ui] settings overlay ready (assets %s). Open it with F2, the Guide button, or L3 + R3 held.\n", root.c_str());
         std::fflush(stdout);
@@ -450,8 +507,28 @@ namespace ps2x_host::ui
             g.closeRequested = false;
             closeOverlay("Back");
         }
+        // Test hook (tests only): open the menu the moment the game has a file open for writing on the card. With
+        // PS2X_TEST_CARD_HOLD_MS (the stubs) the game waits there, so the menu is open in the middle of a save.
+        if (g.testOpenOnCardWrite && !g.visible.load() && cardActivityState().writeHandlesOpen.load() > 0)
+        {
+            g.testOpenOnCardWrite = false;
+            openOverlay("test: card file open for writing");
+        }
         if (g.visible.load())
         {
+            checkQuit();
+            if (g.quitAsked)
+            {
+                g.quitAsked = false;
+                if (g.quitChecked && g.quitBlock.empty())
+                {
+                    // Save changed settings first; the shutdown path saves them again if anything is still unsaved.
+                    ps2x_settings::save();
+                    std::printf("[ui] Quit Game confirmed: stopping the game\n");
+                    std::fflush(stdout);
+                    requestQuit();
+                }
+            }
             ps2x::ui::Overlay &overlay = menu().overlay();
             int width = 0, height = 0;
             SDL_GetWindowSizeInPixels(g.window, &width, &height);

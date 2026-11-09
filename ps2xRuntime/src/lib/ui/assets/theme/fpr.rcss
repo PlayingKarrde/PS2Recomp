@@ -357,8 +357,100 @@ body
     color: #e6e0c8;
 }
 
+/* ---- Quit Game and its question ------------------------------------------------------------------------- */
+
+#footer-buttons
+{
+    display: flex;
+    flex-direction: row-reverse; /* Back (first in the page) at the right edge, Quit Game on its left */
+}
+
+#quit
+{
+    margin-right: 14dp;
+}
+
+/* A button that cannot be used now (Quit Game while the game is writing to the memory card). It stays focusable, so the
+   help line can say why. */
+.button.locked
+{
+    color: #6e6b60;
+    font-effect: none;
+    decorator: linear-gradient(180deg, #8d8a7c, #7a7769 14%, #67645a 80%, #4a483f);
+}
+
+.button.locked:hover,
+.button.locked:focus
+{
+    color: #cfcbbb;
+    border-color: #d1caaf;
+}
+
+/* While the question is up, nothing behind it takes the focus (the controller's directions would otherwise walk off the
+   question into the settings). The mouse cannot reach the settings either: the question's dim layer covers them. */
+#window.confirming
+{
+    focus: none;
+}
+
+#confirm
+{
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    display: flex;
+    flex-direction: row;
+    justify-content: center;
+    align-items: center;
+    background-color: #000000b4;
+}
+
+#confirm-box
+{
+    box-sizing: border-box;
+    width: 640dp;
+    padding: 26dp 30dp 30dp 30dp;
+    text-align: center;
+    background-color: #000000f2;
+    border: 5dp #d1caaf;
+    border-radius: 10dp;
+}
+
+#confirm-title
+{
+    font-size: 34dp;
+}
+
+#confirm-text
+{
+    margin: 14dp 0 26dp 0;
+    font-size: 22dp;
+    font-weight: normal;
+    color: #e6e0c8;
+}
+
+#confirm-buttons
+{
+    display: flex;
+    flex-direction: row;
+    justify-content: center;
+}
+
+#confirm-buttons .button
+{
+    margin: 0 12dp;
+}
+
 /* Last, so that it wins over the display set on .panel above. */
 .hidden
+{
+    display: none;
+}
+
+/* An id selector outranks a class: the question sets its own display, so it needs its own rule. */
+#confirm.hidden
 {
     display: none;
 }

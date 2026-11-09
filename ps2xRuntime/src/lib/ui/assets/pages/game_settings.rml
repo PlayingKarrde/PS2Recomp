@@ -67,7 +67,24 @@
 
         <div id="footer">
             <div id="hints"><span>A: Change</span><span>B: Back</span><span>LB / RB: Tab</span></div>
-            <div class="button" id="back" data-help="Save the settings and go back to the game.">Back</div>
+            <!-- Back comes first in the document, so that Down from the last row lands on Back as it always did; the row
+                 is laid out in reverse, which puts Back at the right edge with Quit Game on its left. -->
+            <div id="footer-buttons">
+                <div class="button" id="back" data-help="Save the settings and go back to the game.">Back</div>
+                <div class="button" id="quit" data-help="Close the game and return to the desktop.">Quit Game</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Quit Game asks first. Cancel is the button that gets the focus, so a stray press cannot quit. -->
+    <div id="confirm" class="hidden">
+        <div id="confirm-box">
+            <div id="confirm-title">Quit to the desktop?</div>
+            <div id="confirm-text">Anything not saved to the memory card is lost.</div>
+            <div id="confirm-buttons">
+                <div class="button" id="confirm-yes" data-help="Close the game and return to the desktop.">Quit</div>
+                <div class="button" id="confirm-no" data-help="Stay in the game.">Cancel</div>
+            </div>
         </div>
     </div>
 </body>

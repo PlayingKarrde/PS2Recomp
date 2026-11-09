@@ -99,6 +99,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <filesystem>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -330,6 +331,14 @@ struct GSGpuBackend::Impl
     // wipes): the marker number, kind, state and screen-space box. For finding out what a transition effect draws.
     std::FILE *primLog = nullptr;
     std::vector<std::string> primLines, spanLines; // the first 150 primitives of a marker; and those that span the screen (at most 40)
+    // PS2X_GS_W2_PRIMS=<file> (with PS2X_GS_W1_LOG, which numbers the markers; task w2): every primitive of the markers in
+    // PS2X_GS_W2_MARKERS=<first>-<last> (default: all), in draw order, with its screen box, texture and state. For finding the
+    // 2D elements a scene draws over the 3D picture (the match clock, names, panels). With PS2X_GS_W2_TRIGGER=<file> a live
+    // game dumps PS2X_GS_W2_FRAMES (default 2) markers each time that file appears (the backend deletes it) instead.
+    std::FILE *w2Prims = nullptr;
+    uint64_t w2First = 0, w2Last = UINT64_MAX, w2Index = 0;
+    std::string w2Trigger;
+    uint32_t w2Frames = 2, w2Remaining = 0;
     struct WideCounts
     {
         uint64_t prims = 0, inside = 0, leftEdge = 0, rightEdge = 0, both = 0, allLeft = 0, allRight = 0, ztest = 0, flatSpan = 0, texSpan = 0, filled = 0;
@@ -606,6 +615,23 @@ bool GSGpuBackend::Impl::init(SDL_GPUDevice *device, uint32_t s, GSGpuBackend::F
             if (primLog)
                 std::fprintf(primLog, "marker,type,tme,fst,abe,iip,x0,x1,y0,y1,rgba_v2,z_v2,tbp0,tex_w,tex_h,tex_psm,alpha_reg,test_reg,scissor\n");
         }
+    if (const char *path = std::getenv("PS2X_GS_W2_PRIMS"))
+        if (path[0] != '\0')
+        {
+            w2Prims = std::fopen(path, "w");
+            if (w2Prims)
+                std::fprintf(w2Prims, "marker,idx,type,tme,fst,abe,iip,x0,x1,y0,y1,z_v0,rgba_v0,tbp0,tex_w,tex_h,tex_psm,u0,u1,v0,v1,alpha_reg,test_reg,scissor,frame_fbp\n");
+            if (const char *range = std::getenv("PS2X_GS_W2_MARKERS"))
+            {
+                unsigned long long a = 0, b = 0;
+                if (std::sscanf(range, "%llu-%llu", &a, &b) == 2)
+                    w2First = a, w2Last = b;
+            }
+            if (const char *trigger = std::getenv("PS2X_GS_W2_TRIGGER"))
+                w2Trigger = trigger;
+            if (const char *frames = std::getenv("PS2X_GS_W2_FRAMES"))
+                w2Frames = static_cast<uint32_t>(std::max(1, std::atoi(frames)));
+        }
     if (const char *path = std::getenv("PS2X_GS_W1_LOG"))
         if (path[0] != '\0')
         {
@@ -861,6 +887,8 @@ GSGpuBackend::Impl::~Impl()
         std::fclose(wideLog);
     if (primLog)
         std::fclose(primLog);
+    if (w2Prims)
+        std::fclose(w2Prims);
     if (!dev)
         return;
     SDL_WaitForGPUIdle(dev);
@@ -2687,6 +2715,25 @@ void GSGpuBackend::Impl::noteWide(const GSPrimitiveBatch &batch, const Setup &se
         if (spans && spanLines.size() < 40)
             spanLines.emplace_back(line);
     }
+    if (w2Prims && (w2Trigger.empty() ? (wideMarker >= w2First && wideMarker <= w2Last) : w2Remaining > 0))
+    {
+        float u0 = setup.v[0].u, u1 = u0, v0 = setup.v[0].v, v1 = v0;
+        for (uint32_t i = 1; i < setup.count; ++i)
+        {
+            u0 = std::min(u0, setup.v[i].u), u1 = std::max(u1, setup.v[i].u);
+            v0 = std::min(v0, setup.v[i].v), v1 = std::max(v1, setup.v[i].v);
+        }
+        const GSVertex &v = batch.vertices[batch.vertexCount > 0u ? batch.vertexCount - 1u : 0u];
+        std::fprintf(w2Prims, "%llu,%llu,%u,%d,%d,%d,%d,%d,%d,%d,%d,%u,%02x%02x%02x%02x,%u,%u,%u,%u,%.1f,%.1f,%.1f,%.1f,%llx,%llx,%u/%u/%u/%u,%u\n",
+                     static_cast<unsigned long long>(wideMarker), static_cast<unsigned long long>(w2Index++),
+                     static_cast<unsigned>(batch.state.prim.type), batch.state.prim.tme ? 1 : 0, batch.state.prim.fst ? 1 : 0,
+                     batch.state.prim.abe ? 1 : 0, batch.state.prim.iip ? 1 : 0, setup.minX, setup.maxX, setup.minY, setup.maxY,
+                     static_cast<unsigned>(v.z), v.r, v.g, v.b, v.a, static_cast<unsigned>(c.tex0.tbp0),
+                     static_cast<unsigned>(batch.state.textureWidth), static_cast<unsigned>(batch.state.textureHeight),
+                     static_cast<unsigned>(c.tex0.psm), u0, u1, v0, v1, static_cast<unsigned long long>(c.alpha),
+                     static_cast<unsigned long long>(c.test), c.scissor.x0, c.scissor.x1, c.scissor.y0, c.scissor.y1,
+                     static_cast<unsigned>(c.frame.fbp));
+    }
 }
 
 void GSGpuBackend::Impl::logWideRow(const GSPresentationRequest &request)
@@ -2713,6 +2760,20 @@ void GSGpuBackend::Impl::logWideRow(const GSPresentationRequest &request)
             std::fputs(l.c_str(), primLog);
         primLines.clear();
         spanLines.clear();
+    }
+    if (w2Prims && (wideMarker % 30u) == 0u)
+        std::fflush(w2Prims);
+    w2Index = 0;
+    if (w2Remaining > 0)
+        --w2Remaining;
+    if (w2Prims && !w2Trigger.empty() && w2Remaining == 0)
+    {
+        std::error_code ec;
+        if (std::filesystem::exists(w2Trigger, ec))
+        {
+            std::filesystem::remove(w2Trigger, ec);
+            w2Remaining = w2Frames;
+        }
     }
     wc = WideCounts{};
 }

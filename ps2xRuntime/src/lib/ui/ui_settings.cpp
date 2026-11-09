@@ -84,8 +84,9 @@ namespace ps2x::ui
         }
         for (Rml::Element *tab : tabs)
             tab->AddEventListener("focus", this);
-        if (Rml::Element *back = document->GetElementById("back"))
-            back->AddEventListener("focus", this);
+        for (const char *id : {"back", "quit", "confirm-yes", "confirm-no"})
+            if (Rml::Element *button = document->GetElementById(id))
+                button->AddEventListener("focus", this);
 
         // The tab that is marked selected in the RML, else the first one.
         std::string initial;
@@ -105,11 +106,12 @@ namespace ps2x::ui
         for (const char *type : {"click", "keydown", "mousedown", "mousemove", "mouseup", "mouseover"})
             m_document->RemoveEventListener(type, this);
         Rml::ElementList elements;
-        m_document->QuerySelectorAll(elements, ".row, .tab, #back");
+        m_document->QuerySelectorAll(elements, ".row, .tab, #back, #quit, #confirm-yes, #confirm-no");
         for (Rml::Element *e : elements)
             e->RemoveEventListener("focus", this);
         m_document = nullptr;
         m_dragRow = nullptr;
+        m_confirming = false;
     }
 
     Rml::Element *SettingsPage::rowForKey(const std::string &key) const
@@ -310,6 +312,62 @@ namespace ps2x::ui
             m_onChange(attr(row, "data-key"), now);
     }
 
+    bool SettingsPage::setQuitLocked(const std::string &reason)
+    {
+        Rml::Element *quit = m_document ? m_document->GetElementById("quit") : nullptr;
+        if (!quit)
+            return false;
+        const bool locked = !reason.empty();
+        quit->SetClass("locked", locked);
+        quit->SetAttribute("data-locked", locked ? "1" : "");
+        quit->SetAttribute("data-lock-reason", reason);
+        // The focused button's help line follows.
+        if (m_document->GetFocusLeafNode() == quit)
+            showHelp(quit);
+        return true;
+    }
+
+    // Shows the Quit Game question. Cancel gets the focus; the settings behind it are marked so that the controller's
+    // directions cannot reach them (focus: none in the theme).
+    void SettingsPage::openConfirm()
+    {
+        Rml::Element *quit = m_document ? m_document->GetElementById("quit") : nullptr;
+        Rml::Element *window = m_document ? m_document->GetElementById("window") : nullptr;
+        Rml::Element *confirm = m_document ? m_document->GetElementById("confirm") : nullptr;
+        Rml::Element *cancel = m_document ? m_document->GetElementById("confirm-no") : nullptr;
+        if (!quit || !window || !confirm || !cancel || m_confirming || !attr(quit, "data-locked").empty())
+            return;
+        m_confirming = true;
+        window->SetClass("confirming", true);
+        confirm->SetClass("hidden", false);
+        // The style (focus: none behind, display on the question) is worked out when the document updates; the focus
+        // call below needs the new state.
+        m_document->UpdateDocument();
+        cancel->Focus(true);
+    }
+
+    // Hides the question. `focusQuit`: put the focus back on the Quit Game button (Cancel, Escape); not when the whole
+    // menu is being closed.
+    void SettingsPage::leaveConfirm(bool focusQuit)
+    {
+        if (!m_document || !m_confirming)
+            return;
+        m_confirming = false;
+        if (Rml::Element *window = m_document->GetElementById("window"))
+            window->SetClass("confirming", false);
+        if (Rml::Element *confirm = m_document->GetElementById("confirm"))
+            confirm->SetClass("hidden", true);
+        m_document->UpdateDocument();
+        if (focusQuit)
+            if (Rml::Element *quit = m_document->GetElementById("quit"))
+                quit->Focus(true);
+    }
+
+    void SettingsPage::closeConfirm()
+    {
+        leaveConfirm(false);
+    }
+
     void SettingsPage::showHelp(Rml::Element *element)
     {
         if (!m_document)
@@ -448,6 +506,23 @@ namespace ps2x::ui
                         m_onBack();
                     return;
                 }
+                if (e->GetId() == "quit")
+                {
+                    openConfirm();
+                    return;
+                }
+                if (e->GetId() == "confirm-no")
+                {
+                    leaveConfirm(true);
+                    return;
+                }
+                if (e->GetId() == "confirm-yes")
+                {
+                    Rml::Element *quit = m_document->GetElementById("quit");
+                    if (m_confirming && m_onQuit && quit && attr(quit, "data-locked").empty())
+                        m_onQuit();
+                    return;
+                }
                 if (e->IsClassSet("row"))
                 {
                     // Sliders react to the mouse in mousedown; toggles and choices step on a click or Return.
@@ -462,12 +537,15 @@ namespace ps2x::ui
             const int key = event.GetParameter<int>("key_identifier", Rml::Input::KI_UNKNOWN);
             if (key == Rml::Input::KI_PRIOR || key == Rml::Input::KI_NEXT)
             {
-                switchTab(key == Rml::Input::KI_NEXT ? 1 : -1);
+                if (!m_confirming) // the tabs are behind the question
+                    switchTab(key == Rml::Input::KI_NEXT ? 1 : -1);
                 event.StopPropagation();
             }
             else if (key == Rml::Input::KI_ESCAPE)
             {
-                if (m_onBack)
+                if (m_confirming)
+                    leaveConfirm(true); // B / Escape answers the question with Cancel
+                else if (m_onBack)
                     m_onBack();
                 event.StopPropagation();
             }

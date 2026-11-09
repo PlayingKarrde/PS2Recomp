@@ -58,6 +58,7 @@ namespace ps2x::ui
                 refresh();
             });
             page.setOnBack([this]() { host->closeRequested(); });
+            page.setOnQuit([this]() { host->quitRequested(); });
             built = true;
             return true;
         }
@@ -117,6 +118,7 @@ namespace ps2x::ui
                 }
                 page.setLocked(key, locked, reason, tag);
             }
+            page.setQuitLocked(host->quitBlockedReason());
             if (document)
             {
                 if (Rml::Element *note = document->GetElementById("restart-note"))
@@ -163,6 +165,7 @@ namespace ps2x::ui
     {
         if (!ready() || !m_impl->loadPage())
             return;
+        m_impl->page.closeConfirm(); // a question left showing when the menu was closed
         m_impl->fillControls();
         m_impl->refresh();
         m_impl->overlay.setVisible(true);

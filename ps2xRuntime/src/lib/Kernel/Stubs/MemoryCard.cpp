@@ -1,7 +1,11 @@
 #include "Common.h"
 #include "MemoryCard.h"
+#include "runtime/ps2_card_activity.h"
+#include "runtime/ps2_pause.h"
 
+#include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <thread>
 
 #if defined(_WIN32)
@@ -99,6 +103,21 @@ namespace ps2_stubs
         bool g_mcCommandPending = false;
         int32_t g_mcLastResult = 0;
         std::unordered_map<int32_t, McOpenFile> g_mcFiles;
+
+        // Tells the host (ps2_card_activity.h) how many files are open for writing. Call with g_mcStateMutex held, after
+        // every change to g_mcFiles.
+        void publishWriteHandlesLocked()
+        {
+            uint32_t writing = 0;
+            for (const auto &entry : g_mcFiles)
+            {
+                if (!entry.second.tempPath.empty())
+                {
+                    ++writing;
+                }
+            }
+            ps2x_host::cardSetWriteHandlesOpen(writing);
+        }
         std::array<McPortState, 2> g_mcPorts{};
         int32_t g_cvMcFileCursor = 0;
 
@@ -440,6 +459,7 @@ namespace ps2_stubs
                 discardMcTempFile(openFile);
             }
             g_mcFiles.clear();
+            publishWriteHandlesLocked();
         }
 
         void closeMcFilesForPortLocked(int32_t port)
@@ -460,6 +480,7 @@ namespace ps2_stubs
                     ++it;
                 }
             }
+            publishWriteHandlesLocked();
         }
 
         int32_t allocateMcFdLocked(FILE *file, int32_t port, const std::filesystem::path &hostPath,
@@ -488,6 +509,11 @@ namespace ps2_stubs
                 }
 
                 g_mcFiles.emplace(fd, McOpenFile{file, port, hostPath, tempPath});
+                if (!tempPath.empty())
+                {
+                    ps2x_host::cardNoteWrite(); // a file opened for writing: the save has begun
+                }
+                publishWriteHandlesLocked();
                 return fd;
             }
 
@@ -664,11 +690,17 @@ namespace ps2_stubs
             auto it = g_mcFiles.find(fd);
             if (it != g_mcFiles.end())
             {
+                const bool wasWriting = !it->second.tempPath.empty();
                 if (commitMcFile(it->second))
                 {
                     result = kMcResultSucceed;
                 }
                 g_mcFiles.erase(it);
+                publishWriteHandlesLocked();
+                if (wasWriting)
+                {
+                    ps2x_host::cardNoteWrite(); // the working copy has been swapped in
+                }
             }
             setMcCommandResultLocked(kMcCmdClose, result);
         }
@@ -708,6 +740,7 @@ namespace ps2_stubs
                             else if (std::filesystem::remove(hostPath, ec) && !ec)
                             {
                                 result = kMcResultSucceed;
+                                ps2x_host::cardNoteWrite();
                             }
                             else
                             {
@@ -780,6 +813,7 @@ namespace ps2_stubs
                     state.currentDir = "/";
                     state.formatted = true;
                     result = kMcResultSucceed;
+                    ps2x_host::cardNoteWrite();
                 }
             }
 
@@ -1063,6 +1097,7 @@ namespace ps2_stubs
                     else if (std::filesystem::create_directory(hostPath, ec) && !ec)
                     {
                         result = kMcResultSucceed;
+                        ps2x_host::cardNoteWrite();
                     }
                     else
                     {
@@ -1211,6 +1246,10 @@ namespace ps2_stubs
                     {
                         std::filesystem::rename(oldHostPath, newHostPath, ec);
                         result = ec ? kMcResultDeniedPermit : kMcResultSucceed;
+                        if (!ec)
+                        {
+                            ps2x_host::cardNoteWrite();
+                        }
                     }
                 }
             }
@@ -1357,6 +1396,7 @@ namespace ps2_stubs
                     state.currentDir = "/";
                     state.formatted = false;
                     result = kMcResultSucceed;
+                    ps2x_host::cardNoteWrite();
                 }
             }
 
@@ -1400,9 +1440,30 @@ namespace ps2_stubs
                 {
                     std::clearerr(it->second.file);
                 }
+                ps2x_host::cardNoteWrite();
             }
 
             setMcCommandResultLocked(kMcCmdWrite, result);
+        }
+
+        // Test hook, tests only: PS2X_TEST_CARD_HOLD_MS=<ms> makes the first write of the process wait that long with its
+        // file still open and then stay here for as long as the guest is paused. A whole save takes about 17 ms (the file
+        // is open for 4 ms of it), so this is the only way to have the settings overlay open in the middle of one on
+        // purpose (together with PS2X_TEST_OPEN_ON_CARD_WRITE=1 on the host side, ps2_host_ui.cpp).
+        if (result > 0)
+        {
+            static const int holdMs = []()
+            {
+                const char *value = std::getenv("PS2X_TEST_CARD_HOLD_MS");
+                return value ? std::atoi(value) : 0;
+            }();
+            static std::atomic<bool> held{false};
+            if (holdMs > 0 && !held.exchange(true))
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(holdMs));
+                ps2x_host::waitWhileGuestPaused([runtime]()
+                                                { return runtime != nullptr && runtime->isStopRequested(); });
+            }
         }
         setReturnS32(ctx, 0);
     }

@@ -11,7 +11,9 @@
 //     Unset it to change it here.");
 //   - a setting that needs the GPU renderer is dimmed while the renderer setting says CPU;
 //   - a setting that only takes effect after a restart is tagged RESTART once it differs from what the running game
-//     started with, and a line at the bottom says so.
+//     started with, and a line at the bottom says so;
+//   - Quit Game asks "Quit to the desktop?" first (Cancel has the focus) and only then tells the host; the host can keep
+//     the button dimmed, with a reason in the help line (quitBlockedReason).
 //
 // Not thread-safe: the host's main thread, like Overlay.
 #pragma once
@@ -47,6 +49,12 @@ namespace ps2x::ui
         // Back, B or Escape: the player is done. The host saves and closes the menu (not from inside this call:
         // the page is still handling an event; set a flag and close afterwards).
         virtual void closeRequested() = 0;
+        // The player answered "Quit to the desktop?" with Quit. The host saves its settings and ends the game, as closing the
+        // window does (not from inside this call: the page is still handling an event; set a flag and quit afterwards).
+        virtual void quitRequested() {}
+        // "" when Quit Game can be used now. Otherwise one sentence saying why not, for the help line ("The game is writing to
+        // the memory card..."); the button is dimmed and does nothing. Asked on open and after every refresh().
+        virtual std::string quitBlockedReason() { return std::string(); }
         // The lines of the Controls page, and the name of the controller in use ("" if none).
         virtual std::vector<ControlLine> controls() = 0;
         virtual std::string controllerName() { return std::string(); }

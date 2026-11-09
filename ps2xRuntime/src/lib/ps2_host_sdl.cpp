@@ -1099,6 +1099,12 @@ namespace ps2x_host
         pace();
     }
 
+    void requestQuit()
+    {
+        // The same flag the window's close button sets: pumpEvents() then returns false and the run loop stops the game.
+        g_quitRequested.store(true);
+    }
+
     bool windowFullscreen()
     {
         return g_video.window && (SDL_GetWindowFlags(g_video.window) & SDL_WINDOW_FULLSCREEN) != 0;

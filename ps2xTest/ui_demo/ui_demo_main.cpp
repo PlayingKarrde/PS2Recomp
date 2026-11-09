@@ -32,7 +32,11 @@
 //   --menu        show the game's settings menu (pages/game_settings.rml, ui_game_menu.h) with a stand-in for the game side,
 //                 instead of the demo page. --set k=v,... gives starting values, --startup k=v,... what the "running game"
 //                 started with (a different current value then shows RESTART), --env-lock k=NAME,... settings fixed by an
-//                 environment variable. --expect then checks the stand-in's values.
+//                 environment variable. --expect then checks the stand-in's values. --quit-blocked TEXT dims Quit Game with
+//                 TEXT as the reason (the host does this while the game writes the memory card). Besides the setting
+//                 values, --expect understands focus (the id of the focused element), confirm (shown or hidden: the
+//                 Quit Game question), quit (asked, once Quit was confirmed), quit-locked (1 or empty), help (the
+//                 help line's text) and tab (the selected tab).
 //   --window      with --script or --png: open a window anyway, so the frames go through the swapchain. The PNG is
 //                 then taken from a second, offscreen draw of the same frame.
 //
@@ -92,7 +96,7 @@ namespace
         bool breakScissor = false; // --validation-selftest
         bool virtualPad = false;   // --virtual-pad
         bool menu = false;         // --menu
-        std::string menuSet, menuStartup, menuEnvLock;
+        std::string menuSet, menuStartup, menuEnvLock, quitBlocked;
         std::string page = "pages/settings.rml";
         int frames = 0;
     };
@@ -413,6 +417,8 @@ namespace
         std::map<std::string, std::string> startup;
         std::map<std::string, std::string> env;
         bool closeAsked = false;
+        bool quitAsked = false;
+        std::string quitBlocked; // --quit-blocked: why Quit Game is dimmed
 
         std::string value(const std::string &key) override { return values[key]; }
         std::string startupValue(const std::string &key) override { return startup.count(key) ? startup[key] : values[key]; }
@@ -433,6 +439,13 @@ namespace
             std::printf("back\n");
             closeAsked = true;
         }
+        void quitRequested() override
+        {
+            std::printf("quit\n");
+            quitAsked = true;
+            values["quit"] = "asked";
+        }
+        std::string quitBlockedReason() override { return quitBlocked; }
         std::vector<ControlLine> controls() override
         {
             return {{"Move", "Arrow keys, W A S D", "D-pad, left stick"}, {"Cross", "X, Space", "A (bottom button)"},
@@ -745,6 +758,38 @@ namespace
         return std::string();
     }
 
+    // What the --expect keys focus, confirm, quit-locked, help and tab read from the menu's page.
+    std::string menuState(Demo &d, const std::string &key)
+    {
+        Rml::Context *context = d.menu.overlay().context();
+        Rml::ElementDocument *document = context && context->GetNumDocuments() > 0 ? context->GetDocument(0) : nullptr;
+        if (!document)
+            return "(no page)";
+        if (key == "focus")
+        {
+            Rml::Element *focus = context->GetFocusElement();
+            return focus ? focus->GetId() : std::string("(none)");
+        }
+        if (key == "confirm")
+        {
+            Rml::Element *confirm = document->GetElementById("confirm");
+            return confirm && !confirm->IsClassSet("hidden") ? "shown" : "hidden";
+        }
+        if (key == "quit-locked")
+        {
+            Rml::Element *quit = document->GetElementById("quit");
+            return quit ? quit->GetAttribute<Rml::String>("data-locked", "") : std::string("(no button)");
+        }
+        if (key == "tab")
+        {
+            Rml::ElementList tabs;
+            document->QuerySelectorAll(tabs, ".tab.selected");
+            return tabs.empty() ? std::string("(none)") : tabs.front()->GetAttribute<Rml::String>("data-tab", "");
+        }
+        Rml::Element *help = document->GetElementById("help-text");
+        return help ? help->GetInnerRML() : std::string("(no help line)");
+    }
+
     void usage()
     {
         std::fprintf(stderr,
@@ -806,6 +851,8 @@ int main(int argc, char **argv)
             opt.menuStartup = next();
         else if (a == "--env-lock" && i + 1 < argc)
             opt.menuEnvLock = next();
+        else if (a == "--quit-blocked" && i + 1 < argc)
+            opt.quitBlocked = next();
         else if (a == "--window")
             opt.forceWindow = true;
         else if (a == "--frames" && i + 1 < argc)
@@ -885,6 +932,7 @@ int main(int argc, char **argv)
         for (auto &kv : parsePairs(opt.menuStartup))
             d.fake.startup[kv.first] = kv.second;
         d.fake.env = parsePairs(opt.menuEnvLock);
+        d.fake.quitBlocked = opt.quitBlocked;
         if (!d.menu.init(config, &d.fake))
         {
             std::fprintf(stderr, "FATAL: the overlay could not start\n");
@@ -978,7 +1026,7 @@ int main(int argc, char **argv)
                 break;
             }
             ++number;
-            if (d.backPressed || d.fake.closeAsked)
+            if (d.backPressed || d.fake.closeAsked || d.fake.quitAsked)
                 break;
         }
         // Settings the script should have reached.
@@ -997,7 +1045,9 @@ int main(int argc, char **argv)
                     continue;
                 const std::string key = item.substr(0, eq);
                 const std::string want = item.substr(eq + 1);
-                const std::string got = opt.menu ? d.fake.values[key] : d.page.value(key);
+                std::string got = opt.menu ? d.fake.values[key] : d.page.value(key);
+                if (opt.menu && (key == "focus" || key == "confirm" || key == "quit-locked" || key == "help" || key == "tab"))
+                    got = menuState(d, key);
                 const bool ok = got == want;
                 std::printf("%s expect %s = %s (got %s)\n", ok ? "PASS" : "FAIL", key.c_str(), want.c_str(), got.c_str());
                 if (!ok)

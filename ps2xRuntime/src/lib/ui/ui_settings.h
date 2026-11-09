@@ -16,6 +16,10 @@
 //        .value                            the element that shows "[ON]", "[16:9]" or "[ 50%]"
 //        .slider .track, .fill             the slider's track (mouse hits) and the filled part (its width is set)
 //   #help-text, #back                      the help line and the Back button
+//   #quit, #confirm, #window               optional. A Quit Game button that asks first: a click shows #confirm (a layer over
+//        #confirm-yes, #confirm-no         the page with a question and two buttons; #window gets the class "confirming" so
+//                                          nothing behind it takes the focus), Cancel (#confirm-no) has the focus, Escape or
+//                                          the B button cancels, and only #confirm-yes calls the quit callback.
 //
 // Keys on a row: Left/Right change the value (toggle: flip, choice: previous/next with wrap, slider: step), Return
 // or a click activates (toggle: flip, choice: next). Page Up / Page Down (the controller's shoulder buttons) switch
@@ -24,7 +28,8 @@
 // A row can be locked (setLocked): it stays focusable, so the help line can say why, but its value cannot change and
 // it is drawn dimmed. A page may also have a `.tag` element in a row, which shows a short word ("ENV", "RESTART").
 //
-// Nothing here changes the game. The host sets a callback to learn about changes.
+// Nothing here changes the game. The host sets a callback to learn about changes (and to learn that the player
+// confirmed Quit Game).
 #pragma once
 
 #include <RmlUi/Core/EventListener.h>
@@ -59,6 +64,7 @@ namespace ps2x::ui
 
         void setOnChange(ChangeCallback callback) { m_onChange = std::move(callback); }
         void setOnBack(std::function<void()> callback) { m_onBack = std::move(callback); }
+        void setOnQuit(std::function<void()> callback) { m_onQuit = std::move(callback); }
 
         // Reads and writes a setting by key. setValue updates the display and does not call the change callback.
         std::string value(const std::string &key) const;
@@ -70,6 +76,12 @@ namespace ps2x::ui
         // .tag element ("" clears it).
         bool setLocked(const std::string &key, bool locked, const std::string &reason, const std::string &tag);
         bool setTag(const std::string &key, const std::string &tag);
+        // Dims the Quit Game button and makes it do nothing; `reason` replaces its help text while it is focused. An empty
+        // reason unlocks it. False if the page has no #quit.
+        bool setQuitLocked(const std::string &reason);
+        // Hides the question if it is showing (the menu was closed or opened again).
+        void closeConfirm();
+        bool confirming() const { return m_confirming; }
 
         void selectTab(const std::string &name);
         std::string selectedTab() const { return m_tab; }
@@ -88,11 +100,15 @@ namespace ps2x::ui
         void setSliderFromMouse(Rml::Element *row, float mouseX);
         void showHelp(Rml::Element *element);
         void switchTab(int delta);
+        void openConfirm();
+        void leaveConfirm(bool focusQuit);
 
         Rml::ElementDocument *m_document = nullptr;
         std::string m_tab;
         Rml::Element *m_dragRow = nullptr; // the slider row being dragged with the mouse
+        bool m_confirming = false;         // the Quit Game question is showing
         ChangeCallback m_onChange;
         std::function<void()> m_onBack;
+        std::function<void()> m_onQuit;
     };
 }
