@@ -20,8 +20,11 @@
 #include <SDL3/SDL_gpu.h>
 #include <SDL3/SDL_video.h>
 
+#include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace Rml
 {
@@ -43,6 +46,14 @@ namespace ps2x::ui
         std::string assetRoot;
         // Optional. The window gets the mouse cursor RmlUi asks for.
         SDL_Window *window = nullptr;
+
+        // Files that come from mods (mod_manager.h) rather than from the asset folder. RmlUi opens everything by name, so a
+        // name that starts with "mod:" ("mod:example.overlay-crimson/theme/accent.rcss") is handed to this reader; it fills
+        // `bytes` and returns true, or returns false when there is no such file. Unset: names like that do not open.
+        std::function<bool(const std::string &name, std::vector<uint8_t> &bytes)> virtualFiles;
+        // Style sheets (virtual names, as above) added to every page after the page's own, in this order, so the last one wins:
+        // the theme mods. A sheet that does not load is logged and skipped; the page still opens.
+        std::vector<std::string> extraStyleSheets;
     };
 
     // What the UI has logged since init (RmlUi warnings are usually a page or style sheet problem).

@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstring>
 #include <map>
 
 namespace ps2x::ui
@@ -100,6 +101,114 @@ namespace ps2x::ui
             std::map<SDL_SystemCursor, SDL_Cursor *> m_cursors;
         };
 
+        // RmlUi's window onto files. Real files are opened through SDL (which takes UTF-8 paths on every system, unlike fopen on
+        // Windows). A name that starts with "mod:" belongs to a mod: it is asked of the reader in OverlayConfig::virtualFiles
+        // and served from memory.
+        class FileInterface final : public Rml::FileInterface
+        {
+        public:
+            void setVirtualReader(std::function<bool(const std::string &, std::vector<uint8_t> &)> reader) { m_reader = std::move(reader); }
+
+            Rml::FileHandle Open(const Rml::String &path) override
+            {
+                if (path.compare(0, 4, "mod:") == 0)
+                {
+                    if (!m_reader)
+                        return 0;
+                    auto *file = new File();
+                    if (!m_reader(path, file->bytes))
+                    {
+                        delete file;
+                        return 0;
+                    }
+                    return reinterpret_cast<Rml::FileHandle>(file);
+                }
+                SDL_IOStream *io = SDL_IOFromFile(path.c_str(), "rb");
+                if (!io)
+                    return 0;
+                auto *file = new File();
+                file->io = io;
+                return reinterpret_cast<Rml::FileHandle>(file);
+            }
+
+            void Close(Rml::FileHandle handle) override
+            {
+                auto *file = reinterpret_cast<File *>(handle);
+                if (file->io)
+                    SDL_CloseIO(file->io);
+                delete file;
+            }
+
+            size_t Read(void *buffer, size_t size, Rml::FileHandle handle) override
+            {
+                auto *file = reinterpret_cast<File *>(handle);
+                if (file->io)
+                    return SDL_ReadIO(file->io, buffer, size);
+                const size_t available = file->bytes.size() - std::min(file->position, file->bytes.size());
+                const size_t count = std::min(size, available);
+                if (count)
+                    std::memcpy(buffer, file->bytes.data() + file->position, count);
+                file->position += count;
+                return count;
+            }
+
+            bool Seek(Rml::FileHandle handle, long offset, int origin) override
+            {
+                auto *file = reinterpret_cast<File *>(handle);
+                if (file->io)
+                {
+                    const SDL_IOWhence whence = origin == SEEK_SET ? SDL_IO_SEEK_SET : (origin == SEEK_CUR ? SDL_IO_SEEK_CUR : SDL_IO_SEEK_END);
+                    return SDL_SeekIO(file->io, offset, whence) >= 0;
+                }
+                long long target = offset;
+                if (origin == SEEK_CUR)
+                    target += static_cast<long long>(file->position);
+                else if (origin == SEEK_END)
+                    target += static_cast<long long>(file->bytes.size());
+                if (target < 0 || target > static_cast<long long>(file->bytes.size()))
+                    return false;
+                file->position = static_cast<size_t>(target);
+                return true;
+            }
+
+            size_t Tell(Rml::FileHandle handle) override
+            {
+                auto *file = reinterpret_cast<File *>(handle);
+                if (file->io)
+                {
+                    const Sint64 at = SDL_TellIO(file->io);
+                    return at < 0 ? 0 : static_cast<size_t>(at);
+                }
+                return file->position;
+            }
+
+        private:
+            struct File
+            {
+                SDL_IOStream *io = nullptr;
+                std::vector<uint8_t> bytes;
+                size_t position = 0;
+            };
+            std::function<bool(const std::string &, std::vector<uint8_t> &)> m_reader;
+        };
+
+        std::string escapeAttribute(const std::string &text)
+        {
+            std::string out;
+            for (const char c : text)
+            {
+                switch (c)
+                {
+                case '&': out += "&amp;"; break;
+                case '"': out += "&quot;"; break;
+                case '<': out += "&lt;"; break;
+                case '>': out += "&gt;"; break;
+                default: out += c; break;
+                }
+            }
+            return out;
+        }
+
         bool g_rmlInitialised = false; // RmlUi's own state is process-wide, so only one Overlay at a time
     }
 
@@ -108,6 +217,8 @@ namespace ps2x::ui
         explicit Impl(SDL_Window *window) : system(window) {}
 
         SystemInterface system;
+        FileInterface files;
+        std::vector<std::string> extraStyleSheets;
         SdlGpuRenderer renderer;
         Input input;
         Rml::Context *context = nullptr;
@@ -145,8 +256,12 @@ namespace ps2x::ui
         if (!impl->renderer.init(config.device, config.targetFormat))
             return false;
 
+        impl->files.setVirtualReader(config.virtualFiles);
+        impl->extraStyleSheets = config.extraStyleSheets;
+
         // The interfaces must be set before RmlUi starts.
         Rml::SetSystemInterface(&impl->system);
+        Rml::SetFileInterface(&impl->files);
         Rml::SetRenderInterface(&impl->renderer);
         if (!Rml::Initialise())
         {
@@ -240,7 +355,48 @@ namespace ps2x::ui
     {
         if (!m_impl)
             return nullptr;
-        Rml::ElementDocument *document = m_impl->context->LoadDocument(m_impl->assetRoot + "/" + relativePath);
+        const std::string path = m_impl->assetRoot + "/" + relativePath;
+        Rml::ElementDocument *document = nullptr;
+        if (m_impl->extraStyleSheets.empty())
+        {
+            document = m_impl->context->LoadDocument(path);
+        }
+        else
+        {
+            // The theme mods' style sheets go after the page's own links, so they win where they say the same thing. RmlUi
+            // reads a page's links while it parses it, so the links are added to the text and the page is loaded from memory
+            // (with its real path as the source, so its own relative links still resolve).
+            std::string text;
+            if (SDL_IOStream *io = SDL_IOFromFile(path.c_str(), "rb"))
+            {
+                size_t size = 0;
+                void *data = SDL_LoadFile_IO(io, &size, true);
+                if (data)
+                {
+                    text.assign(static_cast<const char *>(data), size);
+                    SDL_free(data);
+                }
+            }
+            const size_t headEnd = text.find("</head>");
+            if (text.empty() || headEnd == std::string::npos)
+            {
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "[ui] page %s has no </head>; the theme mods' style sheets are not added",
+                            relativePath.c_str());
+                document = m_impl->context->LoadDocument(path);
+            }
+            else
+            {
+                std::string links;
+                for (const std::string &sheet : m_impl->extraStyleSheets)
+                    links += "    <link type=\"text/rcss\" href=\"" + escapeAttribute(sheet) + "\"/>\n";
+                text.insert(headEnd, links);
+                // RmlUi writes a drive letter's colon as '|' in the URL of a source it opens itself (StreamFile::Open) and turns it
+                // back when it joins a relative link; a source given from memory has to follow the same convention.
+                std::string sourceUrl = path;
+                std::replace(sourceUrl.begin(), sourceUrl.end(), ':', '|');
+                document = m_impl->context->LoadDocumentFromMemory(text, sourceUrl);
+            }
+        }
         if (!document)
         {
             SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "[ui] cannot load page %s", relativePath.c_str());

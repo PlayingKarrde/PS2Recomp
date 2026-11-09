@@ -43,6 +43,14 @@ add_library(ps2_test_lib STATIC
     src/ui_settings_tests.cpp
 )
 
+# The mod layer's tests (src/lib/mods) exist when the build has the mod manager (PS2X_BUILD_MODS). The tests use only the
+# manager's own headers and the static library; the game build does not include ps2xTest.
+if(TARGET ps2_mods)
+    target_sources(ps2_test_lib PRIVATE src/mod_manager_tests.cpp)
+    target_link_libraries(ps2_test_lib PRIVATE ps2_mods)
+    target_compile_definitions(ps2_test_lib PRIVATE PS2X_HAS_MODS_TESTS=1)
+endif()
+
 target_include_directories(ps2_test_lib PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_SOURCE_DIR}/ps2xRecomp/include
@@ -72,6 +80,10 @@ if(PRINT_GENERATED_CODE)
 
     target_compile_definitions(ps2x_tests PRIVATE PRINT_GENERATED_CODE)
     target_compile_definitions(ps2_test_lib PRIVATE PRINT_GENERATED_CODE)
+endif()
+
+if(TARGET ps2_mods)
+    target_compile_definitions(ps2x_tests PRIVATE PS2X_HAS_MODS_TESTS=1)
 endif()
 
 target_include_directories(ps2x_tests PRIVATE

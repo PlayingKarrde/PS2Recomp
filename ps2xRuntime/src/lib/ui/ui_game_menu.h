@@ -13,7 +13,9 @@
 //   - a setting that only takes effect after a restart is tagged RESTART once it differs from what the running game
 //     started with, and a line at the bottom says so;
 //   - Quit Game asks "Quit to the desktop?" first (Cancel has the focus) and only then tells the host; the host can keep
-//     the button dimmed, with a reason in the help line (quitBlockedReason).
+//     the button dimmed, with a reason in the help line (quitBlockedReason);
+//   - the Mods tab (ui_mods.h) is there when the host gives the menu a mod manager (MenuHost::modManager); a change to the
+//     mods that is for the next start adds "Mods" to the "Restart the game to apply" note.
 //
 // Not thread-safe: the host's main thread, like Overlay.
 #pragma once
@@ -23,6 +25,11 @@
 #include <memory>
 #include <string>
 #include <vector>
+
+namespace ps2x::mods
+{
+    class Manager;
+}
 
 namespace ps2x::ui
 {
@@ -58,6 +65,8 @@ namespace ps2x::ui
         // The lines of the Controls page, and the name of the controller in use ("" if none).
         virtual std::vector<ControlLine> controls() = 0;
         virtual std::string controllerName() { return std::string(); }
+        // The mod manager the Mods tab works on, or nullptr: the tab is then left out of the menu. It must outlive the menu.
+        virtual ps2x::mods::Manager *modManager() { return nullptr; }
     };
 
     class GameMenu
@@ -80,6 +89,9 @@ namespace ps2x::ui
         bool visible() const;
         // Reads the settings again (after the host changed something behind the menu's back).
         void refresh();
+        // Shows the Mods tab with `message` under the list ("Installed X.", "That is not a mod file."). The host calls it after a file was
+        // dropped on the window; it opens the menu first if it is not open.
+        void showMods(const std::string &message);
 
         // The overlay for events, update and record (see ui_overlay.h).
         Overlay &overlay();

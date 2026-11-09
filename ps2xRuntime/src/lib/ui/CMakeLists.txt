@@ -91,6 +91,15 @@ target_include_directories(ps2_ui
 target_link_libraries(ps2_ui PUBLIC ${PS2X_SDL3_TARGET} rmlui_core)
 set_target_properties(ps2_ui PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
 
+# The Mods tab (ui_mods.cpp) needs the mod manager (src/lib/mods, option PS2X_BUILD_MODS), which ps2xRuntime/CMakeLists.txt adds
+# before this folder. Without it the menu has no Mods tab and ui_mods.cpp is not compiled. The definition is private: only
+# ui_game_menu.cpp looks at it, and nothing the game's generated code includes does.
+if(TARGET ps2_mods)
+    target_sources(ps2_ui PRIVATE ui_mods.cpp)
+    target_link_libraries(ps2_ui PUBLIC ps2_mods)
+    target_compile_definitions(ps2_ui PRIVATE PS2X_UI_MODS=1)
+endif()
+
 # The theme: RCSS, the pages and the fonts. They are loaded from a folder at run time (see ui_overlay.h).
 # ps2x_ui_stage_assets(<target>) copies that folder to <folder of the target's program>/ui_assets before the
 # target is built (every time, so an edited page or style sheet shows up without touching a source file).

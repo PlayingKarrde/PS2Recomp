@@ -22,6 +22,9 @@ void register_ps2_float_semantics_tests();
 void register_gs_recording_tests();
 void register_gs_gpu_tests();
 void register_ui_settings_tests();
+#if defined(PS2X_HAS_MODS_TESTS)
+void register_mod_manager_tests();
+#endif
 void reset_ps2_test_function_table();
 
 int main()
@@ -56,6 +59,9 @@ int main()
     register_gs_recording_tests();
     register_gs_gpu_tests();
     register_ui_settings_tests();
+#if defined(PS2X_HAS_MODS_TESTS)
+    register_mod_manager_tests();
+#endif
     int res = MiniTest::Run();
     std::cout.flush();
     std::cerr.flush();

@@ -13,6 +13,10 @@ target_include_directories(ps2x_ui_demo PRIVATE
     ${CMAKE_SOURCE_DIR}/ps2xRuntime
 )
 target_link_libraries(ps2x_ui_demo PRIVATE ps2_ui)
+# With the mod manager in the build (PS2X_BUILD_MODS) the demo can give the menu a manager (--mods-dir) and show the Mods tab.
+if(TARGET ps2_mods)
+    target_compile_definitions(ps2x_ui_demo PRIVATE PS2X_DEMO_MODS=1)
+endif()
 target_compile_definitions(ps2x_ui_demo PRIVATE PS2X_UI_SOURCE_ASSET_DIR="${PS2X_UI_ASSET_DIR}")
 ps2x_ui_stage_assets(ps2x_ui_demo)
 if(UNIX AND NOT APPLE)

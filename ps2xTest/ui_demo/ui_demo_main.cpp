@@ -23,7 +23,8 @@
 //                   drag:X0,Y0,X1,Y1                   press, move and release the left button (sliders)
 //                   wait:N                             N more frames
 //                 Real controllers are ignored while a script runs.
-//   --expect      after the script, compare setting values (aspect, resolution, brightness...) and exit 1 if any differ.
+//   --expect      after the script, compare setting values (aspect, resolution, brightness...) and exit 1 if any differ. A value
+//                 that starts with ~ only has to be contained in what the menu says (a help line or status line).
 //   --validation-selftest   draws one deliberately invalid scissor rectangle (x = -8) each frame. With --debug the
 //                 validation layer must report it, which shows that a clean --debug run means something.
 //   --virtual-pad drive the script's controller steps through an SDL virtual gamepad (SDL_AttachVirtualJoystick), so
@@ -37,6 +38,11 @@
 //                 values, --expect understands focus (the id of the focused element), confirm (shown or hidden: the
 //                 Quit Game question), quit (asked, once Quit was confirmed), quit-locked (1 or empty), help (the
 //                 help line's text) and tab (the selected tab).
+//   --mods-dir DIR [--mods-state FILE]   with --menu: give the menu a mod manager on that mods folder (src/lib/mods), so the
+//                 Mods tab is there. The state file (default DIR/../mods.toml) decides which mods are on; a theme mod that is on in
+//                 it is applied, as at a game start. --expect then also understands mods-on, mods-active, mods-order (comma
+//                 lists of mod ids), mods-restart (1 or 0), mods-status, selected-mod, mod-title, mod-problem, mod-confirm,
+//                 restart-note and mods-count. `drop:PATH` as a script step installs a file as a drop on the window would.
 //   --window      with --script or --png: open a window anyway, so the frames go through the swapchain. The PNG is
 //                 then taken from a second, offscreen draw of the same frame.
 //
@@ -44,6 +50,9 @@
 
 #include "../common/png_write.h"
 
+#if defined(PS2X_DEMO_MODS)
+#include "mod_manager.h"
+#endif
 #include "ui_game_menu.h"
 #include "ui_overlay.h"
 #include "ui_render_sdlgpu.h"
@@ -97,6 +106,7 @@ namespace
         bool virtualPad = false;   // --virtual-pad
         bool menu = false;         // --menu
         std::string menuSet, menuStartup, menuEnvLock, quitBlocked;
+        std::string modsDir, modsState;
         std::string page = "pages/settings.rml";
         int frames = 0;
     };
@@ -456,6 +466,8 @@ namespace
                     {"Debug panel", "F1", "-"}};
         }
         std::string controllerName() override { return "Demo virtual gamepad"; }
+        ps2x::mods::Manager *manager = nullptr;
+        ps2x::mods::Manager *modManager() override { return manager; }
     };
 
     // The application: owns the device, the overlay, the picture, and draws frames.
@@ -474,6 +486,9 @@ namespace
         Rml::ElementDocument *document = nullptr;
         GameMenu menu;
         FakeHost fake;
+#if defined(PS2X_DEMO_MODS)
+        ps2x::mods::Manager mods;
+#endif
         int width = 0;
         int height = 0;
         bool quit = false;
@@ -696,6 +711,20 @@ namespace
             key(code, false);
             d.frames(static_cast<int>(kSettleFrames), false);
         }
+        else if (name == "drop")
+        {
+            // A file dropped on the window: the manager installs it and the menu shows the answer on the Mods tab.
+#if defined(PS2X_DEMO_MODS)
+            if (!d.fake.manager)
+                return false;
+            const ps2x::mods::Result result = d.fake.manager->install(fs::path(arg));
+            std::printf("drop: %s\n", result.message.c_str());
+            d.menu.showMods(result.message);
+            d.frames(static_cast<int>(kSettleFrames), false);
+#else
+            return false;
+#endif
+        }
         else if (name == "move" || name == "click")
         {
             float x = 0, y = 0;
@@ -768,7 +797,37 @@ namespace
         if (key == "focus")
         {
             Rml::Element *focus = context->GetFocusElement();
-            return focus ? focus->GetId() : std::string("(none)");
+            if (!focus)
+                return "(none)";
+            if (!focus->GetId().empty())
+                return focus->GetId();
+            // The Mods tab's elements have no id: name them by what they are.
+            if (focus->IsClassSet("mod"))
+                return "mod:" + focus->GetAttribute<Rml::String>("data-key", "");
+            if (focus->IsClassSet("mbtn"))
+                return "btn:" + focus->GetAttribute<Rml::String>("data-action", "");
+            if (focus->IsClassSet("mrow"))
+                return "setting:" + focus->GetAttribute<Rml::String>("data-setting", "");
+            return "(unnamed)";
+        }
+        if (key == "mod-confirm")
+        {
+            Rml::Element *confirm = document->GetElementById("mod-confirm");
+            return confirm && !confirm->IsClassSet("hidden") ? "shown" : "hidden";
+        }
+        if (key == "selected-mod")
+        {
+            Rml::ElementList rows;
+            document->QuerySelectorAll(rows, ".mod.selected");
+            return rows.empty() ? std::string("(none)") : rows.front()->GetAttribute<Rml::String>("data-key", "");
+        }
+        if (key == "mods-status" || key == "mod-title" || key == "mod-problem" || key == "restart-note")
+        {
+            const char *id = key == "mods-status" ? "mods-status" : (key == "mod-title" ? "mod-title" : (key == "mod-problem" ? "mod-problem" : "restart-note"));
+            Rml::Element *element = document->GetElementById(id);
+            if (key == "restart-note" && element && element->IsClassSet("hidden"))
+                return std::string();
+            return element ? element->GetInnerRML() : std::string();
         }
         if (key == "confirm")
         {
@@ -853,6 +912,10 @@ int main(int argc, char **argv)
             opt.menuEnvLock = next();
         else if (a == "--quit-blocked" && i + 1 < argc)
             opt.quitBlocked = next();
+        else if (a == "--mods-dir" && i + 1 < argc)
+            opt.modsDir = next();
+        else if (a == "--mods-state" && i + 1 < argc)
+            opt.modsState = next();
         else if (a == "--window")
             opt.forceWindow = true;
         else if (a == "--frames" && i + 1 < argc)
@@ -933,6 +996,31 @@ int main(int argc, char **argv)
             d.fake.startup[kv.first] = kv.second;
         d.fake.env = parsePairs(opt.menuEnvLock);
         d.fake.quitBlocked = opt.quitBlocked;
+#if defined(PS2X_DEMO_MODS)
+        if (!opt.modsDir.empty())
+        {
+            ps2x::mods::Manager::Config mc;
+            mc.modsDir = opt.modsDir;
+            mc.statePath = opt.modsState.empty() ? fs::path(opt.modsDir).parent_path() / "mods.toml" : fs::path(opt.modsState);
+            if (!d.mods.init(mc))
+            {
+                std::fprintf(stderr, "FATAL: the mod manager could not start: %s\n", d.mods.initError().c_str());
+                return 2;
+            }
+            for (const std::string &note : d.mods.notes())
+                std::fprintf(stderr, "mods: %s\n", note.c_str());
+            d.fake.manager = &d.mods;
+            // What the game does at a start: the theme mods that are on add their style sheets after the game's own theme.
+            config.extraStyleSheets = d.mods.sessionThemeStylesheets();
+            config.virtualFiles = [&d](const std::string &name, std::vector<uint8_t> &bytes) {
+                auto data = d.mods.readVirtual(name);
+                if (!data)
+                    return false;
+                bytes = std::move(*data);
+                return true;
+            };
+        }
+#endif
         if (!d.menu.init(config, &d.fake))
         {
             std::fprintf(stderr, "FATAL: the overlay could not start\n");
@@ -1046,9 +1134,29 @@ int main(int argc, char **argv)
                 const std::string key = item.substr(0, eq);
                 const std::string want = item.substr(eq + 1);
                 std::string got = opt.menu ? d.fake.values[key] : d.page.value(key);
-                if (opt.menu && (key == "focus" || key == "confirm" || key == "quit-locked" || key == "help" || key == "tab"))
+                if (opt.menu && (key == "focus" || key == "confirm" || key == "quit-locked" || key == "help" || key == "tab" ||
+                                 key == "mod-confirm" || key == "selected-mod" || key == "mods-status" || key == "mod-title" ||
+                                 key == "mod-problem" || key == "restart-note"))
                     got = menuState(d, key);
-                const bool ok = got == want;
+#if defined(PS2X_DEMO_MODS)
+                if (opt.menu && d.fake.manager && (key == "mods-on" || key == "mods-active" || key == "mods-order" || key == "mods-restart" || key == "mods-count"))
+                {
+                    got.clear();
+                    int count = 0;
+                    for (const ps2x::mods::ModInfo &m : d.mods.list())
+                    {
+                        ++count;
+                        const bool take = key == "mods-order" ? m.valid : (key == "mods-on" ? m.enabled : (key == "mods-active" ? m.active : false));
+                        if (take)
+                            got += (got.empty() ? "" : "|") + m.key;
+                    }
+                    if (key == "mods-restart")
+                        got = d.mods.restartNeeded() ? "1" : "0";
+                    else if (key == "mods-count")
+                        got = std::to_string(count);
+                }
+#endif
+                const bool ok = (!want.empty() && want[0] == '~') ? got.find(want.substr(1)) != std::string::npos : got == want;
                 std::printf("%s expect %s = %s (got %s)\n", ok ? "PASS" : "FAIL", key.c_str(), want.c_str(), got.c_str());
                 if (!ok)
                     status = 1;

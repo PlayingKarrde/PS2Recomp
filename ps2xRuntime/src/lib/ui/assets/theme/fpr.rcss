@@ -309,10 +309,11 @@ body
     letter-spacing: 1dp;
 }
 
-/* The panels of the game's settings page are the same height, so the window does not jump between tabs. */
+/* The panels of the game's settings page are the same height, so the window does not jump between tabs. The Mods tab needs
+   the room for a list and a details page side by side. */
 #window .panel
 {
-    min-height: 350dp;
+    min-height: 400dp;
 }
 
 .ctl
@@ -443,6 +444,389 @@ body
     margin: 0 12dp;
 }
 
+/* ---- The Mods tab: a list of mods on the left, the details of the focused mod on the right ----------------- */
+
+#panel-mods
+{
+    padding: 10dp 12dp;
+}
+
+#mods-body
+{
+    display: flex;
+    flex-direction: row;
+    height: 318dp;
+}
+
+#mods-list
+{
+    width: 330dp;
+    height: 318dp;
+    margin-right: 14dp;
+    overflow-y: auto;
+}
+
+#mods-empty
+{
+    padding: 14dp;
+    font-size: 20dp;
+    font-weight: normal;
+    color: #e6e0c8;
+}
+
+.mod
+{
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    tab-index: auto;
+    nav: auto;
+    height: 42dp;
+    padding: 0 8dp;
+    font-size: 21dp;
+    letter-spacing: 1dp;
+    border-radius: 3dp;
+    border-left: 4dp #00000000;
+}
+
+.mod:hover,
+.mod:focus
+{
+    decorator: linear-gradient(180deg, #2c68a3, #3a76b2 45%, #4d8cc6);
+}
+
+.mod.selected
+{
+    border-left-color: #e7bc3d;
+}
+
+.mod .m-pos
+{
+    width: 30dp;
+    font-size: 16dp;
+    font-weight: normal;
+    color: #cfcbbb;
+}
+
+.mod .m-name
+{
+    flex: 1 1 0;
+    height: 26dp;
+    overflow: hidden;
+    white-space: nowrap;
+}
+
+.mod .m-flag
+{
+    width: 18dp;
+    text-align: center;
+    color: #e7bc3d;
+}
+
+.mod .m-state
+{
+    width: 50dp;
+    text-align: right;
+    font-size: 19dp;
+}
+
+.mod.off .m-name,
+.mod.off .m-state
+{
+    color: #b3af9b;
+    font-effect: none;
+}
+
+.mod.bad .m-name,
+.mod.bad .m-state
+{
+    color: #ff9d8a;
+}
+
+#mod-details
+{
+    flex: 1 1 0;
+    height: 318dp;
+}
+
+/* Everything but the buttons scrolls (a long description, many settings); the buttons below stay in view. */
+#mod-info
+{
+    height: 266dp;
+    overflow-y: auto;
+}
+
+#mod-title
+{
+    height: 38dp;
+    overflow: hidden;
+    white-space: nowrap;
+    font-size: 29dp;
+}
+
+#mod-meta
+{
+    height: 24dp;
+    margin-bottom: 6dp;
+    font-size: 16dp;
+    font-weight: normal;
+    letter-spacing: 0.5dp;
+    color: #e7bc3d;
+    overflow: hidden;
+    white-space: nowrap;
+}
+
+#mod-main
+{
+    display: flex;
+    flex-direction: row;
+}
+
+#mod-text
+{
+    flex: 1 1 0;
+}
+
+#mod-desc
+{
+    max-height: 84dp;
+    overflow: hidden;
+    font-size: 18dp;
+    font-weight: normal;
+    letter-spacing: 0.5dp;
+    color: #f2eedc;
+}
+
+#mod-problem
+{
+    margin-top: 6dp;
+    font-size: 17dp;
+    font-weight: normal;
+    letter-spacing: 0.5dp;
+}
+
+#mod-problem.bad
+{
+    color: #ff9d8a;
+}
+
+#mod-problem.warn
+{
+    color: #e7bc3d;
+}
+
+#mod-links,
+#mod-note
+{
+    margin-top: 6dp;
+    font-size: 15dp;
+    font-weight: normal;
+    letter-spacing: 0.5dp;
+    color: #cfcbbb;
+}
+
+#mod-picbox
+{
+    width: 168dp;
+    height: 94dp;
+    margin: 4dp 0 0 12dp;
+    overflow: hidden;
+    border: 2dp #d1caaf;
+    background-color: #000000;
+}
+
+#mod-pic
+{
+    width: 164dp;
+}
+
+#mod-settings
+{
+    margin-top: 6dp;
+}
+
+.mrow
+{
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    tab-index: auto;
+    nav: auto;
+    height: 34dp;
+    padding: 0 8dp;
+    font-size: 19dp;
+    letter-spacing: 0.8dp;
+    border-radius: 3dp;
+}
+
+.mrow:hover,
+.mrow:focus
+{
+    decorator: linear-gradient(180deg, #2c68a3, #3a76b2 45%, #4d8cc6);
+}
+
+.mrow .label
+{
+    flex: 1 1 0;
+}
+
+.mrow .value
+{
+    width: 150dp;
+    text-align: right;
+}
+
+#mod-actions
+{
+    display: flex;
+    flex-direction: row;
+    height: 40dp;
+    margin-top: 10dp;
+}
+
+.mbtn
+{
+    display: block;
+    tab-index: auto;
+    nav: auto;
+    width: 128dp;
+    height: 38dp;
+    margin-right: 8dp;
+    padding-top: 6dp;
+    font-size: 18dp;
+    letter-spacing: 0.8dp;
+    text-align: center;
+    color: #1c1a14;
+    font-effect: outline(1dp #ffffff);
+    decorator: linear-gradient(180deg, #efefef, #c3bda4 14%, #a59f89 80%, #6b6759);
+    border: 2dp #3c3b32;
+    border-radius: 4dp;
+}
+
+.mbtn:hover,
+.mbtn:focus
+{
+    color: #ffffff;
+    font-effect: shadow(2dp 2dp #000000);
+    decorator: linear-gradient(180deg, #2c68a3, #4d8cc6);
+    border-color: #d1caaf;
+}
+
+.mbtn.locked
+{
+    color: #6e6b60;
+    font-effect: none;
+    decorator: linear-gradient(180deg, #8d8a7c, #7a7769 14%, #67645a 80%, #4a483f);
+}
+
+.mbtn.locked:hover,
+.mbtn.locked:focus
+{
+    color: #cfcbbb;
+    border-color: #d1caaf;
+}
+
+#mods-status
+{
+    height: 22dp;
+    margin-top: 8dp;
+    overflow: hidden;
+    white-space: nowrap;
+    font-size: 17dp;
+    font-weight: normal;
+    letter-spacing: 0.5dp;
+    color: #e7bc3d;
+}
+
+#mods-folder
+{
+    height: 20dp;
+    overflow: hidden;
+    white-space: nowrap;
+    font-size: 14dp;
+    font-weight: normal;
+    letter-spacing: 0.3dp;
+    color: #cfcbbb;
+}
+
+/* Scroll bars (a list or a details page longer than its box): a cream-framed trough with the blue thumb of the game's own lists. */
+scrollbarvertical
+{
+    width: 12dp;
+}
+
+scrollbarvertical slidertrack
+{
+    background-color: #000000a0;
+}
+
+scrollbarvertical sliderbar
+{
+    width: 12dp;
+    min-height: 24dp;
+    background-color: #40a0ff;
+    border: 2dp #d1caaf;
+    border-radius: 4dp;
+}
+
+scrollbarvertical sliderarrowinc,
+scrollbarvertical sliderarrowdec
+{
+    width: 0;
+    height: 0;
+}
+
+/* The uninstall question: the same layer as the Quit Game question. */
+#mod-confirm
+{
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    display: flex;
+    flex-direction: row;
+    justify-content: center;
+    align-items: center;
+    background-color: #000000b4;
+}
+
+#mod-confirm-box
+{
+    box-sizing: border-box;
+    width: 700dp;
+    padding: 26dp 30dp 30dp 30dp;
+    text-align: center;
+    background-color: #000000f2;
+    border: 5dp #d1caaf;
+    border-radius: 10dp;
+}
+
+#mod-confirm-title
+{
+    font-size: 32dp;
+}
+
+#mod-confirm-text
+{
+    margin: 14dp 0 26dp 0;
+    font-size: 21dp;
+    font-weight: normal;
+    color: #e6e0c8;
+}
+
+#mod-confirm-buttons
+{
+    display: flex;
+    flex-direction: row;
+    justify-content: center;
+}
+
+#mod-confirm-buttons .button
+{
+    margin: 0 12dp;
+}
+
 /* Last, so that it wins over the display set on .panel above. */
 .hidden
 {
@@ -450,7 +834,8 @@ body
 }
 
 /* An id selector outranks a class: the question sets its own display, so it needs its own rule. */
-#confirm.hidden
+#confirm.hidden,
+#mod-confirm.hidden
 {
     display: none;
 }

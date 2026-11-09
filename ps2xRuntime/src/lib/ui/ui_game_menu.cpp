@@ -2,6 +2,11 @@
 
 #include "ui_settings.h"
 
+#if defined(PS2X_UI_MODS)
+#include "mod_manager.h"
+#include "ui_mods.h"
+#endif
+
 #include <RmlUi/Core.h>
 
 #include <SDL3/SDL_log.h>
@@ -37,6 +42,10 @@ namespace ps2x::ui
         MenuHost *host = nullptr;
         Rml::ElementDocument *document = nullptr;
         bool built = false;
+#if defined(PS2X_UI_MODS)
+        ModsPage mods;
+        bool modsAttached = false;
+#endif
 
         // Settings that only work with the GPU renderer.
         static bool needsGpuRenderer(const std::string &key)
@@ -51,6 +60,18 @@ namespace ps2x::ui
             document = overlay.loadPage("pages/game_settings.rml");
             if (!document)
                 return false;
+            // Without a mod manager the Mods tab is not part of the menu: it is removed before the settings page looks for its tabs.
+            bool withMods = false;
+#if defined(PS2X_UI_MODS)
+            withMods = host->modManager() != nullptr;
+#endif
+            if (!withMods)
+            {
+                for (const char *id : {"tab-mods", "panel-mods", "mod-confirm"})
+                    if (Rml::Element *element = document->GetElementById(id))
+                        if (Rml::Element *parent = element->GetParentNode())
+                            parent->RemoveChild(element);
+            }
             if (!page.attach(document))
                 return false;
             page.setOnChange([this](const std::string &key, const std::string &value) {
@@ -59,6 +80,13 @@ namespace ps2x::ui
             });
             page.setOnBack([this]() { host->closeRequested(); });
             page.setOnQuit([this]() { host->quitRequested(); });
+#if defined(PS2X_UI_MODS)
+            if (withMods && mods.attach(document, host->modManager()))
+            {
+                mods.setOnChange([this]() { refresh(); });
+                modsAttached = true;
+            }
+#endif
             built = true;
             return true;
         }
@@ -119,6 +147,10 @@ namespace ps2x::ui
                 page.setLocked(key, locked, reason, tag);
             }
             page.setQuitLocked(host->quitBlockedReason());
+#if defined(PS2X_UI_MODS)
+            if (modsAttached && host->modManager() && host->modManager()->restartNeeded())
+                restartNames += std::string(restartNames.empty() ? "" : ", ") + "Mods";
+#endif
             if (document)
             {
                 if (Rml::Element *note = document->GetElementById("restart-note"))
@@ -150,6 +182,10 @@ namespace ps2x::ui
     {
         if (!m_impl)
             return;
+#if defined(PS2X_UI_MODS)
+        m_impl->mods.detach();
+        m_impl->modsAttached = false;
+#endif
         m_impl->page.detach();
         m_impl->overlay.shutdown();
         m_impl->document = nullptr;
@@ -166,10 +202,23 @@ namespace ps2x::ui
         if (!ready() || !m_impl->loadPage())
             return;
         m_impl->page.closeConfirm(); // a question left showing when the menu was closed
+#if defined(PS2X_UI_MODS)
+        if (m_impl->modsAttached)
+        {
+            m_impl->mods.closeConfirm();
+            m_impl->host->modManager()->rescan(); // a file may have been added or removed by hand since the menu was last open
+            m_impl->mods.setStatus(std::string());
+            m_impl->mods.refresh();
+        }
+#endif
         m_impl->fillControls();
         m_impl->refresh();
         m_impl->overlay.setVisible(true);
         m_impl->page.focusFirstRow();
+#if defined(PS2X_UI_MODS)
+        if (m_impl->modsAttached && m_impl->page.selectedTab() == "mods")
+            m_impl->mods.focusList();
+#endif
     }
 
     void GameMenu::close()
@@ -187,6 +236,21 @@ namespace ps2x::ui
     {
         if (ready())
             m_impl->refresh();
+    }
+
+    void GameMenu::showMods(const std::string &message)
+    {
+#if defined(PS2X_UI_MODS)
+        if (!ready() || !m_impl->loadPage() || !m_impl->modsAttached)
+            return;
+        m_impl->page.selectTab("mods");
+        m_impl->mods.refresh();
+        m_impl->mods.setStatus(message);
+        m_impl->refresh();
+        m_impl->mods.focusList();
+#else
+        (void)message;
+#endif
     }
 
     Overlay &GameMenu::overlay()

@@ -432,6 +432,10 @@ if(NOT PS2X_IS_VITA)
     # always compiled; with PS2X_BUILD_UI it carries the overlay, without it a few stubs.
     target_sources(ps2_runtime PRIVATE src/lib/ps2_settings.cpp src/lib/ps2_host_ui.cpp)
 
+    # The game side of the mod manager (src/lib/ps2_host_mods.h): where the mods folder and the state file are, the manager the
+    # host and the overlay share, and installing a dropped file. Always compiled; it does nothing without PS2X_BUILD_MODS.
+    target_sources(ps2_runtime PRIVATE src/lib/ps2_host_mods.cpp)
+
     # SDL_GPU shader loader for the compiled blobs in shaders/compiled/ (see shaders/build_shaders.py).
     # Nothing the generated game code includes refers to it.
     target_sources(ps2_runtime PRIVATE src/lib/gpu/gpu_shaders.cpp)
@@ -449,6 +453,17 @@ if(NOT PS2X_IS_VITA)
     set_source_files_properties(src/lib/ps2_host_gpu.cpp src/lib/gs/gs_gpu_backend.cpp src/lib/gs/gs_gpu_present.cpp
         src/lib/gs/gs_gpu_host.cpp PROPERTIES
         INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/src/lib;${CMAKE_CURRENT_SOURCE_DIR}")
+endif()
+
+# The mod layer (src/lib/mods): the .fprmod package format and the mod manager. On by default: it fetches toml11 and miniz
+# (pinned, see src/lib/mods/CMakeLists.txt) and builds the static library ps2_mods, which the game links. It is its own switch,
+# not part of PS2X_BUILD_UI, because the manager is a runtime feature that later kinds of mod use with or without the overlay;
+# the overlay's Mods tab is built only when both are on. Off, the game has no mod manager and fetches nothing.
+option(PS2X_BUILD_MODS "Build the mod manager (ps2_mods) into the game; fetches toml11 and miniz" ON)
+if(PS2X_BUILD_MODS AND NOT PS2X_IS_VITA)
+    set(PS2X_HAS_MODS ON)
+else()
+    set(PS2X_HAS_MODS OFF)
 endif()
 
 # The RmlUi settings overlay (src/lib/ui). On by default: it fetches RmlUi and FreeType (pinned, see src/lib/ui/CMakeLists.txt)
@@ -599,6 +614,17 @@ if(PS2X_ENABLE_DEBUG_UI AND NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
 endif()
 
 ps2x_stage_ffmpeg_runtime_dlls(ps2EntryRunner)
+
+# The mod manager (src/lib/mods; option PS2X_BUILD_MODS above). Linked for linking only, like the overlay below, so no compile
+# command of ps2_runtime or of the game's generated code changes. ps2_host_mods.cpp alone is told that the manager exists and
+# where its headers are. This comes before the overlay: the overlay's Mods tab is built when the target exists.
+if(PS2X_HAS_MODS)
+    add_subdirectory(src/lib/mods)
+    target_link_libraries(ps2_runtime PRIVATE $<LINK_ONLY:ps2_mods>)
+    set_source_files_properties(src/lib/ps2_host_mods.cpp PROPERTIES
+        COMPILE_DEFINITIONS "PS2X_HAS_MODS=1"
+        INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/src/lib/mods;${CMAKE_CURRENT_SOURCE_DIR}/src/lib;${CMAKE_CURRENT_SOURCE_DIR}")
+endif()
 
 # The RmlUi settings overlay (src/lib/ui; option PS2X_BUILD_UI above). ps2_runtime links it, and only for linking:
 # $<LINK_ONLY:...> passes on no include directory and no definition, so no compile command of ps2_runtime or of the

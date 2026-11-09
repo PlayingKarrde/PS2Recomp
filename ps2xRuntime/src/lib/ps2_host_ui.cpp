@@ -43,6 +43,7 @@
 #include "ps2_host_ui.h"
 
 #include "ps2_host_backend.h"
+#include "ps2_host_mods.h"
 #include "ps2_settings.h"
 #include "runtime/gs/gs_gpu_threads.h"
 #include "runtime/ps2_card_activity.h"
@@ -291,6 +292,8 @@ namespace ps2x_host::ui
             }
 
             std::string controllerName() override { return gamepadName(); }
+
+            ps2x::mods::Manager *modManager() override { return ps2x_host_mods::manager(); }
         };
 
         GameHost &gameHost()
@@ -378,6 +381,76 @@ namespace ps2x_host::ui
             else
                 openOverlay(how);
         }
+
+        // A file was dropped on the window (SDL_EVENT_DROP_FILE, or a line of the PS2X_TEST_DROP file): the mod manager installs
+        // it if it is a good .fprmod, and the player is shown the answer on the Mods tab, which opens for the purpose (the game
+        // pauses while the menu is open, as always). Without an overlay the answer only goes to the log.
+        void handleDroppedFile(const std::string &path)
+        {
+            const ps2x_host_mods::DropOutcome outcome = ps2x_host_mods::installDropped(path);
+#if defined(PS2X_HAS_UI)
+            if (!outcome.handled || !g.created)
+                return;
+            if (!g.visible.load())
+                openOverlay("file dropped");
+            if (g.visible.load())
+                menu().showMods(outcome.message);
+#else
+            (void)outcome;
+#endif
+        }
+
+        // PS2X_TEST_DROP=<file>: for scripted runs. Each line the script appends to the file is "drop <path>" (the rest of the line is
+        // the path, spaces included) and does what dropping that file on the window does, from the same function the real
+        // SDL_EVENT_DROP_FILE event calls. (A script cannot drag a file onto a window from outside the process.)
+        struct TestDrop
+        {
+            bool checked = false;
+            std::string file;
+            uint64_t offset = 0;
+            std::string pending;
+        } testDrop;
+
+        void pumpTestDrop()
+        {
+            if (!testDrop.checked)
+            {
+                testDrop.checked = true;
+                if (const char *env = std::getenv("PS2X_TEST_DROP"))
+                    testDrop.file = env;
+            }
+            if (testDrop.file.empty())
+                return;
+            const size_t newline = testDrop.pending.find('\n');
+            if (newline != std::string::npos)
+            {
+                std::string line = testDrop.pending.substr(0, newline);
+                testDrop.pending.erase(0, newline + 1);
+                while (!line.empty() && (line.back() == '\r' || line.back() == ' '))
+                    line.pop_back();
+                if (line.compare(0, 5, "drop ") == 0)
+                {
+                    std::printf("[ui] PS2X_TEST_DROP: dropping %s\n", line.c_str() + 5);
+                    std::fflush(stdout);
+                    handleDroppedFile(line.substr(5));
+                }
+                return;
+            }
+            std::error_code ec;
+            const uint64_t size = std::filesystem::file_size(testDrop.file, ec);
+            if (ec || size <= testDrop.offset)
+                return;
+            std::FILE *file = std::fopen(testDrop.file.c_str(), "rb");
+            if (!file)
+                return;
+            std::fseek(file, static_cast<long>(testDrop.offset), SEEK_SET);
+            std::string chunk(static_cast<size_t>(size - testDrop.offset), '\0');
+            const size_t got = std::fread(chunk.data(), 1, chunk.size(), file);
+            std::fclose(file);
+            chunk.resize(got);
+            testDrop.offset += got;
+            testDrop.pending += chunk;
+        }
     }
 
     bool create(SDL_Window *window, SDL_GPUDevice *device, SDL_GPUTextureFormat swapchainFormat)
@@ -402,6 +475,10 @@ namespace ps2x_host::ui
         config.targetFormat = swapchainFormat;
         config.assetRoot = root;
         config.window = window;
+        // Theme mods: the style sheets of the mods that were on when the game started go after the game's own theme, and the
+        // overlay opens their files (and the pictures of the Mods tab) through the manager.
+        config.extraStyleSheets = ps2x_host_mods::themeStyleSheets();
+        config.virtualFiles = [](const std::string &name, std::vector<uint8_t> &bytes) { return ps2x_host_mods::readVirtualFile(name, bytes); };
         if (!menu().init(config, &gameHost()))
         {
             std::fprintf(stderr, "[ui] no settings overlay: it could not start (see above)\n");
@@ -412,6 +489,13 @@ namespace ps2x_host::ui
         g.testOpenOnCardWrite = std::getenv("PS2X_TEST_OPEN_ON_CARD_WRITE") != nullptr && std::getenv("PS2X_TEST_OPEN_ON_CARD_WRITE")[0] == '1';
         createTestPad();
         std::printf("[ui] settings overlay ready (assets %s). Open it with F2, the Guide button, or L3 + R3 held.\n", root.c_str());
+        if (!config.extraStyleSheets.empty())
+        {
+            std::printf("[ui] theme mods: %zu style sheet(s) added after the game's own theme:", config.extraStyleSheets.size());
+            for (const std::string &sheet : config.extraStyleSheets)
+                std::printf(" %s", sheet.c_str());
+            std::printf("\n");
+        }
         std::fflush(stdout);
         return true;
 #else
@@ -457,6 +541,12 @@ namespace ps2x_host::ui
 
     bool handleEvent(const SDL_Event &event)
     {
+        // A file dropped on the window is a request to install a mod, with or without the overlay.
+        if (event.type == SDL_EVENT_DROP_FILE && event.drop.data && event.drop.data[0] != '\0')
+        {
+            handleDroppedFile(event.drop.data);
+            return true;
+        }
         if (!g.created)
             return false;
         if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat && event.key.scancode == SDL_SCANCODE_F2)
@@ -560,6 +650,7 @@ namespace ps2x_host::ui
 
     void pumpTestPad()
     {
+        pumpTestDrop(); // PS2X_TEST_DROP: files a script "dropped" on the window
         if (!g.testPad.joystick)
             return;
         // One command per call, so SDL sees every state for at least one event pump: a button set down and up again before

@@ -14,6 +14,8 @@
             <div class="tab selected" id="tab-graphics" data-tab="graphics" data-help="Picture options.">Graphics</div>
             <div class="tab" id="tab-audio" data-tab="audio" data-help="Sound options.">Audio</div>
             <div class="tab" id="tab-controls" data-tab="controls" data-help="The keys and buttons the game uses.">Controls</div>
+            <!-- The Mods tab (panel-mods, mod-confirm) is removed by the menu when the game has no mod manager. -->
+            <div class="tab" id="tab-mods" data-tab="mods" data-help="Install, turn on and off, and order mods.">Mods</div>
         </div>
 
         <div class="panel" id="panel-graphics">
@@ -62,6 +64,16 @@
             <div id="controller-name"></div>
         </div>
 
+        <!-- The Mods tab: the list on the left and the details of the focused mod on the right are filled in by ui_mods.cpp. -->
+        <div class="panel hidden" id="panel-mods">
+            <div id="mods-body">
+                <div id="mods-list"></div>
+                <div id="mod-details"></div>
+            </div>
+            <div id="mods-status"></div>
+            <div id="mods-folder"></div>
+        </div>
+
         <div id="notice"><span id="restart-note" class="hidden"></span></div>
         <div id="help"><span id="help-text"></span></div>
 
@@ -72,6 +84,18 @@
             <div id="footer-buttons">
                 <div class="button" id="back" data-help="Save the settings and go back to the game.">Back</div>
                 <div class="button" id="quit" data-help="Close the game and return to the desktop.">Quit Game</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Uninstalling a mod asks first, the same way. -->
+    <div id="mod-confirm" class="hidden">
+        <div id="mod-confirm-box">
+            <div id="mod-confirm-title">Uninstall this mod?</div>
+            <div id="mod-confirm-text"></div>
+            <div id="mod-confirm-buttons">
+                <div class="button" id="mod-confirm-yes" data-help="Move the mod's file to the .trash folder.">Uninstall</div>
+                <div class="button" id="mod-confirm-no" data-help="Keep the mod.">Cancel</div>
             </div>
         </div>
     </div>

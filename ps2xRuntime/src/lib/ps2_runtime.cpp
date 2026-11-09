@@ -17,6 +17,7 @@
 #include <rlgl.h>
 #else
 #include "ps2_settings.h"
+#include "ps2_host_mods.h"
 #endif
 #include "ps2_iop_host.h"
 #include "ps2x/iop/iop_subsystem.h"
@@ -906,6 +907,9 @@ bool PS2Runtime::initialize(const char *title)
         // The settings file (the settings overlay writes it): its values go into the environment variables the rest of
         // this function and the host read, except where a variable is already set. Before anything reads them.
         ps2x_settings::initialize(ps2x_settings::defaultPath());
+        // The mod manager (mods folder and mods.toml next to the settings file). Every kind of mod takes effect at start-up, so
+        // it runs before the host creates the overlay, which reads the theme mods.
+        ps2x_host_mods::initialize();
 #endif
         if (!m_memory.initialize())
         {
