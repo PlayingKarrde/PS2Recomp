@@ -447,6 +447,8 @@ if(NOT PS2X_IS_VITA)
     target_sources(ps2_runtime PRIVATE src/lib/ps2_host_gpu.cpp)
     # The GS GPU renderer (GSGpuBackend, M2) takes the same two include directories, for the same reason.
     target_sources(ps2_runtime PRIVATE src/lib/gs/gs_gpu_backend.cpp)
+    # The texture census and dumper (task t1a; opt-in through PS2X_TEX_CENSUS / PS2X_TEX_DUMP). No SDL; nothing generated code includes refers to it.
+    target_sources(ps2_runtime PRIVATE src/lib/gs/gs_tex_census.cpp)
     # M3: the main-thread presenter of the direct picture path (its compiled shaders) and the code that chooses and
     # wires up the GPU renderer for the game (it asks the host presenter for its device).
     target_sources(ps2_runtime PRIVATE src/lib/gs/gs_gpu_present.cpp src/lib/gs/gs_gpu_host.cpp)

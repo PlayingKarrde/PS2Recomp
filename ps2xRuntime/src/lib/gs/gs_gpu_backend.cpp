@@ -77,6 +77,7 @@
 #include "runtime/gs/gs_gpu_math.h"
 #include "runtime/gs/gs_presentation.h"
 #include "runtime/gs/gs_recording.h"
+#include "runtime/gs/gs_tex_census.h"
 #include "runtime/gs/gs_texel.h"
 #include "runtime/gs/ps2_gs_memory.h"
 #include "runtime/gs/ps2_gs_transfer.h"
@@ -160,6 +161,7 @@ namespace
     struct GpuTexture
     {
         SDL_GPUTexture *tex = nullptr;
+        uint64_t contentHash = 0; // the key the texture cache found it under (the census names textures by it; gs_tex_census.h)
         uint32_t w = 0, h = 0;
         uint64_t bytes = 0;
         uint64_t lastUsedFlush = 0;
@@ -299,6 +301,15 @@ namespace
     }
 }
 
+// The texture census (PS2X_TEX_CENSUS, PS2X_TEX_DUMP; task t1a, gs_tex_census.h) is a file-scope pointer, not a member of Impl, so that
+// Impl (and the draw path's view of it) is exactly what it was without the census: a null pointer, one test per hook. One backend
+// per process owns it (the game and the replayer create one); a second backend would find it taken and run without.
+namespace
+{
+    std::unique_ptr<TexCensus::Census> gCensus;
+    TexCensus::Census *census = nullptr; // gCensus.get(), set by the backend that owns it
+}
+
 struct GSGpuBackend::Impl
 {
     SDL_GPUDevice *dev = nullptr;
@@ -357,6 +368,7 @@ struct GSGpuBackend::Impl
     mutable std::mutex mutex;
     Stats stats;
     bool ready = false;
+    bool ownsCensus = false;
 
     // ---- GS memory image and the state outside it
     uint8_t *vram = nullptr;
@@ -534,6 +546,8 @@ struct GSGpuBackend::Impl
     void restoreDepth(uint32_t depthIdx, uint32_t frameIdx, uint32_t rows);
     SDL_GPUGraphicsPipeline *pipeline(uint32_t key);
     GpuTexture *resolveTexture(const GSDrawState &state);
+    // The texture census's per-draw hook (gs_tex_census.h), kept out of line so that the draw path is unchanged when no census is on.
+    void censusDraw(const GpuTexture &texture, const GSDrawState &state, const Setup &setup);
     void decodeTexels(GpuTexture &g, const GSDrawState &state, const Setup &setup);
     uint64_t clutHash(const GSDrawState &state);
     GpuTexture *createTexture(const GSDrawState &state, uint64_t contentHash, uint32_t w, uint32_t h);
@@ -566,6 +580,12 @@ struct GSGpuBackend::Impl
 bool GSGpuBackend::Impl::init(SDL_GPUDevice *device, uint32_t s, GSGpuBackend::FieldMode fieldMode)
 {
     dev = device;
+    if (!gCensus)
+    {
+        gCensus = TexCensus::Census::FromEnvironment();
+        ownsCensus = gCensus != nullptr;
+        census = gCensus.get();
+    }
     scale = std::max(1u, s);
     mode = fieldMode;
     if (scale > 1u && !progressive())
@@ -876,6 +896,11 @@ void GSGpuBackend::Impl::makerLoop()
 
 GSGpuBackend::Impl::~Impl()
 {
+    if (ownsCensus)
+    {
+        census = nullptr;
+        gCensus.reset(); // finishes the census (writes its files)
+    }
     stopMaker();
     if (!missLogPath.empty())
         writeMissLog();
@@ -1337,6 +1362,7 @@ GpuTexture *GSGpuBackend::Impl::createTexture(const GSDrawState &state, uint64_t
     GpuTexture &g = contentTextures[contentHash];
     g = GpuTexture{};
     g.tex = tex;
+    g.contentHash = contentHash;
     g.w = w;
     g.h = h;
     g.bytes = bytes;
@@ -1498,6 +1524,27 @@ void GSGpuBackend::Impl::decodeTexels(GpuTexture &g, const GSDrawState &state, c
             missRecords[it->second].stageNs += stageNs;
         }
     }
+}
+
+#if defined(_MSC_VER)
+__declspec(noinline)
+#else
+__attribute__((noinline))
+#endif
+void GSGpuBackend::Impl::censusDraw(const GpuTexture &texture, const GSDrawState &state, const Setup &setup)
+{
+    TexCensus::DrawInfo info;
+    info.k1 = texture.contentHash;
+    info.state = &state;
+    info.setup = &setup;
+    info.width = texture.w;
+    info.height = texture.h;
+    info.scaleX = scaleX;
+    info.scaleY = scaleY;
+    info.vram = vram;
+    info.clut = &clut;
+    info.marker = markerSeq;
+    census->Draw(info);
 }
 
 GpuTexture *GSGpuBackend::Impl::resolveTexture(const GSDrawState &state)
@@ -1735,6 +1782,8 @@ void GSGpuBackend::Impl::submitSetup(const GSDrawState &state, const Setup &setu
         if (!texture)
             return;
         decodeTexels(*texture, state, setup);
+        if (census)
+            censusDraw(*texture, state, setup);
         d.texture = texture->tex;
         if (!missLogPath.empty())
             noteTextureUse(d.texture, state, setup);
@@ -2873,6 +2922,8 @@ void GSGpuBackend::Initialize(uint8_t *vram, uint32_t vramSize)
     s.localToHostPos = 0u;
     s.touchAll();
     s.recentValid = false;
+    if (census)
+        census->MemoryReset();
 }
 
 void GSGpuBackend::Reset()
@@ -2892,6 +2943,8 @@ void GSGpuBackend::Reset()
     s.localToHostPos = 0u;
     s.touchAll();
     s.recentValid = false;
+    if (census)
+        census->MemoryReset();
 }
 
 void GSGpuBackend::ImportRecordingState(const GSRec::BackendState &state)
@@ -2940,6 +2993,8 @@ void GSGpuBackend::BeginTransfer(const GSTransferCommand &command)
     GSTransfer::Begin(command, s.transferState);
     if (!s.vram)
         return;
+    if (census)
+        census->BeginTransfer(command);
     const auto &b = command.bitbltbuf;
     if (command.direction == 2u)
     {
@@ -2973,7 +3028,11 @@ void GSGpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
         std::fprintf(s.uploadLog, "%llu,%u,%u,%u,%u,%u,%u,%u,%u,%u,%d,%u,%llu\n", static_cast<unsigned long long>(s.markerSeq), tb.dbp, tb.dbw, tb.dpsm,
                      tp.dsax, tp.dsay, tr.rrw, tr.rrh, s.transferState.copiedPixels, sizeBytes, same ? 1 : 0, span.count, static_cast<unsigned long long>(s.epoch));
     }
+    if (census)
+        census->BeforeUpload(s.vram);
     GSTransfer::UploadImage(s.vram, s.transfer, s.transferState, data, sizeBytes);
+    if (census)
+        census->AfterUpload(s.vram, data, sizeBytes);
     const auto &b = s.transfer.bitbltbuf;
     s.touchBuffer(b.dpsm, b.dbp, std::max<uint32_t>(b.dbw, 1u), s.transfer.trxpos.dsax, s.transfer.trxpos.dsay,
                   s.transfer.trxreg.rrw, s.transfer.trxreg.rrh);
@@ -3026,6 +3085,8 @@ GSGpuBackend::MarkResult GSGpuBackend::MarkPresentation(const GSPresentationRequ
     const uint64_t markNs = nowNanos() - markStart;
     s.stats.markNanos += markNs;
     ++s.markerSeq;
+    if (census)
+        census->Marker(s.markerSeq);
     if (s.wideLog)
         s.logWideRow(request);
     if (s.markerLog)
