@@ -18,6 +18,9 @@ namespace ps2x::ui
     {
         // The UI is designed for a 720 pixel high window at scale 1.0 (1 dp = 1 pixel there).
         constexpr float kDesignHeight = 720.0f;
+        // The settings page is 960 dp wide; with margins the design needs 1000 dp. A window narrower than that (a portrait
+        // window, a 500 px wide one) scales the page down to fit its width instead of squeezing the text.
+        constexpr float kDesignWidth = 1000.0f;
 
         // RmlUi's window onto the platform: time, log, the mouse cursor and the clipboard, through SDL.
         class SystemInterface final : public Rml::SystemInterface
@@ -201,12 +204,12 @@ namespace ps2x::ui
         if (!m_impl || width <= 0 || height <= 0)
             return;
         Impl &s = *m_impl;
-        // Automatic scale: height / 720, rounded down to a multiple of 1/8. RmlUi builds a font atlas for every font
+        // Automatic scale: the smaller of height / 720 and width / 1000, rounded down to a multiple of 1/8. RmlUi builds a font atlas for every font
         // size it is asked for and keeps it until shutdown, so a scale that followed every pixel of a window drag
         // would pile up atlases (a resize storm left 60 textures alive); in steps there are few. Rounding down
         // keeps the page inside the window.
-        const float effective =
-            scale > 0.0f ? scale : std::max(0.25f, std::floor(static_cast<float>(height) / kDesignHeight * 8.0f) / 8.0f);
+        const float fit = std::min(static_cast<float>(height) / kDesignHeight, static_cast<float>(width) / kDesignWidth);
+        const float effective = scale > 0.0f ? scale : std::max(0.25f, std::floor(fit * 8.0f) / 8.0f);
         if (width == s.width && height == s.height && effective == s.scale && scale == s.requestedScale)
             return;
         s.width = width;
@@ -225,6 +228,12 @@ namespace ps2x::ui
     {
         if (m_impl)
             m_impl->input.setPixelDensity(density);
+    }
+
+    void Overlay::setMouseGuard(bool on)
+    {
+        if (m_impl)
+            m_impl->input.setMouseGuard(on);
     }
 
     Rml::ElementDocument *Overlay::loadPage(const std::string &relativePath)

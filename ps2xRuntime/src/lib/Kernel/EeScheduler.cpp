@@ -2,9 +2,11 @@
 
 #include "ps2_log.h"
 #include "ps2_runtime_macros.h"
+#include "runtime/ps2_pause.h"
 
 #include <algorithm>
 #include <cassert>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -401,8 +403,12 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
         using HostClock = std::chrono::steady_clock;
         static const HostClock::time_point s_hostBase = HostClock::now();
         static uint64_t s_cycleBase = m_eeCycle;
-        const uint64_t elapsedUs = static_cast<uint64_t>(
+        // Time the guest spent paused by the UI overlay (ps2_pause.h) is not game time: leaving it in would make the
+        // clock think the guest fell behind by the whole pause.
+        const uint64_t hostElapsedUs = static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::microseconds>(HostClock::now() - s_hostBase).count());
+        const uint64_t pausedUs = ps2x_host::guestPausedTotalNs() / 1000u;
+        const uint64_t elapsedUs = hostElapsedUs > pausedUs ? hostElapsedUs - pausedUs : 0u;
         const uint64_t hostCycle = s_cycleBase + elapsedUs * (kEeClockHz / 1000u) / 1000u;
         if (hostCycle > m_eeCycle)
         {
@@ -1915,6 +1921,40 @@ void EeScheduler::processDueDeadlines()
         if (due.empty())
         {
             return;
+        }
+
+        // UI overlay (ps2_pause.h): while the settings overlay is open, the guest stops here, at the next vertical
+        // blank, before it presents or counts it. When the pause ends, every host-time deadline moves forward by the
+        // time spent blocked; otherwise they would all be in the past and the guest would run the missed frames in one
+        // burst. (The checks use statics and the scheduler's own members, so ee_scheduler.h is unchanged.)
+        if (ps2x_host::guestPaused() &&
+            std::any_of(due.begin(), due.end(), [](const ScheduledEvent &item)
+                        { return item.event.type == EeEventType::VBlankStart; }))
+        {
+            const uint64_t tickBefore = m_vsyncTick;
+            std::printf("[pause] guest blocked at vsync tick %llu\n", static_cast<unsigned long long>(tickBefore));
+            std::fflush(stdout);
+            const uint64_t blockedNs = ps2x_host::waitWhileGuestPaused([this]()
+                                                                       { return m_stopRequested.load(std::memory_order_acquire); });
+            if (blockedNs != 0u)
+            {
+                const auto shift = std::chrono::nanoseconds(blockedNs);
+                for (ScheduledEvent &item : due)
+                {
+                    item.hostDeadline += shift;
+                }
+                {
+                    std::lock_guard lock(m_eventMutex);
+                    for (ScheduledEvent &item : m_deadlines)
+                    {
+                        item.hostDeadline += shift;
+                    }
+                    updateNextDeadline();
+                }
+                std::printf("[pause] guest resumed after %.1f ms at vsync tick %llu (deadlines moved forward)\n",
+                            static_cast<double>(blockedNs) / 1e6, static_cast<unsigned long long>(m_vsyncTick));
+                std::fflush(stdout);
+            }
         }
 
         for (ScheduledEvent &scheduled : due)

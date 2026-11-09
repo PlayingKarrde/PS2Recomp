@@ -157,6 +157,50 @@ namespace ps2x::ui
         return true;
     }
 
+    std::vector<std::string> SettingsPage::keys() const
+    {
+        std::vector<std::string> out;
+        if (!m_document)
+            return out;
+        Rml::ElementList rows;
+        m_document->QuerySelectorAll(rows, ".row");
+        for (Rml::Element *row : rows)
+            if (!attr(row, "data-key").empty())
+                out.push_back(attr(row, "data-key"));
+        return out;
+    }
+
+    std::string SettingsPage::attribute(const std::string &key, const std::string &name) const
+    {
+        Rml::Element *row = rowForKey(key);
+        return row ? attr(row, name.c_str()) : std::string();
+    }
+
+    bool SettingsPage::setTag(const std::string &key, const std::string &tag)
+    {
+        Rml::Element *row = rowForKey(key);
+        if (!row)
+            return false;
+        if (Rml::Element *shown = row->QuerySelector(".tag"))
+            shown->SetInnerRML(tag);
+        return true;
+    }
+
+    bool SettingsPage::setLocked(const std::string &key, bool locked, const std::string &reason, const std::string &tag)
+    {
+        Rml::Element *row = rowForKey(key);
+        if (!row)
+            return false;
+        row->SetClass("locked", locked);
+        row->SetAttribute("data-locked", locked ? "1" : "");
+        row->SetAttribute("data-lock-reason", reason);
+        setTag(key, tag);
+        // The focused row's help line follows.
+        if (m_document && m_document->GetFocusLeafNode() == row)
+            showHelp(row);
+        return true;
+    }
+
     // Shows the row's value: "[ON]" / "[16:9]" / "[85%]", and sets a slider's fill.
     void SettingsPage::refreshRow(Rml::Element *row)
     {
@@ -182,7 +226,17 @@ namespace ps2x::ui
         }
         else
         {
-            text = "[" + value + "]";
+            // A choice shows its label when the row has labels for the choices ("1|2|3" -> "1x|2x|3x"), else the value.
+            std::string shownValue = value;
+            const std::vector<std::string> labels = split(attr(row, "data-labels"), '|');
+            const std::vector<std::string> choices = split(attr(row, "data-choices"), '|');
+            if (!attr(row, "data-labels").empty() && labels.size() == choices.size())
+            {
+                const auto it = std::find(choices.begin(), choices.end(), value);
+                if (it != choices.end())
+                    shownValue = labels[static_cast<size_t>(it - choices.begin())];
+            }
+            text = "[" + shownValue + "]";
         }
         if (Rml::Element *shown = row->QuerySelector(".value"))
             shown->SetInnerRML(text);
@@ -191,6 +245,8 @@ namespace ps2x::ui
     // direction: -1 / +1 for Left / Right, 0 for activation (Return or a click).
     void SettingsPage::changeRow(Rml::Element *row, int direction, bool activate)
     {
+        if (!attr(row, "data-locked").empty())
+            return;
         const std::string kind = attr(row, "data-kind");
         const std::string key = attr(row, "data-key");
         const std::string old = attr(row, "data-value");
@@ -230,6 +286,8 @@ namespace ps2x::ui
 
     void SettingsPage::setSliderFromMouse(Rml::Element *row, float mouseX)
     {
+        if (!attr(row, "data-locked").empty())
+            return;
         Rml::Element *track = row->QuerySelector(".track");
         if (!track)
             return;
@@ -259,6 +317,8 @@ namespace ps2x::ui
         if (Rml::Element *help = m_document->GetElementById("help-text"))
         {
             std::string text = attr(element, "data-help");
+            if (!attr(element, "data-locked").empty() && !attr(element, "data-lock-reason").empty())
+                text = attr(element, "data-lock-reason");
             if (text.empty() && element->GetId() == "back")
                 text = "Close the settings.";
             help->SetInnerRML(text);
@@ -316,7 +376,16 @@ namespace ps2x::ui
         if (!panel)
             return;
         if (Rml::Element *row = panel->QuerySelector(".row"))
+        {
             row->Focus(true);
+            return;
+        }
+        // A panel with nothing to change (a read-only page): the focus goes to its tab, so the controller still has a place.
+        Rml::ElementList tabs;
+        m_document->QuerySelectorAll(tabs, ".tab");
+        for (Rml::Element *tab : tabs)
+            if (attr(tab, "data-tab") == m_tab)
+                tab->Focus(true);
     }
 
     void SettingsPage::ProcessEvent(Rml::Event &event)

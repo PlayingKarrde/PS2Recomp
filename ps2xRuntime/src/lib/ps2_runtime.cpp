@@ -15,6 +15,8 @@
 #include "ps2_host_backend.h"
 #if defined(PLATFORM_VITA)
 #include <rlgl.h>
+#else
+#include "ps2_settings.h"
 #endif
 #include "ps2_iop_host.h"
 #include "ps2x/iop/iop_subsystem.h"
@@ -24,6 +26,7 @@
 #include <fstream>
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -899,6 +902,11 @@ bool PS2Runtime::initialize(const char *title)
 {
     try
     {
+#if !defined(PLATFORM_VITA)
+        // The settings file (the settings overlay writes it): its values go into the environment variables the rest of
+        // this function and the host read, except where a variable is already set. Before anything reads them.
+        ps2x_settings::initialize(ps2x_settings::defaultPath());
+#endif
         if (!m_memory.initialize())
         {
             std::cerr << "Failed to initialize PS2 memory" << std::endl;
@@ -931,6 +939,20 @@ bool PS2Runtime::initialize(const char *title)
                 }
                 else
                     std::fprintf(stderr, "[host] PS2X_WINDOW=%s is not <W>x<H>, using %dx%d\n", size, windowWidth, windowHeight);
+            }
+            else if (const char *wide = std::getenv("PS2X_GS_WIDE"))
+            {
+                // A widened picture (PS2X_GS_WIDE=16:9, the aspect setting) gets a window of that shape: the height stays
+                // 480 and the width follows. Not with the CPU renderer (which has no wide picture), and not when
+                // PS2X_PRESENT=renderer forces the SDL_Renderer presenter, which comes with the CPU renderer.
+                const char *backend = std::getenv("PS2X_GS_BACKEND");
+                const char *present = std::getenv("PS2X_PRESENT");
+                float aw = 0.0f, ah = 0.0f;
+                if (!(backend && std::strcmp(backend, "cpu") == 0) && !(present && std::strcmp(present, "renderer") == 0) && std::sscanf(wide, "%f:%f", &aw, &ah) == 2 && aw > 0.0f && ah > 0.0f &&
+                    aw / ah > 4.0f / 3.0f + 0.01f && aw / ah <= 4.0f)
+                {
+                    windowWidth = static_cast<int>(std::lround(static_cast<float>(windowHeight) * aw / ah));
+                }
             }
             if (!ps2x_host::createWindow(title, windowWidth, windowHeight, mode))
             {

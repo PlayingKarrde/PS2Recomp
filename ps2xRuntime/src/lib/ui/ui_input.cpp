@@ -6,7 +6,9 @@
 #include <SDL3/SDL_gamepad.h>
 #include <SDL3/SDL_keyboard.h>
 #include <SDL3/SDL_mouse.h>
+#include <SDL3/SDL_timer.h>
 
+#include <algorithm>
 #include <cmath>
 
 namespace ps2x::ui
@@ -157,6 +159,13 @@ namespace ps2x::ui
         }
     }
 
+    void Input::quietMouse(uint64_t nanoseconds)
+    {
+        if (!m_mouseGuard)
+            return;
+        m_mouseQuietUntilNs = std::max(m_mouseQuietUntilNs, SDL_GetTicksNS() + nanoseconds);
+    }
+
     void Input::sendDirection(uint8_t bit, bool down)
     {
         if (!m_context)
@@ -234,8 +243,16 @@ namespace ps2x::ui
             return false;
         switch (e.type)
         {
+        case SDL_EVENT_WINDOW_RESIZED:
+        case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
+        case SDL_EVENT_WINDOW_ENTER_FULLSCREEN:
+        case SDL_EVENT_WINDOW_LEAVE_FULLSCREEN:
+        case SDL_EVENT_WINDOW_MOVED:
+            quietMouse(1'500'000'000ull);
+            return false;
         case SDL_EVENT_KEY_DOWN:
         {
+            quietMouse(350'000'000ull);
             const KeyIdentifier key = keyIdentifier(e.key.key);
             if (key != Rml::Input::KI_UNKNOWN)
                 m_context->ProcessKeyDown(key, modifiers(e.key.mod));
@@ -252,6 +269,8 @@ namespace ps2x::ui
             m_context->ProcessTextInput(Rml::String(e.text.text));
             return true;
         case SDL_EVENT_MOUSE_MOTION:
+            if (SDL_GetTicksNS() < m_mouseQuietUntilNs)
+                return true; // not the player's hand (see m_mouseQuietUntilNs)
             m_context->ProcessMouseMove(static_cast<int>(std::lround(e.motion.x * m_density)),
                                         static_cast<int>(std::lround(e.motion.y * m_density)), modifiers(SDL_GetModState()));
             return true;
@@ -286,6 +305,7 @@ namespace ps2x::ui
         case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
         case SDL_EVENT_GAMEPAD_BUTTON_UP:
         {
+            quietMouse(350'000'000ull);
             const bool down = e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN;
             const uint8_t button = e.gbutton.button;
             uint8_t bit = 0;

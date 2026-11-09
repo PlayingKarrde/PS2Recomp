@@ -263,6 +263,100 @@ body
     border-color: #d1caaf;
 }
 
+/* ---- In the game: row tags, locked rows, the restart note and the read-only controls list --------------- */
+
+/* A short word in a row ("ENV", "RESTART"); the space is kept so values do not move. */
+.row .tag
+{
+    width: 130dp;
+    margin-right: 10dp;
+    text-align: right;
+    font-size: 16dp;
+    color: #e7bc3d;
+    letter-spacing: 1dp;
+}
+
+/* A locked row can still be focused (the help line says why) but is dimmed. */
+.row.locked .label,
+.row.locked .value
+{
+    color: #8f8c80;
+    font-effect: none;
+}
+
+.row.locked .track
+{
+    border-color: #8f8c80;
+}
+
+#notice
+{
+    height: 30dp;
+    margin-top: 6dp;
+    text-align: center;
+}
+
+#help
+{
+    font-size: 24dp;
+}
+
+#restart-note
+{
+    font-size: 20dp;
+    font-weight: normal;
+    color: #e7bc3d;
+    letter-spacing: 1dp;
+}
+
+/* The panels of the game's settings page are the same height, so the window does not jump between tabs. */
+#window .panel
+{
+    min-height: 350dp;
+}
+
+.ctl
+{
+    display: flex;
+    flex-direction: row;
+    height: 23dp;
+    padding: 0 14dp;
+    font-size: 17dp;
+    letter-spacing: 1dp;
+}
+
+.ctl .c-act
+{
+    width: 150dp;
+}
+
+.ctl .c-key
+{
+    flex: 1 1 0;
+    color: #e6e0c8;
+}
+
+.ctl .c-pad
+{
+    width: 340dp;
+}
+
+.ctl.head
+{
+    color: #e7bc3d;
+    margin-bottom: 4dp;
+    border-bottom: 2dp #d1caaf;
+}
+
+#controller-name
+{
+    margin-top: 10dp;
+    padding: 0 14dp;
+    font-size: 16dp;
+    font-weight: normal;
+    color: #e6e0c8;
+}
+
 /* Last, so that it wins over the display set on .panel above. */
 .hidden
 {

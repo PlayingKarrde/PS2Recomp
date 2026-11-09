@@ -1,7 +1,8 @@
 # The UI layer: an RmlUi overlay (settings pages and so on) drawn through SDL_GPU over the game picture.
 #
-# Added by ps2xRuntime/CMakeLists.txt only when PS2X_BUILD_UI is ON, so a normal configure fetches nothing
-# and no game target changes. Nothing the generated game code includes refers to this folder.
+# Added by ps2xRuntime/CMakeLists.txt when PS2X_BUILD_UI is ON (the default since the overlay is part of the game; OFF
+# fetches nothing). ps2_runtime links it for linking only, so no compile command of the game changes. Nothing the
+# generated game code includes refers to this folder.
 #
 # Third-party sources, both pinned and fetched from git like SDL (nothing is installed system-wide):
 #   RmlUi    6.3          tag 6.3         commit ba95ffe8bfb6370efb2cdcca927eaad4710c5413 (2026-08-22), MIT
@@ -74,6 +75,7 @@ FetchContent_MakeAvailable(rmlui)
 # which ps2_runtime already holds; it is not compiled in a second time here, so the user of ps2_ui provides it:
 # the game by linking ps2_runtime, ps2x_ui_demo by compiling that one file.
 add_library(ps2_ui STATIC
+    ui_game_menu.cpp
     ui_input.cpp
     ui_overlay.cpp
     ui_render_sdlgpu.cpp

@@ -428,6 +428,10 @@ if(NOT PS2X_IS_VITA)
     # ps2_runtime.cpp and does not compile this file.
     target_sources(ps2_runtime PRIVATE src/lib/ps2_host_sdl.cpp)
 
+    # The settings file and the settings overlay's host glue (see src/lib/ps2_settings.h and src/lib/ps2_host_ui.h). The glue is
+    # always compiled; with PS2X_BUILD_UI it carries the overlay, without it a few stubs.
+    target_sources(ps2_runtime PRIVATE src/lib/ps2_settings.cpp src/lib/ps2_host_ui.cpp)
+
     # SDL_GPU shader loader for the compiled blobs in shaders/compiled/ (see shaders/build_shaders.py).
     # Nothing the generated game code includes refers to it.
     target_sources(ps2_runtime PRIVATE src/lib/gpu/gpu_shaders.cpp)
@@ -445,6 +449,15 @@ if(NOT PS2X_IS_VITA)
     set_source_files_properties(src/lib/ps2_host_gpu.cpp src/lib/gs/gs_gpu_backend.cpp src/lib/gs/gs_gpu_present.cpp
         src/lib/gs/gs_gpu_host.cpp PROPERTIES
         INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/src/lib;${CMAKE_CURRENT_SOURCE_DIR}")
+endif()
+
+# The RmlUi settings overlay (src/lib/ui). On by default: it fetches RmlUi and FreeType (pinned, see src/lib/ui/CMakeLists.txt)
+# and builds the static library ps2_ui, which the game links. Off, the game has no overlay and fetches nothing.
+option(PS2X_BUILD_UI "Build the RmlUi settings overlay (ps2_ui) into the game; fetches RmlUi and FreeType" ON)
+if(PS2X_BUILD_UI AND NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
+    set(PS2X_HAS_UI ON)
+else()
+    set(PS2X_HAS_UI OFF)
 endif()
 
 if(PS2X_ENABLE_RUNTIME_LOGS)
@@ -587,11 +600,17 @@ endif()
 
 ps2x_stage_ffmpeg_runtime_dlls(ps2EntryRunner)
 
-# The RmlUi UI layer (src/lib/ui). Off by default: turning it on fetches RmlUi and FreeType and defines the
-# static library ps2_ui, which nothing in the game links yet.
-option(PS2X_BUILD_UI "Build the RmlUi UI layer (ps2_ui); fetches RmlUi and FreeType" OFF)
-if(PS2X_BUILD_UI AND NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
+# The RmlUi settings overlay (src/lib/ui; option PS2X_BUILD_UI above). ps2_runtime links it, and only for linking:
+# $<LINK_ONLY:...> passes on no include directory and no definition, so no compile command of ps2_runtime or of the
+# game's generated code changes. ps2_host_ui.cpp alone is told that the overlay exists and where its header is.
+if(PS2X_HAS_UI)
     add_subdirectory(src/lib/ui)
+    target_link_libraries(ps2_runtime PRIVATE $<LINK_ONLY:ps2_ui>)
+    set_source_files_properties(src/lib/ps2_host_ui.cpp PROPERTIES
+        COMPILE_DEFINITIONS "PS2X_HAS_UI=1;PS2X_UI_SOURCE_ASSET_DIR=\"${PS2X_UI_ASSET_DIR}\""
+        INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/src/lib/ui;${CMAKE_CURRENT_SOURCE_DIR}/src/lib;${CMAKE_CURRENT_SOURCE_DIR}")
+    # The theme, pages and fonts are copied next to the program on every build (ps2x_ui_stage_assets, src/lib/ui).
+    ps2x_ui_stage_assets(ps2EntryRunner)
 endif()
 
 if(PS2X_IS_VITA)

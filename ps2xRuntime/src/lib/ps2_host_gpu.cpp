@@ -11,6 +11,8 @@
 
 #include "ps2_host_gpu.h"
 
+#include "ps2_host_ui.h"
+#include "ps2_settings.h"
 #include "gpu/gpu_shaders.h"
 #include "runtime/gs/gs_gpu_threads.h"
 #include "shaders/compiled/present_frag.h"
@@ -38,7 +40,8 @@ namespace ps2x_host
             SDL_GPUShader *vertexShader = nullptr;
             SDL_GPUShader *fragmentShader = nullptr;
             SDL_GPUGraphicsPipeline *pipeline = nullptr;
-            SDL_GPUSampler *sampler = nullptr;
+            SDL_GPUSampler *sampler = nullptr;        // linear (sharp and linear filters)
+            SDL_GPUSampler *samplerNearest = nullptr; // nearest (PS2X_SCALE=nearest)
 
             // The CPU picture: staged into the transfer buffer, copied into the texture.
             SDL_GPUTransferBuffer *transfer = nullptr;
@@ -60,6 +63,7 @@ namespace ps2x_host
             GpuOverlay overlay;
             PictureSource source; // set: the picture comes from the GS GPU renderer's texture, not from stagePicture()
             bool loggedProblem = false;
+            bool presentModeForced = false; // PS2X_GPU_PRESENT_MODE named the mode: the overlay's V-Sync setting leaves it alone
 
             // Task g5: the window command buffer acquires the swapchain texture before it takes the Vulkan defragmentation
             // guard (gs_gpu_threads.h). PS2X_GPU_ACQUIRE_FIRST=0 restores the old order (guard held across the acquire).
@@ -149,6 +153,17 @@ namespace ps2x_host
             return true;
         }
 
+        // The host paces itself at 60 Hz, so unless V-Sync is asked for the swapchain must not also wait for the display:
+        // immediate if the window can do it, else mailbox, else vsync (always available).
+        SDL_GPUPresentMode unsyncedPresentMode(SDL_GPUDevice *device, SDL_Window *window)
+        {
+            if (SDL_WindowSupportsGPUPresentMode(device, window, SDL_GPU_PRESENTMODE_IMMEDIATE))
+                return SDL_GPU_PRESENTMODE_IMMEDIATE;
+            if (SDL_WindowSupportsGPUPresentMode(device, window, SDL_GPU_PRESENTMODE_MAILBOX))
+                return SDL_GPU_PRESENTMODE_MAILBOX;
+            return SDL_GPU_PRESENTMODE_VSYNC;
+        }
+
         // Reasons are collected into one string, which the caller prints with the fallback notice.
         bool fail(std::string &failure, const char *what)
         {
@@ -208,6 +223,10 @@ namespace ps2x_host
             color.clear_color = {0.0f, 0.0f, 0.0f, 1.0f};
             color.load_op = SDL_GPU_LOADOP_CLEAR;
             color.store_op = SDL_GPU_STOREOP_STORE;
+            // With the settings overlay open, the picture, the overlay and the debug panel are three render passes in
+            // that order, so the debug panel draws above the overlay (its ImGui windows are tools: they must stay
+            // reachable). Closed, the overlay costs nothing and the picture and the panel share one pass, as before.
+            const bool overlayOpen = ui::visible();
             ps2x_gs::DebugPassLock passLock; // validation only: see gs_gpu_threads.h
             SDL_GPURenderPass *pass = SDL_BeginGPURenderPass(commandBuffer, &color, 1, nullptr);
             if (!pass)
@@ -255,14 +274,34 @@ namespace ps2x_host
                 SDL_BindGPUGraphicsPipeline(pass, g.pipeline);
                 SDL_PushGPUVertexUniformData(commandBuffer, 0, &place, sizeof(place));
                 SDL_PushGPUFragmentUniformData(commandBuffer, 0, &params, sizeof(params));
-                SDL_GPUTextureSamplerBinding binding = {source, g.sampler};
+                SDL_GPUTextureSamplerBinding binding = {source, g.scale == ScaleMode::Nearest && g.samplerNearest ? g.samplerNearest : g.sampler};
                 SDL_BindGPUFragmentSamplers(pass, 0, &binding, 1);
                 SDL_DrawGPUPrimitives(pass, 6, 1, 0, 0);
             }
 
-            if (g.overlay.draw)
-                g.overlay.draw(commandBuffer, pass, g.overlay.user);
+            if (!overlayOpen)
+            {
+                if (g.overlay.draw)
+                    g.overlay.draw(commandBuffer, pass, g.overlay.user);
+                SDL_EndGPURenderPass(pass);
+                return;
+            }
             SDL_EndGPURenderPass(pass);
+            passLock.Unlock(); // the overlay and the panel take the lock for their own passes
+            ui::record(commandBuffer, swapchain, outputWidth, outputHeight);
+            if (g.overlay.draw)
+            {
+                SDL_GPUColorTargetInfo panel = {};
+                panel.texture = swapchain;
+                panel.load_op = SDL_GPU_LOADOP_LOAD;
+                panel.store_op = SDL_GPU_STOREOP_STORE;
+                ps2x_gs::DebugPassLock panelLock;
+                if (SDL_GPURenderPass *panelPass = SDL_BeginGPURenderPass(commandBuffer, &panel, 1, nullptr))
+                {
+                    g.overlay.draw(commandBuffer, panelPass, g.overlay.user);
+                    SDL_EndGPURenderPass(panelPass);
+                }
+            }
         }
     } // namespace
 
@@ -286,6 +325,39 @@ namespace ps2x_host
         bool active()
         {
             return g.device != nullptr && g.pipeline != nullptr;
+        }
+
+        void setVsync(bool vsync)
+        {
+            if (!active() || g.presentModeForced)
+                return;
+            const SDL_GPUPresentMode mode = vsync ? SDL_GPU_PRESENTMODE_VSYNC : unsyncedPresentMode(g.device, g.window);
+            if (mode == g.presentMode)
+                return;
+            if (!SDL_SetGPUSwapchainParameters(g.device, g.window, SDL_GPU_SWAPCHAINCOMPOSITION_SDR, mode))
+            {
+                std::fprintf(stderr, "[host] swapchain present mode %s refused (%s), keeping %s\n", presentModeName(mode), SDL_GetError(),
+                             presentModeName(g.presentMode));
+                return;
+            }
+            std::printf("[host] present mode now %s\n", presentModeName(mode));
+            std::fflush(stdout);
+            g.presentMode = mode;
+        }
+
+        bool vsync()
+        {
+            return g.presentMode == SDL_GPU_PRESENTMODE_VSYNC;
+        }
+
+        void setPictureFilter(ScaleMode mode)
+        {
+            g.scale = mode;
+        }
+
+        ScaleMode pictureFilter()
+        {
+            return g.scale;
         }
 
         void setPictureSource(const PictureSource &source)
@@ -350,14 +422,13 @@ namespace ps2x_host
             // The host loop paces itself at 60 Hz, so the swapchain must not also wait for the display:
             // immediate if the window can do it, else mailbox, else vsync (always available).
             SDL_GPUPresentMode forced = SDL_GPU_PRESENTMODE_VSYNC;
+            // "Forced" means the player set the variable. A value that came from the settings file (ps2_settings.h puts it
+            // in the same variable) leaves the overlay's V-Sync setting free to change it.
+            g.presentModeForced = ps2x_settings::fixedByEnvironment("vsync");
             if (presentModeFromEnv(forced) && (forced == SDL_GPU_PRESENTMODE_VSYNC || SDL_WindowSupportsGPUPresentMode(g.device, window, forced)))
                 g.presentMode = forced;
-            else if (SDL_WindowSupportsGPUPresentMode(g.device, window, SDL_GPU_PRESENTMODE_IMMEDIATE))
-                g.presentMode = SDL_GPU_PRESENTMODE_IMMEDIATE;
-            else if (SDL_WindowSupportsGPUPresentMode(g.device, window, SDL_GPU_PRESENTMODE_MAILBOX))
-                g.presentMode = SDL_GPU_PRESENTMODE_MAILBOX;
             else
-                g.presentMode = SDL_GPU_PRESENTMODE_VSYNC;
+                g.presentMode = unsyncedPresentMode(g.device, window);
             if (!SDL_SetGPUSwapchainParameters(g.device, window, SDL_GPU_SWAPCHAINCOMPOSITION_SDR, g.presentMode))
             {
                 std::fprintf(stderr, "[host] swapchain present mode %s refused (%s), using vsync\n",
@@ -399,19 +470,23 @@ namespace ps2x_host
                 return fail(failure, "SDL_CreateGPUGraphicsPipeline");
 
             // Nearest for PS2X_SCALE=nearest; linear for bilinear, and also for sharp, which does its own
-            // weighting in the shader on top of linear fetches (SDL does the same).
-            const SDL_GPUFilter filter = scale == ScaleMode::Nearest ? SDL_GPU_FILTER_NEAREST : SDL_GPU_FILTER_LINEAR;
-            SDL_GPUSamplerCreateInfo sampler = {};
-            sampler.min_filter = filter;
-            sampler.mag_filter = filter;
-            sampler.mipmap_mode = scale == ScaleMode::Nearest ? SDL_GPU_SAMPLERMIPMAPMODE_NEAREST : SDL_GPU_SAMPLERMIPMAPMODE_LINEAR;
-            sampler.address_mode_u = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
-            sampler.address_mode_v = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
-            sampler.address_mode_w = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
-            sampler.max_lod = 16.0f; // the picture of the GS GPU renderer at a higher scale has mip levels (the CPU picture has one)
-            g.sampler = SDL_CreateGPUSampler(g.device, &sampler);
-            if (!g.sampler)
-                return fail(failure, "SDL_CreateGPUSampler");
+            // weighting in the shader on top of linear fetches (SDL does the same). Both samplers exist, so the
+            // overlay's picture filter setting can switch between them while the game runs.
+            for (const bool nearest : {false, true})
+            {
+                const SDL_GPUFilter filter = nearest ? SDL_GPU_FILTER_NEAREST : SDL_GPU_FILTER_LINEAR;
+                SDL_GPUSamplerCreateInfo sampler = {};
+                sampler.min_filter = filter;
+                sampler.mag_filter = filter;
+                sampler.mipmap_mode = nearest ? SDL_GPU_SAMPLERMIPMAPMODE_NEAREST : SDL_GPU_SAMPLERMIPMAPMODE_LINEAR;
+                sampler.address_mode_u = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
+                sampler.address_mode_v = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
+                sampler.address_mode_w = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
+                sampler.max_lod = 16.0f; // the picture of the GS GPU renderer at a higher scale has mip levels (the CPU picture has one)
+                (nearest ? g.samplerNearest : g.sampler) = SDL_CreateGPUSampler(g.device, &sampler);
+                if (!(nearest ? g.samplerNearest : g.sampler))
+                    return fail(failure, "SDL_CreateGPUSampler");
+            }
 
             SDL_GPUTextureCreateInfo texture = {};
             texture.type = SDL_GPU_TEXTURETYPE_2D;
@@ -446,6 +521,8 @@ namespace ps2x_host
                     SDL_ReleaseGPUTexture(g.device, g.picture);
                 if (g.sampler)
                     SDL_ReleaseGPUSampler(g.device, g.sampler);
+                if (g.samplerNearest)
+                    SDL_ReleaseGPUSampler(g.device, g.samplerNearest);
                 if (g.pipeline)
                     SDL_ReleaseGPUGraphicsPipeline(g.device, g.pipeline);
                 if (g.fragmentShader)

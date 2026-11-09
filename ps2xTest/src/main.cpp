@@ -21,6 +21,7 @@ void register_ps2_runtime_expansion_tests();
 void register_ps2_float_semantics_tests();
 void register_gs_recording_tests();
 void register_gs_gpu_tests();
+void register_ui_settings_tests();
 void reset_ps2_test_function_table();
 
 int main()
@@ -54,6 +55,7 @@ int main()
     register_ps2_float_semantics_tests();
     register_gs_recording_tests();
     register_gs_gpu_tests();
+    register_ui_settings_tests();
     int res = MiniTest::Run();
     std::cout.flush();
     std::cerr.flush();

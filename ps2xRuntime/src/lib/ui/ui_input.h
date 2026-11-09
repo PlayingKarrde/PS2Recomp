@@ -34,6 +34,10 @@ namespace ps2x::ui
 
         void setContext(Rml::Context *context) { m_context = context; }
 
+        // On by default: mouse motion that follows a window change or a key or button press within a moment is ignored
+        // (see m_mouseQuietUntilNs). Scripted tests that push mouse and key events back to back turn it off.
+        void setMouseGuard(bool on) { m_mouseGuard = on; }
+
         // SDL reports mouse positions in window coordinates (points), the UI works in pixels. On a high-DPI display
         // pass SDL_GetWindowPixelDensity(window); 1.0 otherwise.
         void setPixelDensity(float density) { m_density = density > 0.0f ? density : 1.0f; }
@@ -73,5 +77,11 @@ namespace ps2x::ui
         double m_repeatTimer = 0.0;
         bool m_repeating = false;
         uint32_t m_buttonsHeld = 0; // bit per mapped gamepad button, so releaseAll() can release them
+        // Mouse motion that is not the player's hand: the pointer sits where it was, and a window that changes size (full
+        // screen on or off) or a key or button press just before makes the system report motion over a row, which would
+        // move the focus there (hovering a row focuses it). Mouse motion is ignored until this time (SDL ticks, ns).
+        uint64_t m_mouseQuietUntilNs = 0;
+        bool m_mouseGuard = true;
+        void quietMouse(uint64_t nanoseconds);
     };
 }

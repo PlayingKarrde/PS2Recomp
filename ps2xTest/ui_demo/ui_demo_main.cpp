@@ -29,6 +29,10 @@
 //   --virtual-pad drive the script's controller steps through an SDL virtual gamepad (SDL_AttachVirtualJoystick), so
 //                 the events come out of SDL's own gamepad layer, not pushed by this program.
 //   --page FILE   show another page of the asset folder (default pages/settings.rml) without the settings behaviour.
+//   --menu        show the game's settings menu (pages/game_settings.rml, ui_game_menu.h) with a stand-in for the game side,
+//                 instead of the demo page. --set k=v,... gives starting values, --startup k=v,... what the "running game"
+//                 started with (a different current value then shows RESTART), --env-lock k=NAME,... settings fixed by an
+//                 environment variable. --expect then checks the stand-in's values.
 //   --window      with --script or --png: open a window anyway, so the frames go through the swapchain. The PNG is
 //                 then taken from a second, offscreen draw of the same frame.
 //
@@ -36,6 +40,7 @@
 
 #include "../common/png_write.h"
 
+#include "ui_game_menu.h"
 #include "ui_overlay.h"
 #include "ui_render_sdlgpu.h"
 #include "ui_settings.h"
@@ -54,6 +59,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -85,6 +91,8 @@ namespace
         bool forceWindow = false;
         bool breakScissor = false; // --validation-selftest
         bool virtualPad = false;   // --virtual-pad
+        bool menu = false;         // --menu
+        std::string menuSet, menuStartup, menuEnvLock;
         std::string page = "pages/settings.rml";
         int frames = 0;
     };
@@ -379,6 +387,64 @@ namespace
         pushEvent(e);
     }
 
+    // A stand-in for the game side of the settings menu: values in a map.
+    std::map<std::string, std::string> parsePairs(const std::string &text)
+    {
+        std::map<std::string, std::string> out;
+        size_t start = 0;
+        while (start < text.size())
+        {
+            size_t end = text.find(',', start);
+            if (end == std::string::npos)
+                end = text.size();
+            const std::string item = text.substr(start, end - start);
+            start = end + 1;
+            const size_t eq = item.find('=');
+            if (eq != std::string::npos)
+                out[item.substr(0, eq)] = item.substr(eq + 1);
+        }
+        return out;
+    }
+
+    struct FakeHost final : MenuHost
+    {
+        std::map<std::string, std::string> values{{"renderer", "gpu"},   {"resolution", "1"}, {"aspect", "4:3"}, {"fullscreen", "off"},
+                                                  {"vsync", "off"},      {"filter", "sharp"},  {"volume", "100"}};
+        std::map<std::string, std::string> startup;
+        std::map<std::string, std::string> env;
+        bool closeAsked = false;
+
+        std::string value(const std::string &key) override { return values[key]; }
+        std::string startupValue(const std::string &key) override { return startup.count(key) ? startup[key] : values[key]; }
+        bool fixedByEnvironment(const std::string &key, std::string &envName) override
+        {
+            if (!env.count(key))
+                return false;
+            envName = env[key];
+            return true;
+        }
+        void change(const std::string &key, const std::string &value) override
+        {
+            values[key] = value;
+            std::printf("change: %s = %s\n", key.c_str(), value.c_str());
+        }
+        void closeRequested() override
+        {
+            std::printf("back\n");
+            closeAsked = true;
+        }
+        std::vector<ControlLine> controls() override
+        {
+            return {{"Move", "Arrow keys, W A S D", "D-pad, left stick"}, {"Cross", "X, Space", "A (bottom button)"},
+                    {"Circle", "C, Escape", "B (right button)"},          {"Square", "Z, Keypad 0", "X (left button)"},
+                    {"Triangle", "V, Keypad 1", "Y (top button)"},        {"L1 / R1", "Q / E", "LB / RB"},
+                    {"L2 / R2", "Left Shift / Right Shift", "LT / RT"},   {"Start", "Enter", "Start"},
+                    {"Select", "Tab", "Back"},                            {"This menu", "F2", "Guide, or hold L3 + R3"},
+                    {"Debug panel", "F1", "-"}};
+        }
+        std::string controllerName() override { return "Demo virtual gamepad"; }
+    };
+
     // The application: owns the device, the overlay, the picture, and draws frames.
     struct Demo
     {
@@ -387,10 +453,14 @@ namespace
         SDL_Window *window = nullptr;
         SDL_GPUTextureFormat format = SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM;
         SDL_GPUTexture *offscreen = nullptr; // headless target, and the PNG copy in windowed mode
-        Overlay overlay;
+        Overlay ownOverlay;
+        Overlay *overlayPtr = &ownOverlay; // the menu's overlay in --menu mode
+        Overlay &overlay() { return *overlayPtr; }
         SettingsPage page;
         Picture picture;
         Rml::ElementDocument *document = nullptr;
+        GameMenu menu;
+        FakeHost fake;
         int width = 0;
         int height = 0;
         bool quit = false;
@@ -412,7 +482,7 @@ namespace
                 width = pw;
                 height = ph;
             }
-            overlay.setPixelDensity(SDL_GetWindowPixelDensity(window));
+            overlay().setPixelDensity(SDL_GetWindowPixelDensity(window));
         }
 
         // Draws one frame (picture pass, then the overlay pass) onto `target`.
@@ -420,12 +490,12 @@ namespace
         {
             auto t0 = std::chrono::steady_clock::now();
             const SDL_FColor black = {0.0f, 0.0f, 0.0f, 1.0f};
-            SdlGpuRenderer &r = overlay.renderer();
+            SdlGpuRenderer &r = overlay().renderer();
             r.beginFrame(cmd, target, static_cast<uint32_t>(width), static_cast<uint32_t>(height), &black);
             drawPicture(r, picture, static_cast<uint32_t>(width), static_cast<uint32_t>(height));
             r.endFrame();
             auto t1 = std::chrono::steady_clock::now();
-            overlay.record(cmd, target);
+            overlay().record(cmd, target);
             auto t2 = std::chrono::steady_clock::now();
             if (opt.breakScissor)
             {
@@ -462,7 +532,7 @@ namespace
                     std::printf("gamepad added: %s\n", pad ? SDL_GetGamepadName(pad) : "(could not open)");
                     continue;
                 }
-                overlay.handleEvent(e);
+                overlay().handleEvent(e);
             }
         }
 
@@ -472,10 +542,10 @@ namespace
         {
             pump(allowRealPads);
             sizeFromWindow();
-            overlay.setViewport(width, height, opt.scale);
+            overlay().setViewport(width, height, opt.scale);
 
             auto u0 = std::chrono::steady_clock::now();
-            overlay.update(lastDt);
+            overlay().update(lastDt);
             updateMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - u0).count();
 
             SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(device);
@@ -497,7 +567,7 @@ namespace
                 }
                 width = static_cast<int>(sw);
                 height = static_cast<int>(sh);
-                overlay.setViewport(width, height, opt.scale);
+                overlay().setViewport(width, height, opt.scale);
                 drawFrame(cmd, swap);
                 if (wantPng)
                 {
@@ -728,6 +798,14 @@ int main(int argc, char **argv)
             opt.virtualPad = true;
         else if (a == "--page" && i + 1 < argc)
             opt.page = next();
+        else if (a == "--menu")
+            opt.menu = true;
+        else if (a == "--set" && i + 1 < argc)
+            opt.menuSet = next();
+        else if (a == "--startup" && i + 1 < argc)
+            opt.menuStartup = next();
+        else if (a == "--env-lock" && i + 1 < argc)
+            opt.menuEnvLock = next();
         else if (a == "--window")
             opt.forceWindow = true;
         else if (a == "--frames" && i + 1 < argc)
@@ -799,13 +877,30 @@ int main(int argc, char **argv)
     config.targetFormat = d.format;
     config.assetRoot = assets;
     config.window = d.window;
-    if (!d.overlay.init(config))
+    if (opt.menu)
+    {
+        for (auto &kv : parsePairs(opt.menuSet))
+            d.fake.values[kv.first] = kv.second;
+        d.fake.startup = d.fake.values;
+        for (auto &kv : parsePairs(opt.menuStartup))
+            d.fake.startup[kv.first] = kv.second;
+        d.fake.env = parsePairs(opt.menuEnvLock);
+        if (!d.menu.init(config, &d.fake))
+        {
+            std::fprintf(stderr, "FATAL: the overlay could not start\n");
+            return 2;
+        }
+        d.overlayPtr = &d.menu.overlay();
+    }
+    else if (!d.overlay().init(config))
     {
         std::fprintf(stderr, "FATAL: the overlay could not start\n");
         return 2;
     }
     d.sizeFromWindow();
-    d.overlay.setViewport(d.width, d.height, opt.scale);
+    d.overlay().setViewport(d.width, d.height, opt.scale);
+    if (scripted)
+        d.overlay().setMouseGuard(false); // a script pushes mouse and key steps back to back
 
     std::vector<uint8_t> pic;
     if (opt.backdrop.empty() || !loadBackdrop(opt.backdrop, pic))
@@ -814,12 +909,21 @@ int main(int argc, char **argv)
             std::fprintf(stderr, "warning: cannot read backdrop %s, using the built-in picture\n", opt.backdrop.c_str());
         pic = makeStandInPicture();
     }
-    createPicture(d.overlay.renderer(), d.picture, pic);
+    createPicture(d.overlay().renderer(), d.picture, pic);
 
-    d.document = d.overlay.loadPage(opt.page);
-    if (!d.document)
-        return 2;
-    d.overlay.setVisible(true);
+    if (opt.menu)
+    {
+        d.menu.open();
+        if (!d.menu.visible())
+            return 2;
+    }
+    else
+    {
+        d.document = d.overlay().loadPage(opt.page);
+        if (!d.document)
+            return 2;
+        d.overlay().setVisible(true);
+    }
 
     auto applyAspect = [&](const std::string &v) {
         int aw = 4, ah = 3;
@@ -838,20 +942,20 @@ int main(int argc, char **argv)
         if (key == "aspect")
             applyAspect(value);
         else if (key == "brightness")
-            updateBrightness(d.overlay.renderer(), d.picture, static_cast<float>(std::atoi(value.c_str())) / 100.0f);
+            updateBrightness(d.overlay().renderer(), d.picture, static_cast<float>(std::atoi(value.c_str())) / 100.0f);
     });
     d.page.setOnBack([&]() {
         std::printf("back\n");
         d.backPressed = true;
     });
     // Another page (--page) is just shown: it has none of the settings page's rows to wire up.
-    if (opt.page == "pages/settings.rml")
+    if (!opt.menu && opt.page == "pages/settings.rml")
     {
         if (!d.page.attach(d.document))
             return 2;
         // The page's own starting values drive the picture (so it matches what the page shows).
         applyAspect(d.page.value("aspect"));
-        updateBrightness(d.overlay.renderer(), d.picture, static_cast<float>(std::atoi(d.page.value("brightness").c_str())) / 100.0f);
+        updateBrightness(d.overlay().renderer(), d.picture, static_cast<float>(std::atoi(d.page.value("brightness").c_str())) / 100.0f);
         d.page.focusFirstRow();
     }
 
@@ -874,7 +978,7 @@ int main(int argc, char **argv)
                 break;
             }
             ++number;
-            if (d.backPressed)
+            if (d.backPressed || d.fake.closeAsked)
                 break;
         }
         // Settings the script should have reached.
@@ -893,7 +997,7 @@ int main(int argc, char **argv)
                     continue;
                 const std::string key = item.substr(0, eq);
                 const std::string want = item.substr(eq + 1);
-                const std::string got = d.page.value(key);
+                const std::string got = opt.menu ? d.fake.values[key] : d.page.value(key);
                 const bool ok = got == want;
                 std::printf("%s expect %s = %s (got %s)\n", ok ? "PASS" : "FAIL", key.c_str(), want.c_str(), got.c_str());
                 if (!ok)
@@ -922,23 +1026,26 @@ int main(int argc, char **argv)
     }
 
     SDL_WaitForGPUIdle(d.device);
-    const SdlGpuRenderer::FrameStats &fs_ = d.overlay.renderer().lastFrame();
+    const SdlGpuRenderer::FrameStats &fs_ = d.overlay().renderer().lastFrame();
     if (d.measured > 0)
         std::printf("per frame on this thread: picture pass %.3f ms, overlay record %.3f ms, update %.3f ms (%d frames)\n",
                     d.pictureMs / d.measured, d.recordMs / d.measured, d.updateMs / d.measured, d.measured);
     std::printf("last overlay frame: %u draws, %u geometries, %u vertices, %u indices, %u textures; alive: %zu textures (%.1f MB), %zu geometries\n",
-                fs_.draws, fs_.geometries, fs_.vertices, fs_.indices, fs_.uniqueTextures, d.overlay.renderer().textureCount(),
-                static_cast<double>(d.overlay.renderer().textureBytes()) / (1024.0 * 1024.0), d.overlay.renderer().geometryCount());
-    const LogCounts logs = d.overlay.logCounts();
+                fs_.draws, fs_.geometries, fs_.vertices, fs_.indices, fs_.uniqueTextures, d.overlay().renderer().textureCount(),
+                static_cast<double>(d.overlay().renderer().textureBytes()) / (1024.0 * 1024.0), d.overlay().renderer().geometryCount());
+    const LogCounts logs = d.overlay().logCounts();
     std::printf("ui log: %d errors, %d warnings, %d info\n", logs.errors, logs.warnings, logs.infos);
     if (logs.errors > 0)
         status = 1;
 
     d.page.detach();
-    d.overlay.renderer().ReleaseGeometry(d.picture.quad);
-    d.overlay.renderer().ReleaseGeometry(d.picture.shade);
-    d.overlay.renderer().ReleaseTexture(d.picture.texture);
-    d.overlay.shutdown();
+    d.overlay().renderer().ReleaseGeometry(d.picture.quad);
+    d.overlay().renderer().ReleaseGeometry(d.picture.shade);
+    d.overlay().renderer().ReleaseTexture(d.picture.texture);
+    if (opt.menu)
+        d.menu.shutdown();
+    else
+        d.overlay().shutdown();
     if (d.offscreen)
         SDL_ReleaseGPUTexture(d.device, d.offscreen);
     if (d.window)

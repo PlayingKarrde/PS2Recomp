@@ -9,6 +9,8 @@
 //        data-key=KEY                      the setting's name, handed to the change callback
 //        data-value=VALUE                  the current value (toggle: on/off; choice: one of data-choices; slider: a number)
 //        data-choices=A|B|C                choice rows only
+//        data-labels=a|b|c                 choice rows only, optional: what is shown for each choice (default: the value)
+//        data-restart=1                    the setting only takes effect after a restart (the host can flag it)
 //        data-min / data-max / data-step   slider rows only (default 0, 100, 5), data-suffix e.g. "%"
 //        data-help=TEXT                    shown in #help-text while the row has focus
 //        .value                            the element that shows "[ON]", "[16:9]" or "[ 50%]"
@@ -19,6 +21,9 @@
 // or a click activates (toggle: flip, choice: next). Page Up / Page Down (the controller's shoulder buttons) switch
 // tabs, Escape (the B button) is Back. Up/Down and the tab bar are plain RmlUi focus navigation.
 //
+// A row can be locked (setLocked): it stays focusable, so the help line can say why, but its value cannot change and
+// it is drawn dimmed. A page may also have a `.tag` element in a row, which shows a short word ("ENV", "RESTART").
+//
 // Nothing here changes the game. The host sets a callback to learn about changes.
 #pragma once
 
@@ -26,6 +31,7 @@
 
 #include <functional>
 #include <string>
+#include <vector>
 
 namespace Rml
 {
@@ -57,6 +63,13 @@ namespace ps2x::ui
         // Reads and writes a setting by key. setValue updates the display and does not call the change callback.
         std::string value(const std::string &key) const;
         bool setValue(const std::string &key, const std::string &value);
+        // The keys of every row, in page order, and a row's attribute (for example "data-restart"); "" if there is none.
+        std::vector<std::string> keys() const;
+        std::string attribute(const std::string &key, const std::string &name) const;
+        // Locks or unlocks a row. `reason` replaces the help text while the row is focused; `tag` goes in the row's
+        // .tag element ("" clears it).
+        bool setLocked(const std::string &key, bool locked, const std::string &reason, const std::string &tag);
+        bool setTag(const std::string &key, const std::string &tag);
 
         void selectTab(const std::string &name);
         std::string selectedTab() const { return m_tab; }

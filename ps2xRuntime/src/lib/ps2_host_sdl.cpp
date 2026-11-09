@@ -23,6 +23,8 @@
 
 #include "ps2_host_backend.h"
 #include "ps2_host_gpu.h"
+#include "ps2_host_ui.h"
+#include "runtime/ps2_pause.h"
 
 #include <SDL3/SDL.h>
 #if defined(__linux__) && !defined(__ANDROID__)
@@ -85,6 +87,14 @@ namespace ps2x_host
             return when != 0 && SDL_GetTicksNS() - when <= kLatchMaxNs;
         }
         std::atomic<bool> g_keyboardCaptured{false};
+
+        // The settings overlay (ps2_host_ui.h) has the input. The host keeps tracking the real state of every key and
+        // button, but the game's readers (pad ports 0 and 1) see nothing while it is open. When it closes, whatever is
+        // still held stays hidden until it is released (the masks below), and presses that happened meanwhile are
+        // dropped (their latches are cleared), so a button used to close the overlay never reaches the game.
+        std::atomic<bool> g_overlayCaptured{false};
+        std::array<std::atomic<uint8_t>, kKeyCount> g_keyMasked{};
+        std::atomic<uint32_t> g_padMasked{0};
 
         // ---- Controllers ----
 
@@ -168,12 +178,14 @@ namespace ps2x_host
             else
             {
                 g_pad.held.fetch_and(~bit, std::memory_order_relaxed);
+                g_padMasked.fetch_and(~bit, std::memory_order_relaxed); // released: the game may see the next press
             }
         }
 
         void clearPadState()
         {
             g_pad.held.store(0);
+            g_padMasked.store(0);
             for (auto &latch : g_pad.latchNs)
                 for (auto &stamp : latch)
                     stamp.store(0);
@@ -455,7 +467,15 @@ namespace ps2x_host
             // How much audio is kept queued ahead of the device, on top of the device's own buffer.
             int queueTargetBytes = 0;
             float gain = 1.0f;
+            // The settings overlay: master volume on top of `gain`, and a short fade for the pause (audio thread only).
+            std::atomic<float> volume{1.0f};
+            float pauseFade = 1.0f; // 1 = playing, 0 = silent; moves by kFadeStep per frame toward the target
         } g_audio;
+
+        // Pausing the guest (ps2_pause.h) silences the sound: the sound chip is not mixed while paused, because its voices
+        // would run on without the guest feeding them and loop or buzz. A fade of 10 ms (480 frames at 48 kHz) at each end
+        // avoids a click.
+        constexpr float kFadeStep = 1.0f / 480.0f;
 
         // The old build's audio device ran with a 1440-frame period (30 ms at 48 kHz, from its log).
         // Total buffering here is kept near that: the device's period plus a queue of our own.
@@ -486,13 +506,37 @@ namespace ps2x_host
             if (wanted <= 0)
                 return;
             int remainingFrames = wanted / static_cast<int>(2 * sizeof(int16_t));
+            const bool paused = ps2x_host::guestPaused();
             while (remainingFrames > 0)
             {
                 const int frames = std::min(remainingFrames, kChunkFrames);
+                if (paused && g_audio.pauseFade <= 0.0f)
+                {
+                    // Silent and not mixing: the sound chip stays exactly where it was until the guest runs again.
+                    std::memset(buffer, 0, static_cast<size_t>(frames) * 2u * sizeof(int16_t));
+                    if (g_audio.statsOn)
+                        g_audio.frames.fetch_add(static_cast<uint64_t>(frames), std::memory_order_relaxed);
+                    SDL_PutAudioStreamData(stream, buffer, frames * 2 * static_cast<int>(sizeof(int16_t)));
+                    remainingFrames -= frames;
+                    continue;
+                }
                 if (g_audio.mix)
                     g_audio.mix(g_audio.mixUser, buffer, static_cast<unsigned>(frames));
                 else
                     std::memset(buffer, 0, static_cast<size_t>(frames) * 2u * sizeof(int16_t));
+                if (paused || g_audio.pauseFade < 1.0f)
+                {
+                    const float target = paused ? 0.0f : 1.0f;
+                    for (int i = 0; i < frames; ++i)
+                    {
+                        if (g_audio.pauseFade < target)
+                            g_audio.pauseFade = std::min(target, g_audio.pauseFade + kFadeStep);
+                        else if (g_audio.pauseFade > target)
+                            g_audio.pauseFade = std::max(target, g_audio.pauseFade - kFadeStep);
+                        buffer[i * 2] = static_cast<int16_t>(static_cast<float>(buffer[i * 2]) * g_audio.pauseFade);
+                        buffer[i * 2 + 1] = static_cast<int16_t>(static_cast<float>(buffer[i * 2 + 1]) * g_audio.pauseFade);
+                    }
+                }
                 if (g_audio.statsOn)
                 {
                     uint64_t sum = 0;
@@ -636,6 +680,7 @@ namespace ps2x_host
                 else
                 {
                     g_keyHeld[key].store(0, std::memory_order_relaxed);
+                    g_keyMasked[key].store(0, std::memory_order_relaxed);
                 }
                 break;
             }
@@ -699,6 +744,8 @@ namespace ps2x_host
         const bool held = g_keyHeld[index].load(std::memory_order_relaxed) != 0;
         if (reader <= ReaderPort1 && g_keyboardCaptured.load(std::memory_order_relaxed))
             return false;
+        if (reader <= ReaderPort1 && (g_overlayCaptured.load(std::memory_order_relaxed) || g_keyMasked[index].load(std::memory_order_relaxed) != 0))
+            return false;
         if (latched && !held)
             g_statLatchOnlyReads.fetch_add(1, std::memory_order_relaxed);
         return held || latched;
@@ -710,7 +757,10 @@ namespace ps2x_host
         if (index >= kKeyCount)
             return false;
         reader = std::clamp(reader, 0, static_cast<int>(ReaderCount) - 1);
-        return takeLatch(g_keyLatchNs[reader][index]);
+        const bool pressed = takeLatch(g_keyLatchNs[reader][index]);
+        if (reader <= ReaderPort1 && (g_overlayCaptured.load(std::memory_order_relaxed) || g_keyMasked[index].load(std::memory_order_relaxed) != 0))
+            return false;
+        return pressed;
     }
 
     bool gamepadAvailable()
@@ -727,6 +777,8 @@ namespace ps2x_host
         const uint32_t bit = 1u << index;
         const bool latched = takeLatch(g_pad.latchNs[reader][index]);
         const bool held = (g_pad.held.load(std::memory_order_relaxed) & bit) != 0;
+        if (reader <= ReaderPort1 && (g_overlayCaptured.load(std::memory_order_relaxed) || (g_padMasked.load(std::memory_order_relaxed) & bit) != 0))
+            return false;
         return held || latched;
     }
 
@@ -734,6 +786,8 @@ namespace ps2x_host
     {
         const size_t index = static_cast<size_t>(axis);
         if (index >= 4)
+            return 0.0f;
+        if (g_overlayCaptured.load(std::memory_order_relaxed))
             return 0.0f;
         return std::clamp(static_cast<float>(g_pad.axis[index].load(std::memory_order_relaxed)) / 32767.0f, -1.0f, 1.0f);
     }
@@ -747,6 +801,27 @@ namespace ps2x_host
     void setKeyboardCapturedByUi(bool captured)
     {
         g_keyboardCaptured.store(captured, std::memory_order_relaxed);
+    }
+
+    void setInputCapturedByOverlay(bool captured)
+    {
+        if (captured)
+        {
+            g_overlayCaptured.store(true, std::memory_order_release);
+            return;
+        }
+        // Leaving: what is held now stays hidden until released, and presses made while the overlay was open are dropped.
+        for (size_t key = 0; key < kKeyCount; ++key)
+        {
+            g_keyMasked[key].store(g_keyHeld[key].load(std::memory_order_relaxed) != 0 ? 1 : 0, std::memory_order_relaxed);
+            for (auto &latch : g_keyLatchNs)
+                latch[key].store(0, std::memory_order_relaxed);
+        }
+        g_padMasked.store(g_pad.held.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        for (auto &latch : g_pad.latchNs)
+            for (auto &stamp : latch)
+                stamp.store(0, std::memory_order_relaxed);
+        g_overlayCaptured.store(false, std::memory_order_release);
     }
 
     // ------------------------------------------------------- window and picture
@@ -789,6 +864,16 @@ namespace ps2x_host
             destroyWindow();
             return false;
         }
+        // PS2X_FULLSCREEN (the settings file's "fullscreen = on" arrives here too, see ps2_settings.h) starts full screen.
+        if (const char *full = std::getenv("PS2X_FULLSCREEN"))
+        {
+            const std::string text = full;
+            if (text == "1" || text == "on" || text == "true" || text == "yes")
+            {
+                SDL_SetWindowFullscreen(g_video.window, true);
+                SDL_SyncWindow(g_video.window);
+            }
+        }
         // Which presenter: SDL_GPU unless told otherwise, with SDL_Renderer as the fallback.
         const char *wanted = std::getenv("PS2X_PRESENT");
         const bool forceRenderer = wanted && std::strcmp(wanted, "renderer") == 0;
@@ -818,9 +903,13 @@ namespace ps2x_host
         if (g_video.gpu)
         {
             presenterText = gpu_present::describe();
+            // The settings overlay draws through the presenter's device. It is optional: without it the game is unchanged.
+            ui::create(g_video.window, gpuDevice(), gpuSwapchainFormat());
         }
         else
         {
+            std::printf("[ui] the settings overlay needs the SDL_GPU presenter, which is not in use; no overlay\n");
+            std::fflush(stdout);
             g_video.renderer = SDL_CreateRenderer(g_video.window, nullptr);
             if (!g_video.renderer)
             {
@@ -874,7 +963,8 @@ namespace ps2x_host
 
     void destroyWindow()
     {
-        // The GPU device releases its claim on the window, so it goes first.
+        // The overlay holds objects of the GPU device, and the device releases its claim on the window: both go first.
+        ui::destroy();
         if (g_video.gpu || gpu_present::active())
             gpu_present::destroy();
         if (g_video.picture)
@@ -902,11 +992,15 @@ namespace ps2x_host
 
     bool pumpEvents()
     {
+        ui::pumpTestPad(); // PS2X_TEST_PAD: the buttons a script pressed on an SDL virtual gamepad become events below
         SDL_Event event;
         while (SDL_PollEvent(&event))
         {
             if (auto hook = g_eventHook.load())
                 hook(&event);
+            // The overlay looks for its open and close keys and, while open, uses the input. The game's own handling
+            // below still runs, so the real state is always tracked; the readers hide it from the game.
+            ui::handleEvent(event);
             handleEvent(event);
         }
         return !g_quitRequested.load();
@@ -993,13 +1087,31 @@ namespace ps2x_host
         {
             ScopedPhase timing(g_presentStats.present);
             if (g_video.gpu)
+            {
+                ui::update(); // timers, the deferred close, layout of the open overlay
                 gpu_present::present();
+            }
             else if (g_video.renderer)
                 SDL_RenderPresent(g_video.renderer);
         }
         writePendingDump();
         reportStats();
         pace();
+    }
+
+    bool windowFullscreen()
+    {
+        return g_video.window && (SDL_GetWindowFlags(g_video.window) & SDL_WINDOW_FULLSCREEN) != 0;
+    }
+
+    void setWindowFullscreen(bool fullscreen)
+    {
+        if (!g_video.window || windowFullscreen() == fullscreen)
+            return;
+        if (!SDL_SetWindowFullscreen(g_video.window, fullscreen))
+            std::fprintf(stderr, "[host] could not switch full screen %s: %s\n", fullscreen ? "on" : "off", SDL_GetError());
+        else
+            SDL_SyncWindow(g_video.window);
     }
 
     void *nativeWindow()
@@ -1062,8 +1174,13 @@ namespace ps2x_host
         float gain = 0.6875f;
         if (const char *env = std::getenv("PS2X_AUDIO_GAIN"))
             gain = std::clamp(static_cast<float>(std::atof(env)), 0.0f, 4.0f);
-        SDL_SetAudioStreamGain(g_audio.stream, gain);
         g_audio.gain = gain;
+        // Master volume (0..100 %, the settings overlay's slider; PS2X_VOLUME or the settings file give the starting value).
+        float volume = 1.0f;
+        if (const char *env = std::getenv("PS2X_VOLUME"))
+            volume = std::clamp(static_cast<float>(std::atof(env)), 0.0f, 100.0f) / 100.0f;
+        g_audio.volume.store(volume);
+        SDL_SetAudioStreamGain(g_audio.stream, gain * volume);
         const SDL_AudioDeviceID device = SDL_GetAudioStreamDevice(g_audio.stream);
         SDL_AudioSpec deviceSpec{};
         int deviceFrames = 0;
@@ -1084,6 +1201,19 @@ namespace ps2x_host
         SDL_ResumeAudioStreamDevice(g_audio.stream);
         g_audio.started = true;
         return true;
+    }
+
+    void setMasterVolume(float volume)
+    {
+        volume = std::clamp(volume, 0.0f, 1.0f);
+        g_audio.volume.store(volume);
+        if (g_audio.started && g_audio.stream)
+            SDL_SetAudioStreamGain(g_audio.stream, g_audio.gain * volume);
+    }
+
+    float masterVolume()
+    {
+        return g_audio.volume.load();
     }
 
     void stopAudioStream()
