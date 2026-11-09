@@ -88,4 +88,10 @@ namespace ps2x_gs
 
     // One line for the debug panel about what its GS views show, or "" with the CPU renderer.
     std::string debugPanelNote();
+
+    // One line for the debug panel about texture packs (task t1b): "Texture packs: N replaced this frame (M draws), K loaded of F files,
+    // R refused", or "" when no pack is loaded and the dumper is off.
+    std::string debugPanelTextureLine();
+    // Reads the texture pack files again (the debug panel's button). Returns one line saying what was found, or "" with no pack.
+    std::string reloadTexturePacks();
 }

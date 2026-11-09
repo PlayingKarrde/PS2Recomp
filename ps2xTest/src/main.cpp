@@ -21,6 +21,7 @@ void register_ps2_runtime_expansion_tests();
 void register_ps2_float_semantics_tests();
 void register_gs_recording_tests();
 void register_gs_gpu_tests();
+void register_gs_tex_pack_tests();
 void register_ui_settings_tests();
 #if defined(PS2X_HAS_MODS_TESTS)
 void register_mod_manager_tests();
@@ -58,6 +59,7 @@ int main()
     register_ps2_float_semantics_tests();
     register_gs_recording_tests();
     register_gs_gpu_tests();
+    register_gs_tex_pack_tests();
     register_ui_settings_tests();
 #if defined(PS2X_HAS_MODS_TESTS)
     register_mod_manager_tests();

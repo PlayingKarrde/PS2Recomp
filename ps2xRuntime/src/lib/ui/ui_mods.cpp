@@ -81,6 +81,7 @@ namespace ps2x::ui
             switch (kind)
             {
             case Kind::Theme: return "A theme changes how this menu looks. It takes effect when the game starts.";
+            case Kind::Assets: return "Replacement pictures (texture packs). They take effect when the game starts, and only with the GPU renderer.";
             case Kind::Code: return "Code mods are not supported yet, so this does nothing.";
             default: return "This kind of mod does nothing yet. Support comes in a later version.";
             }
@@ -310,6 +311,18 @@ namespace ps2x::ui
                    (m.enabled ? "On, but it does nothing: " : "Cannot be turned on yet: ") + text(m.problem) + "</div>";
         if (m.valid)
         {
+            // What the running game found wrong with the mod's files (texture pictures it refused, and why).
+            const std::vector<std::string> notes = m_manager->runtimeNotes(m.id);
+            if (!notes.empty())
+            {
+                rml += "<div id=\"mod-notes\">The game could not use some files of this mod:";
+                const size_t shown = std::min<size_t>(notes.size(), 5);
+                for (size_t i = 0; i < shown; ++i)
+                    rml += "<div class=\"mod-notes-line\">" + text(notes[i]) + "</div>";
+                if (notes.size() > shown)
+                    rml += "<div class=\"mod-notes-line\">and " + std::to_string(notes.size() - shown) + " more (see the log).</div>";
+                rml += "</div>";
+            }
             std::string links;
             for (const auto &dep : m.depends)
             {

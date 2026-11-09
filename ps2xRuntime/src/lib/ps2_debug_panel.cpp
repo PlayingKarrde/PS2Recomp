@@ -2319,6 +2319,14 @@ void PS2DebugPanel::draw(PS2Runtime &runtime)
             const std::string note = ps2x_gs::debugPanelNote();
             if (!note.empty())
                 ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f), "%s", note.c_str());
+            const std::string textureLine = ps2x_gs::debugPanelTextureLine();
+            if (!textureLine.empty())
+            {
+                ImGui::TextColored(ImVec4(0.6f, 0.9f, 1.0f, 1.0f), "%s", textureLine.c_str());
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Reload texture packs"))
+                    std::printf("[tex:pack] %s\n", ps2x_gs::reloadTexturePacks().c_str());
+            }
         }
 
         if (ImGui::BeginTabBar("debug-tabs"))

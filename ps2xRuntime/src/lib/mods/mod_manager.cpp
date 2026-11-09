@@ -113,6 +113,7 @@ namespace ps2x::mods
             std::string id;
             std::string version;
             fs::path path;
+            std::map<std::string, PackageEntry> entries; // the content files, as readPackage found them (for readPackageEntryAt)
         };
         std::vector<Mod> mods; // active mods in load order
         std::map<std::string, std::vector<size_t>> providers; // content path -> indices into `mods`, ascending
@@ -877,7 +878,10 @@ namespace ps2x::mods
             session->mods.push_back(std::move(mod));
             for (const PackageEntry &entry : slot->entries)
                 if (!entry.isDirectory && isContentPath(entry.name))
+                {
                     session->providers[entry.name].push_back(index);
+                    session->mods[index].entries.emplace(entry.name, entry);
+                }
             if (slot->manifest.kind == Kind::Theme)
                 for (const std::string &sheet : slot->manifest.stylesheets)
                     session->stylesheets.push_back(virtualName(slot->info.id, sheet));
@@ -911,7 +915,12 @@ namespace ps2x::mods
 
     std::optional<std::vector<uint8_t>> Manager::open(const std::string &path) const
     {
-        std::vector<fs::path> candidates; // last provider first
+        struct Candidate
+        {
+            fs::path package;
+            PackageEntry entry;
+        };
+        std::vector<Candidate> candidates; // last provider first
         uint64_t maxBytes = 0;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
@@ -919,13 +928,21 @@ namespace ps2x::mods
             if (found == m_session->providers.end())
                 return std::nullopt;
             for (auto it = found->second.rbegin(); it != found->second.rend(); ++it)
-                candidates.push_back(m_session->mods[*it].path);
+            {
+                const Session::Mod &mod = m_session->mods[*it];
+                const auto entry = mod.entries.find(path);
+                candidates.push_back(Candidate{mod.path, entry != mod.entries.end() ? entry->second : PackageEntry()});
+            }
             maxBytes = m_config.limits.maxEntryBytes;
         }
-        for (const fs::path &package : candidates)
+        for (const Candidate &candidate : candidates)
         {
-            // If the winner's file has gone since the start, the mod below it still provides the path.
-            if (auto bytes = readPackageEntry(package, path, maxBytes))
+            // If the winner's file has gone since the start, the mod below it still provides the path. The fast read goes straight
+            // to the entry; if it fails for any reason (the file changed under us) the slower one looks the entry up again.
+            if (!candidate.entry.name.empty())
+                if (auto bytes = readPackageEntryAt(candidate.package, candidate.entry, maxBytes))
+                    return bytes;
+            if (auto bytes = readPackageEntry(candidate.package, path, maxBytes))
                 return bytes;
         }
         return std::nullopt;
@@ -957,6 +974,38 @@ namespace ps2x::mods
             out.push_back(std::move(conflict));
         }
         return out;
+    }
+
+    std::vector<SessionFile> Manager::sessionFiles(const std::string &prefix) const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        std::vector<SessionFile> out;
+        for (auto it = m_session->providers.lower_bound(prefix); it != m_session->providers.end(); ++it)
+        {
+            if (it->first.compare(0, prefix.size(), prefix) != 0)
+                break;
+            if (it->second.empty())
+                continue;
+            const size_t winner = it->second.back();
+            out.push_back(SessionFile{it->first, m_session->mods[winner].id, static_cast<uint32_t>(winner)});
+        }
+        return out;
+    }
+
+    void Manager::addRuntimeNote(const std::string &modId, const std::string &note)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        std::vector<std::string> &notes = m_runtimeNotes[modId];
+        if (notes.size() >= kMaxRuntimeNotes || std::find(notes.begin(), notes.end(), note) != notes.end())
+            return;
+        notes.push_back(note);
+    }
+
+    std::vector<std::string> Manager::runtimeNotes(const std::string &modId) const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        const auto found = m_runtimeNotes.find(modId);
+        return found == m_runtimeNotes.end() ? std::vector<std::string>() : found->second;
     }
 
     std::optional<std::vector<uint8_t>> Manager::readFile(const std::string &modId, const std::string &path, uint64_t maxBytes,

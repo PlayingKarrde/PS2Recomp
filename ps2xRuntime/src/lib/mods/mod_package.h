@@ -43,6 +43,11 @@ namespace ps2x::mods
         uint64_t size = 0;       // unpacked
         uint64_t packedSize = 0; // in the zip
         bool isDirectory = false;
+        // Where the data is, for readPackageEntryAt (no central directory to parse): the local header's offset in the file, the
+        // compression method (0 stored, 8 deflate) and the CRC-32 of the unpacked bytes.
+        uint64_t localOffset = 0;
+        uint32_t crc32 = 0;
+        uint16_t method = 0;
     };
 
     struct Package
@@ -64,6 +69,13 @@ namespace ps2x::mods
     // Opens `file`, checks it as described above and returns the manifest and the file list.
     PackageResult readPackage(const std::filesystem::path &file, const ManifestRules &rules = ManifestRules(),
                               const Limits &limits = Limits());
+
+    // Reads an entry whose details readPackage already returned: seeks to its local header, reads the packed bytes and inflates
+    // them, checking the CRC. Unlike readPackageEntry it does not parse the zip's central directory, so it costs the same for a
+    // package of ten files and of ten thousand (texture packs read thousands of pictures). The file is opened and closed for
+    // each call (a package can be uninstalled while the game runs). nullopt with *error when it fails.
+    std::optional<std::vector<uint8_t>> readPackageEntryAt(const std::filesystem::path &file, const PackageEntry &entry, uint64_t maxBytes,
+                                                           std::string *error = nullptr);
 
     // Unpacks one entry into memory. nullopt (with *error, one line) when the file is not a zip, has no such entry, or the
     // entry is larger than maxBytes.

@@ -15,12 +15,18 @@
 // Nothing here includes SDL, so it can be called from anywhere in the runtime. Without PS2X_BUILD_MODS the functions do nothing.
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
 namespace ps2x::mods
 {
     class Manager;
+}
+
+namespace TexPack
+{
+    class FileSource;
 }
 
 namespace ps2x_host_mods
@@ -38,6 +44,9 @@ namespace ps2x_host_mods
     // The style sheets of the theme mods that were on when the game started, as virtual names ("mod:<id>/<path>"), in load order.
     // Empty without a manager. The overlay adds them after its own theme.
     std::vector<std::string> themeStyleSheets();
+    // The enabled mods' files as the texture pack store reads them (gs_tex_pack.h): the manager's virtual lookup, for the mods that
+    // were on when the game started. Null without a manager. initialize() registers it with TexPack::SetDefaultSource.
+    std::shared_ptr<TexPack::FileSource> texturePackSource();
     // Reads a file by virtual name ("mod:<id>/<path>"): the overlay's file interface uses it for those style sheets and the
     // pictures they and the Mods tab show. False when there is no such file.
     bool readVirtualFile(const std::string &name, std::vector<uint8_t> &bytes);

@@ -130,7 +130,31 @@ public:
         uint64_t fieldTextureBytes = 0;   // the field ring
         uint64_t uploadBufferBytes = 0;   // the transfer buffer that stages uploads (host-visible memory)
         uint64_t vertexBufferBytes = 0;
+        // Texture replacement (task t1b); zero without a texture pack.
+        uint64_t repCreated = 0;          // replacement pictures made on the GPU
+        uint64_t repEvicted = 0;          // ... and released again over the budget
+        uint64_t repDrawCalls = 0;        // draw calls that used a replacement (gs_rep.frag.hlsl)
     };
+
+    // Texture packs, for the F1 panel (any thread). Counts of the last completed frame (VBlank) and of the whole run.
+    struct ReplacementReport
+    {
+        bool active = false;              // a texture pack is loaded
+        bool dumping = false;             // PS2X_TEX_DUMP is on
+        uint32_t packFiles = 0;           // texture files indexed
+        uint32_t decoded = 0;             // pictures decoded so far ("loaded replacements")
+        uint32_t refused = 0;             // files refused (their reasons are in the Mods tab and the log)
+        uint32_t pending = 0;             // pictures waiting to be decoded
+        uint32_t texturesThisFrame = 0;   // distinct replacement pictures drawn in the last frame
+        uint32_t drawsThisFrame = 0;      // draws that used one
+        uint64_t gpuBytes = 0;            // replacement pictures on the GPU
+        uint64_t cacheBytes = 0;          // decoded pictures held in memory
+        uint32_t dumpedFiles = 0;
+    };
+    ReplacementReport Replacement() const;
+    // Reads the texture pack files again (the F1 panel's button; any thread). Textures asked again at their next draw; pictures changed
+    // on disk show up. The set of mods is the one the game started with. Returns the number of texture files, 0 without a pack.
+    uint32_t ReloadTexturePacks();
 
     // One field published by the GS thread for the host (path B). A field uses one slot for the displayed
     // region, and up to two more for the frame buffers Compose falls back to when the displayed one is

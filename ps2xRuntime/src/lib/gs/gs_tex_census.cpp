@@ -1,12 +1,12 @@
-// The texture census and dumper (task t1a). See include/runtime/gs/gs_tex_census.h for what it measures and the switches.
+// The texture census (task t1a; since task t1b it shares the key tracker, gs_tex_keys.h, with the live texture keys). See
+// include/runtime/gs/gs_tex_census.h for what it measures and the switches.
 //
 // Reading guide:
-//   block geometry          which 256-byte blocks of GS memory a rectangle of a format covers (the GS page and block layouts)
-//   Stream                  a hash of a byte stream that does not depend on how the bytes are chunked
-//   PNG writer              a small deflate (fixed Huffman codes, LZ77) so the dump folder stays a sane size
-//   Census::Impl            instances (one per texture content), uploads, scenes, row output, the dumper
+//   Census::Impl            instances (one per texture content), uploads, scenes, row output, the candidate keys
+//   (the block map of uploads, the stream hash and the GS block layouts are in gs_tex_keys.cpp; the PNG writer in gs_png.cpp;
+//    the dumper for texture authors, which task t1a had here, is gs_tex_dump.cpp)
 //
-// Everything is opt-in; the backend holds no Census unless an environment variable asked for it.
+// Everything is opt-in; the backend holds no Census unless PS2X_TEX_CENSUS names a file.
 
 #include "runtime/gs/gs_tex_census.h"
 
@@ -14,6 +14,7 @@
 #include "runtime/gs/gs_texel.h"
 #include "runtime/gs/ps2_gs_memory.h"
 
+#include "runtime/gs/gs_tex_keys.h"
 #include <algorithm>
 #include <atomic>
 #include <bitset>
@@ -44,29 +45,14 @@ namespace
         return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
     }
 
-    inline uint64_t rotl64(uint64_t x, int r)
-    {
-        return (x << r) | (x >> (64 - r));
-    }
-
-    inline uint64_t mix64(uint64_t x)
-    {
-        x ^= x >> 33;
-        x *= 0xFF51AFD7ED558CCDull;
-        x ^= x >> 33;
-        x *= 0xC4CEB9FE1A85EC53ull;
-        x ^= x >> 33;
-        return x;
-    }
-
     inline uint64_t combine(uint64_t h, uint64_t v)
     {
-        return mix64(h ^ (v + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2)));
+        return TexKeys::Combine(h, v);
     }
 
-    uint64_t hash64(const void *data, size_t size, uint64_t seed)
+    inline uint64_t hash64(const void *data, size_t size, uint64_t seed)
     {
-        return GSRec::Hash64(data, size, seed);
+        return TexKeys::HashBytes(data, size, seed);
     }
 
     void appendf(std::string &out, const char *fmt, ...)
@@ -80,381 +66,13 @@ namespace
             out.append(buffer, static_cast<size_t>(std::min<int>(n, sizeof(buffer) - 1)));
     }
 
-    // A hash of a byte stream that does not depend on how the bytes arrive in chunks (the DMA splits a transfer wherever it likes).
-    // Four independent lanes take 32 bytes per step, and a partial stripe waits in a small buffer, so the value only depends on the bytes.
-    struct Stream
-    {
-        uint64_t lane[4] = {0x243F6A8885A308D3ull, 0x13198A2E03707344ull, 0xA4093822299F31D0ull, 0x082EFA98EC4E6C89ull};
-        uint8_t buf[32] = {};
-        uint32_t bufLen = 0;
-        uint64_t len = 0;
-
-        static uint64_t round(uint64_t acc, uint64_t w)
-        {
-            acc ^= rotl64(w * 0xC2B2AE3D27D4EB4Full, 31) * 0x9E3779B185EBCA87ull;
-            return rotl64(acc, 27) * 0x9E3779B185EBCA87ull + 0x85EBCA77C2B2AE63ull;
-        }
-
-        static void stripe(uint64_t *lanes, const uint8_t *p)
-        {
-            for (int i = 0; i < 4; ++i)
-            {
-                uint64_t w;
-                std::memcpy(&w, p + 8 * i, 8);
-                lanes[i] = round(lanes[i], w);
-            }
-        }
-
-        void update(const uint8_t *p, size_t n)
-        {
-            len += n;
-            if (bufLen)
-            {
-                const size_t take = std::min<size_t>(n, 32u - bufLen);
-                std::memcpy(buf + bufLen, p, take);
-                bufLen += static_cast<uint32_t>(take);
-                p += take;
-                n -= take;
-                if (bufLen < 32u)
-                    return;
-                stripe(lane, buf);
-                bufLen = 0;
-            }
-            while (n >= 32)
-            {
-                stripe(lane, p);
-                p += 32;
-                n -= 32;
-            }
-            if (n)
-            {
-                std::memcpy(buf, p, n);
-                bufLen = static_cast<uint32_t>(n);
-            }
-        }
-
-        uint64_t finish() const
-        {
-            uint64_t l[4] = {lane[0], lane[1], lane[2], lane[3]};
-            if (bufLen)
-            {
-                uint8_t last[32] = {};
-                std::memcpy(last, buf, bufLen);
-                stripe(l, last);
-            }
-            uint64_t h = len * 0x9E3779B185EBCA87ull;
-            for (int i = 0; i < 4; ++i)
-                h = mix64(h ^ l[i]) + static_cast<uint64_t>(i);
-            return mix64(h ^ len);
-        }
-    };
-
-    // ------------------------------------------------------------------------------------------------
-    // GS memory blocks. A block is 256 bytes (the unit of TBP and DBP); a page is 32 blocks. The order of the blocks inside a
-    // page depends on the format (the GS documentation's tables, as the arrangement of the page's blocks in rows).
-    constexpr uint32_t kBlocks = 16384u;
     constexpr uint32_t kTile = 16u;
     constexpr uint32_t kTilesPerSide = 64u;
 
-    const uint8_t kTab32[32] = {0, 1, 4, 5, 16, 17, 20, 21, 2, 3, 6, 7, 18, 19, 22, 23, 8, 9, 12, 13, 24, 25, 28, 29, 10, 11, 14, 15, 26, 27, 30, 31};
-    const uint8_t kTab16[32] = {0, 2, 8, 10, 1, 3, 9, 11, 4, 6, 12, 14, 5, 7, 13, 15, 16, 18, 24, 26, 17, 19, 25, 27, 20, 22, 28, 30, 21, 23, 29, 31};
-    const uint8_t kTab16S[32] = {0, 2, 16, 18, 1, 3, 17, 19, 8, 10, 24, 26, 9, 11, 25, 27, 4, 6, 20, 22, 5, 7, 21, 23, 12, 14, 28, 30, 13, 15, 29, 31};
-
-    struct Geom
-    {
-        uint32_t pageW, pageH, blockW, blockH, cols;
-        const uint8_t *table;
-    };
-
-    bool geomOf(uint32_t psm, Geom &g)
-    {
-        switch (psm)
-        {
-        case GS_PSM_CT32:
-        case GS_PSM_CT24:
-        case GS_PSM_T8H:
-        case GS_PSM_T4HL:
-        case GS_PSM_T4HH:
-            g = {64u, 32u, 8u, 8u, 8u, kTab32};
-            return true;
-        case GS_PSM_CT16:
-            g = {64u, 64u, 16u, 8u, 4u, kTab16};
-            return true;
-        case GS_PSM_CT16S:
-            g = {64u, 64u, 16u, 8u, 4u, kTab16S};
-            return true;
-        case GS_PSM_T8:
-            g = {128u, 64u, 16u, 16u, 8u, kTab32};
-            return true;
-        case GS_PSM_T4:
-            g = {128u, 128u, 32u, 16u, 4u, kTab16};
-            return true;
-        default:
-            return false;
-        }
-    }
-
-    // Calls f(block) for every block of GS memory that the rectangle (x, y, w, h) of a buffer at block pointer `bp` with width `bw`
-    // (in units of 64 pixels) touches. A partly covered block counts.
-    template <class F>
-    void forEachBlock(uint32_t psm, uint32_t bp, uint32_t bw, int x, int y, int w, int h, F &&f)
-    {
-        Geom g;
-        if (!geomOf(psm, g) || w <= 0 || h <= 0 || x < 0 || y < 0)
-            return;
-        const uint32_t perRow = (bw * 64u) / g.pageW;
-        const uint32_t bx0 = static_cast<uint32_t>(x) / g.blockW, bx1 = static_cast<uint32_t>(x + w - 1) / g.blockW;
-        const uint32_t by0 = static_cast<uint32_t>(y) / g.blockH, by1 = static_cast<uint32_t>(y + h - 1) / g.blockH;
-        for (uint32_t by = by0; by <= by1; ++by)
-            for (uint32_t bx = bx0; bx <= bx1; ++bx)
-            {
-                const uint32_t px = bx * g.blockW, py = by * g.blockH;
-                const uint32_t page = (py / g.pageH) * perRow + px / g.pageW;
-                const uint32_t inPage = g.table[((py % g.pageH) / g.blockH) * g.cols + (px % g.pageW) / g.blockW];
-                f((bp + page * 32u + inPage) & (kBlocks - 1u));
-            }
-    }
-
-    // ------------------------------------------------------------------------------------------------
-    // A PNG writer: filter "up", LZ77 with a hash chain, one fixed-Huffman deflate block. The files are for people and scripts to read,
-    // not to be small, but a dump of thousands of sprites should not fill the disk with stored blocks.
-    uint32_t crc32Of(const uint8_t *data, size_t size, uint32_t crc = 0)
-    {
-        static uint32_t table[256];
-        static std::once_flag once;
-        std::call_once(once,
-                       []
-                       {
-                           for (uint32_t i = 0; i < 256; ++i)
-                           {
-                               uint32_t c = i;
-                               for (int k = 0; k < 8; ++k)
-                                   c = (c & 1u) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
-                               table[i] = c;
-                           }
-                       });
-        crc = ~crc;
-        for (size_t i = 0; i < size; ++i)
-            crc = table[(crc ^ data[i]) & 0xFFu] ^ (crc >> 8);
-        return ~crc;
-    }
-
-    struct BitOut
-    {
-        std::vector<uint8_t> &out;
-        uint32_t buffer = 0;
-        int count = 0;
-        explicit BitOut(std::vector<uint8_t> &o) : out(o) {}
-        void put(uint32_t value, int bits)
-        {
-            buffer |= value << count;
-            count += bits;
-            while (count >= 8)
-            {
-                out.push_back(static_cast<uint8_t>(buffer & 0xFFu));
-                buffer >>= 8;
-                count -= 8;
-            }
-        }
-        void putCode(uint32_t code, int bits) // Huffman codes go most significant bit first
-        {
-            uint32_t r = 0;
-            for (int i = 0; i < bits; ++i)
-                r = (r << 1) | ((code >> i) & 1u);
-            put(r, bits);
-        }
-        void flush()
-        {
-            if (count > 0)
-            {
-                out.push_back(static_cast<uint8_t>(buffer & 0xFFu));
-                buffer = 0;
-                count = 0;
-            }
-        }
-    };
-
-    void putLiteralLength(BitOut &b, uint32_t sym)
-    {
-        if (sym < 144u)
-            b.putCode(0x30u + sym, 8);
-        else if (sym < 256u)
-            b.putCode(0x190u + (sym - 144u), 9);
-        else if (sym < 280u)
-            b.putCode(sym - 256u, 7);
-        else
-            b.putCode(0xC0u + (sym - 280u), 8);
-    }
-
-    const uint16_t kLenBase[29] = {3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258};
-    const uint8_t kLenExtra[29] = {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0};
-    const uint16_t kDistBase[30] = {1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577};
-    const uint8_t kDistExtra[30] = {0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13};
-
-    void deflateFixed(const uint8_t *data, size_t n, std::vector<uint8_t> &out)
-    {
-        BitOut b(out);
-        b.put(1, 1); // final block
-        b.put(1, 2); // fixed Huffman codes
-        constexpr uint32_t kWindow = 32768u;
-        constexpr uint32_t kHashSize = 1u << 15;
-        std::vector<int32_t> head(kHashSize, -1);
-        std::vector<int32_t> prev(kWindow, -1);
-        auto hashAt = [&](size_t i) -> uint32_t { return ((static_cast<uint32_t>(data[i]) << 10) ^ (static_cast<uint32_t>(data[i + 1]) << 5) ^ data[i + 2]) & (kHashSize - 1u); };
-        size_t i = 0;
-        while (i < n)
-        {
-            uint32_t bestLen = 0, bestDist = 0;
-            if (i + 3 <= n)
-            {
-                const uint32_t h = hashAt(i);
-                int32_t cand = head[h];
-                int chain = 24;
-                const size_t maxLen = std::min<size_t>(258, n - i);
-                while (cand >= 0 && chain-- > 0 && i - static_cast<size_t>(cand) <= kWindow)
-                {
-                    const size_t c = static_cast<size_t>(cand);
-                    size_t len = 0;
-                    while (len < maxLen && data[c + len] == data[i + len])
-                        ++len;
-                    if (len >= 3 && len > bestLen)
-                    {
-                        bestLen = static_cast<uint32_t>(len);
-                        bestDist = static_cast<uint32_t>(i - c);
-                        if (len == maxLen)
-                            break;
-                    }
-                    cand = prev[c & (kWindow - 1u)];
-                }
-            }
-            const size_t step = bestLen >= 3 ? bestLen : 1;
-            if (bestLen >= 3)
-            {
-                uint32_t lc = 0;
-                while (lc + 1 < 29 && kLenBase[lc + 1] <= bestLen)
-                    ++lc;
-                putLiteralLength(b, 257u + lc);
-                if (kLenExtra[lc])
-                    b.put(bestLen - kLenBase[lc], kLenExtra[lc]);
-                uint32_t dc = 0;
-                while (dc + 1 < 30 && kDistBase[dc + 1] <= bestDist)
-                    ++dc;
-                b.putCode(dc, 5);
-                if (kDistExtra[dc])
-                    b.put(bestDist - kDistBase[dc], kDistExtra[dc]);
-            }
-            else
-            {
-                putLiteralLength(b, data[i]);
-            }
-            for (size_t k = 0; k < step; ++k, ++i)
-                if (i + 3 <= n)
-                {
-                    const uint32_t h = hashAt(i);
-                    prev[i & (kWindow - 1u)] = head[h];
-                    head[h] = static_cast<int32_t>(i);
-                }
-        }
-        putLiteralLength(b, 256u);
-        b.flush();
-    }
-
-    void putBe32(std::vector<uint8_t> &v, uint32_t x)
-    {
-        v.push_back(static_cast<uint8_t>(x >> 24));
-        v.push_back(static_cast<uint8_t>(x >> 16));
-        v.push_back(static_cast<uint8_t>(x >> 8));
-        v.push_back(static_cast<uint8_t>(x));
-    }
-
-    void pngChunk(std::vector<uint8_t> &png, const char *tag, const std::vector<uint8_t> &body)
-    {
-        putBe32(png, static_cast<uint32_t>(body.size()));
-        const size_t start = png.size();
-        png.insert(png.end(), tag, tag + 4);
-        png.insert(png.end(), body.begin(), body.end());
-        putBe32(png, crc32Of(png.data() + start, png.size() - start));
-    }
-
-    // colorType 6: RGBA8, 3: paletted 8 bit (plte holds RGB triples, trns the alpha values), 0: grey 8 bit. `pixels` holds the rows
-    // without filter bytes.
-    std::vector<uint8_t> encodePng(uint32_t w, uint32_t h, int colorType, const std::vector<uint8_t> &pixels, const std::vector<uint8_t> &plte,
-                                   const std::vector<uint8_t> &trns)
-    {
-        const size_t bpp = colorType == 6 ? 4 : 1;
-        const size_t rowBytes = static_cast<size_t>(w) * bpp;
-        std::vector<uint8_t> raw;
-        raw.reserve((rowBytes + 1) * h);
-        for (uint32_t y = 0; y < h; ++y)
-        {
-            const uint8_t *row = pixels.data() + y * rowBytes;
-            if (y == 0)
-            {
-                raw.push_back(0);
-                raw.insert(raw.end(), row, row + rowBytes);
-            }
-            else
-            {
-                raw.push_back(2); // up
-                const uint8_t *above = row - rowBytes;
-                for (size_t x = 0; x < rowBytes; ++x)
-                    raw.push_back(static_cast<uint8_t>(row[x] - above[x]));
-            }
-        }
-        std::vector<uint8_t> z = {0x78, 0x01};
-        deflateFixed(raw.data(), raw.size(), z);
-        uint32_t a = 1, bsum = 0;
-        for (size_t k = 0; k < raw.size();)
-        {
-            const size_t end = std::min(raw.size(), k + 5552);
-            for (; k < end; ++k)
-            {
-                a += raw[k];
-                bsum += a;
-            }
-            a %= 65521u;
-            bsum %= 65521u;
-        }
-        putBe32(z, (bsum << 16) | a);
-        std::vector<uint8_t> png = {0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A};
-        std::vector<uint8_t> ihdr;
-        putBe32(ihdr, w);
-        putBe32(ihdr, h);
-        ihdr.push_back(8);
-        ihdr.push_back(static_cast<uint8_t>(colorType));
-        ihdr.push_back(0);
-        ihdr.push_back(0);
-        ihdr.push_back(0);
-        pngChunk(png, "IHDR", ihdr);
-        if (colorType == 3)
-        {
-            pngChunk(png, "PLTE", plte);
-            if (!trns.empty())
-                pngChunk(png, "tRNS", trns);
-        }
-        pngChunk(png, "IDAT", z);
-        pngChunk(png, "IEND", {});
-        return png;
-    }
-
-    // ------------------------------------------------------------------------------------------------
-    struct Rect
-    {
-        int x0 = 0, y0 = 0, x1 = -1, y1 = -1;
-        bool empty() const { return x1 < x0 || y1 < y0; }
-        bool contains(const Rect &o) const { return !empty() && !o.empty() && o.x0 >= x0 && o.y0 >= y0 && o.x1 <= x1 && o.y1 <= y1; }
-        bool operator==(const Rect &o) const { return x0 == o.x0 && y0 == o.y0 && x1 == o.x1 && y1 == o.y1; }
-        int64_t area() const { return empty() ? 0 : static_cast<int64_t>(x1 - x0 + 1) * (y1 - y0 + 1); }
-    };
-
-    Rect unite(const Rect &a, const Rect &b)
-    {
-        if (a.empty())
-            return b;
-        if (b.empty())
-            return a;
-        return Rect{std::min(a.x0, b.x0), std::min(a.y0, b.y0), std::max(a.x1, b.x1), std::max(a.y1, b.y1)};
-    }
+    using TexKeys::Rect;
+    using TexKeys::Unite;
+    using TexKeys::WriterEntry;
+    using TexKeys::WriterInfo;
 
     // The texels the draws sample (see the header): like GSGpu::TextureReach without the one texel of guard on each side.
     Rect tightReach(const GSGpu::Setup &setup, uint64_t clampReg, uint32_t width, uint32_t height, bool bilinear)
@@ -534,48 +152,6 @@ namespace
         return Rect{first[0], first[1], last[0], last[1]};
     }
 
-    // One host-to-local transfer, from its BeginTransfer to the next.
-    struct UploadRec
-    {
-        Stream stream;
-        uint32_t dbp = 0, dbw = 0, dpsm = 0, x = 0, y = 0, w = 0, h = 0;
-        uint64_t bytes = 0;
-        uint64_t marker = 0;
-        uint32_t refs = 0;   // blocks that name this record as their writer
-        bool inUse = false;
-        uint64_t payload() const
-        {
-            return combine(combine(stream.finish(), (static_cast<uint64_t>(dpsm) << 40) | (static_cast<uint64_t>(w) << 20) | h), 0x5041594Cull);
-        }
-    };
-
-    // Who wrote a block, as a key ingredient: the payload (bytes, format and size of the transfer), where the texture's pointer sits
-    // relative to the transfer's, and where the transfer put its rectangle inside its buffer.
-    struct WriterEntry
-    {
-        uint64_t payload = 0;
-        int32_t rel = 0;
-        uint16_t dsax = 0, dsay = 0;
-        bool operator<(const WriterEntry &o) const
-        {
-            if (payload != o.payload)
-                return payload < o.payload;
-            if (rel != o.rel)
-                return rel < o.rel;
-            if (dsax != o.dsax)
-                return dsax < o.dsax;
-            return dsay < o.dsay;
-        }
-        bool operator==(const WriterEntry &o) const { return payload == o.payload && rel == o.rel && dsax == o.dsax && dsay == o.dsay; }
-    };
-
-    struct WriterInfo
-    {
-        WriterEntry entry;
-        uint32_t cells = 0;
-        uint32_t dbw = 0, dbp = 0, dpsm = 0, w = 0, h = 0;
-    };
-
     struct Tile
     {
         std::vector<uint8_t> data; // 16 x 16 indices (indexed textures) or RGBA texels (4 bytes each)
@@ -604,17 +180,9 @@ namespace
         uint32_t palette[256] = {};
         uint32_t paletteCount = 0;
         std::vector<WriterEntry> clutWriters;
+        TexKeys::LiveKey live; // the key the renderer gave this texture (task t1b), if the renderer computed one
+        bool hasLive = false;
     };
-
-    struct PngJob
-    {
-        std::string path;
-        uint32_t w = 0, h = 0;
-        int colorType = 6;
-        std::vector<uint8_t> pixels, plte, trns;
-        bool markDone = false; // not an image: write `path` (an empty file) once everything before it is written
-    };
-
     struct UploadAgg
     {
         uint64_t count = 0, bytes = 0;
@@ -629,32 +197,18 @@ namespace
         uint64_t k1 = 0, k2b_i = 0, k2b_c = 0, k2t_i = 0, k2t_c = 0, k2s_i = 0, k2s_c = 0, k3_i = 0, k3_c = 0, k3m_i = 0, k3m_c = 0;
     };
 
-    uint8_t alpha8(uint32_t gsAlpha)
-    {
-        return gsAlpha >= 0x80u ? 255u : static_cast<uint8_t>(gsAlpha * 2u);
-    }
-
-    // texel as the renderer decodes it: r | g << 8 | b << 16 | a << 24 (alpha as the GS sees it, 0x80 = opaque)
-    void texelToRgba8(uint32_t texel, uint8_t *out)
-    {
-        out[0] = static_cast<uint8_t>(texel & 0xFFu);
-        out[1] = static_cast<uint8_t>((texel >> 8) & 0xFFu);
-        out[2] = static_cast<uint8_t>((texel >> 16) & 0xFFu);
-        out[3] = alpha8(texel >> 24);
-    }
 } // namespace
 
 // ------------------------------------------------------------------------------------------------
 struct Census::Impl
 {
     // ---- configuration
-    std::string censusPath, dumpDir, scenePath;
-    bool dump = false, verify = false, statsOn = false;
-    std::string dumpKeyName = "k3m_i";
-    uint32_t dumpMax = 40000, dumpCount = 0;
+    std::string censusPath, scenePath;
+    bool verify = false, statsOn = false;
+    TexKeys::Tracker *tracker = nullptr; // owned by the backend; the census reads writers from it
 
     // ---- output
-    std::FILE *csv = nullptr, *tilesCsv = nullptr, *palCsv = nullptr, *texCsv = nullptr;
+    std::FILE *csv = nullptr, *tilesCsv = nullptr, *palCsv = nullptr;
     uint64_t rowCounter = 0;
     std::string scene = "boot";
     bool finished = false;
@@ -666,28 +220,23 @@ struct Census::Impl
                "mag_u_min,mag_u_max,mag_v_min,mag_v_max,tri_dens_min,tri_dens_max,dynamic,"
                "k2b_i,k2b_c,k2t_i,k2t_c,k2s_i,k2s_c,k3_i,k3_c,k3m_i,k3m_c,"
                "writers,cells,cells_known,main_payload,main_w,main_h,main_psm,main_dbw,main_dbp,main_rel,main_cells,clut_writer,clut_writers,"
-               "used_entries,palette_n";
+               "used_entries,palette_n,"
+               "live_status,live_k3_i,live_x0,live_y0,live_w,live_h,live_writers,live_exact";
     }
 
-    // ---- uploads and the block map
-    std::vector<UploadRec> recs;
-    std::vector<uint32_t> freeRecs;
-    std::vector<uint32_t> blockWriter = std::vector<uint32_t>(kBlocks, 0u); // record index + 1, 0 = unknown
-    int cur = -1;
+    // ---- uploads (the tracker keeps the block map; the census tabulates the transfers)
     std::unordered_map<uint64_t, UploadAgg> uploads;
     uint64_t uploadsDropped = 0; // distinct transfers not tabled once `uploads` is full
     // verify mode
-    std::vector<uint8_t> predicted = std::vector<uint8_t>(kBlocks, 0u);
+    std::vector<uint8_t> predicted = std::vector<uint8_t>(TexKeys::kBlocks, 0u);
     std::vector<uint8_t> beforePages;
     GSGpu::PageSpan beforeSpan;
     uint64_t verifyChunks = 0, verifyChangedBlocks = 0, verifyViolations = 0, verifyPredicted = 0, verifyUnchangedPredicted = 0;
-    std::vector<uint8_t> changedSeen = std::vector<uint8_t>(kBlocks, 0u);
+    std::vector<uint8_t> changedSeen = std::vector<uint8_t>(TexKeys::kBlocks, 0u);
 
     // ---- instances
     std::unordered_map<uint64_t, std::unique_ptr<Instance>> instances;
     std::unordered_map<uint64_t, uint32_t> slotCounts;
-    std::unordered_map<uint64_t, uint32_t> dumpedArea; // dump key -> area of the file written
-    std::unordered_map<uint64_t, std::set<uint64_t>> dumpedPalettes;
 
     // ---- cost
     uint64_t costNs = 0, drawCalls = 0, uploadCalls = 0, lastStatsMarker = 0, curMarker = 0;
@@ -695,102 +244,17 @@ struct Census::Impl
     uint64_t costBeginNs = 0, costAfterNs = 0, costCreateNs = 0, costGrowNs = 0, costPollNs = 0, costCloseNs = 0, instancesCreated = 0, growths = 0, tilesCaptured = 0;
     uint64_t scenesClosed = 0;
 
-    // ---- PNG worker
-    std::thread worker;
-    std::mutex queueMutex;
-    std::condition_variable queueCv;
-    std::deque<PngJob> queue;
-    uint64_t queuedBytes = 0;
-    bool workerStop = false;
-    std::atomic<uint64_t> pngWritten{0};
-
-    Impl() = default;
     ~Impl()
     {
-        stopWorker();
-        for (std::FILE *f : {csv, tilesCsv, palCsv, texCsv})
+        for (std::FILE *f : {csv, tilesCsv, palCsv})
             if (f)
                 std::fclose(f);
     }
 
-    // ---------------------------------------------------------------- worker
-    void startWorker()
-    {
-        worker = std::thread(
-            [this]
-            {
-                for (;;)
-                {
-                    PngJob job;
-                    {
-                        std::unique_lock<std::mutex> lock(queueMutex);
-                        queueCv.wait(lock, [this] { return workerStop || !queue.empty(); });
-                        if (queue.empty())
-                            return;
-                        job = std::move(queue.front());
-                        queue.pop_front();
-                        queuedBytes -= job.pixels.size();
-                    }
-                    if (job.markDone)
-                    {
-                        if (std::FILE *f = std::fopen(job.path.c_str(), "wb"))
-                            std::fclose(f);
-                        continue;
-                    }
-                    const std::vector<uint8_t> png = encodePng(job.w, job.h, job.colorType, job.pixels, job.plte, job.trns);
-                    if (std::FILE *f = std::fopen(job.path.c_str(), "wb"))
-                    {
-                        std::fwrite(png.data(), 1, png.size(), f);
-                        std::fclose(f);
-                        ++pngWritten;
-                    }
-                }
-            });
-    }
-
-    void stopWorker()
-    {
-        if (!worker.joinable())
-            return;
-        {
-            std::lock_guard<std::mutex> lock(queueMutex);
-            workerStop = true;
-        }
-        queueCv.notify_all();
-        worker.join();
-    }
-
-    void enqueue(PngJob &&job)
-    {
-        std::unique_lock<std::mutex> lock(queueMutex);
-        // A scene with thousands of textures closes in one go: do not let the queue grow without limit.
-        while (queuedBytes > (768ull << 20) && !workerStop)
-        {
-            lock.unlock();
-            std::this_thread::sleep_for(std::chrono::milliseconds(2));
-            lock.lock();
-        }
-        queuedBytes += job.pixels.size();
-        queue.push_back(std::move(job));
-        queueCv.notify_one();
-    }
-
     // ---------------------------------------------------------------- uploads
-    void releaseRecord(uint32_t index)
+    // Called by the tracker when a transfer is complete.
+    void transferClosed(const TexKeys::TransferRec &r)
     {
-        UploadRec &r = recs[index];
-        if (r.refs == 0 && r.inUse && static_cast<int>(index) != cur)
-        {
-            r.inUse = false;
-            freeRecs.push_back(index);
-        }
-    }
-
-    void closeCurrent(uint64_t marker)
-    {
-        if (cur < 0)
-            return;
-        UploadRec &r = recs[static_cast<size_t>(cur)];
         const uint64_t payload = r.payload();
         auto found = uploads.find(payload);
         if (found == uploads.end())
@@ -799,9 +263,6 @@ struct Census::Impl
             if (uploads.size() >= 300000u)
             {
                 ++uploadsDropped;
-                const uint32_t index = static_cast<uint32_t>(cur);
-                cur = -1;
-                releaseRecord(index);
                 return;
             }
             found = uploads.emplace(payload, UploadAgg{}).first;
@@ -819,101 +280,26 @@ struct Census::Impl
         }
         ++a.count;
         a.bytes += r.bytes;
-        a.lastMarker = marker;
+        a.lastMarker = curMarker;
         if (a.dbps.size() < 8)
             a.dbps.insert(r.dbp);
-        const uint32_t index = static_cast<uint32_t>(cur);
-        cur = -1;
-        releaseRecord(index);
     }
 
-    void beginTransfer(const GSTransferCommand &c, uint64_t marker)
+    void beginTransfer(const GSTransferCommand &c)
     {
-        closeCurrent(marker);
-        uint32_t index;
-        if (!freeRecs.empty())
-        {
-            index = freeRecs.back();
-            freeRecs.pop_back();
-        }
-        else
-        {
-            index = static_cast<uint32_t>(recs.size());
-            recs.emplace_back();
-        }
-        UploadRec &r = recs[index];
-        r = UploadRec{};
-        r.inUse = true;
-        r.dbp = c.bitbltbuf.dbp;
-        r.dbw = std::max<uint32_t>(c.bitbltbuf.dbw, 1u);
-        r.dpsm = c.bitbltbuf.dpsm;
-        r.x = c.trxpos.dsax;
-        r.y = c.trxpos.dsay;
-        r.w = c.trxreg.rrw;
-        r.h = c.trxreg.rrh;
-        r.marker = marker;
-        cur = static_cast<int>(index);
-        if (verify)
-            std::fill(predicted.begin(), predicted.end(), 0);
-        forEachBlock(r.dpsm, r.dbp, r.dbw, r.x, r.y, r.w, r.h,
-                     [&](uint32_t block)
-                     {
-                         const uint32_t old = blockWriter[block];
-                         if (old != 0u)
-                         {
-                             UploadRec &o = recs[old - 1u];
-                             if (o.refs > 0)
-                                 --o.refs;
-                             releaseRecord(old - 1u);
-                         }
-                         blockWriter[block] = index + 1u;
-                         ++r.refs;
-                         if (verify)
-                             predicted[block] = 1;
-                     });
-        if (verify)
-        {
-            std::fill(changedSeen.begin(), changedSeen.end(), 0);
-            for (uint8_t p : predicted)
-                verifyPredicted += p;
-        }
+        if (!verify)
+            return;
+        std::fill(predicted.begin(), predicted.end(), 0);
+        const TexKeys::TransferRec *r = tracker->CurrentTransfer();
+        if (r)
+            TexKeys::ForEachBlock(r->dpsm, r->dbp, r->dbw, static_cast<int>(r->x), static_cast<int>(r->y), static_cast<int>(r->w), static_cast<int>(r->h),
+                                  [&](uint32_t block, int, int, int, int) { predicted[block] = 1; });
+        std::fill(changedSeen.begin(), changedSeen.end(), 0);
+        for (uint8_t p : predicted)
+            verifyPredicted += p;
+        (void)c;
     }
 
-    // Which transfer wrote the blocks of a rectangle of a texture (or CLUT), added to `out` (with the number of blocks each wrote).
-    void collectWriters(uint32_t psm, uint32_t tbp, uint32_t tbw, int x0, int y0, int x1, int y1, std::vector<WriterInfo> &out, uint32_t &cells,
-                        uint32_t &known)
-    {
-        forEachBlock(psm, tbp, tbw, x0, y0, x1 - x0 + 1, y1 - y0 + 1,
-                     [&](uint32_t block)
-                     {
-                         ++cells;
-                         const uint32_t w = blockWriter[block];
-                         if (w == 0u)
-                             return;
-                         ++known;
-                         const UploadRec &r = recs[w - 1u];
-                         WriterEntry e;
-                         e.payload = r.payload();
-                         e.rel = static_cast<int32_t>(tbp) - static_cast<int32_t>(r.dbp);
-                         e.dsax = static_cast<uint16_t>(r.x);
-                         e.dsay = static_cast<uint16_t>(r.y);
-                         for (WriterInfo &wi : out)
-                             if (wi.entry == e)
-                             {
-                                 ++wi.cells;
-                                 return;
-                             }
-                         WriterInfo wi;
-                         wi.entry = e;
-                         wi.cells = 1;
-                         wi.dbw = r.dbw;
-                         wi.dbp = r.dbp;
-                         wi.dpsm = r.dpsm;
-                         wi.w = r.w;
-                         wi.h = r.h;
-                         out.push_back(wi);
-                     });
-    }
 
     // ---------------------------------------------------------------- instances
     static uint32_t readTexel(GSMem::TexturePageCache &cache, const uint8_t *vram, const Instance &I, const GSTexaReg &texa, uint32_t u, uint32_t v)
@@ -990,6 +376,11 @@ struct Census::Impl
         I.four = GSTexel::isFourBitIndexedPsm(t.psm);
         I.indexed = I.four || GSTexel::isEightBitIndexedPsm(t.psm);
         I.firstMarker = d.marker;
+        if (d.live)
+        {
+            I.live = *d.live;
+            I.hasLive = true;
+        }
         if (I.indexed)
         {
             I.cpsm = t.cpsm;
@@ -1004,7 +395,7 @@ struct Census::Impl
             // who wrote the CLUT: 16 x 16 entries for 8 bit textures, 8 x 2 for 4 bit (CSM1 layout)
             std::vector<WriterInfo> cw;
             uint32_t cells = 0, known = 0;
-            collectWriters(t.cpsm, t.cbp, 1, 0, 0, I.four ? 8 : 16, I.four ? 2 : 16, cw, cells, known);
+            tracker->CollectWriters(t.cpsm, t.cbp, 1, 0, 0, I.four ? 8 : 16, I.four ? 2 : 16, cw, cells, known);
             for (const WriterInfo &w : cw)
                 I.clutWriters.push_back(w.entry);
         }
@@ -1129,10 +520,10 @@ struct Census::Impl
         } growTimer{costGrowNs, tGrow, growths};
         I.lastGuard = G;
         I.lastTight = T;
-        I.tight = unite(I.tight, T);
+        I.tight = Unite(I.tight, T);
         if (I.dynamic == 0 && !I.indexed && G.area() > 65536)
             I.dynamic = 2;
-        const Rect grown = unite(I.guard, G);
+        const Rect grown = Unite(I.guard, G);
         const bool guardGrew = !(grown == I.guard);
         I.guard = grown;
         if (I.dynamic != 0 || G.empty())
@@ -1150,7 +541,7 @@ struct Census::Impl
                 const int x0 = std::max(tx * static_cast<int>(kTile), 0), y0 = std::max(ty * static_cast<int>(kTile), 0);
                 const int x1 = std::min(tx * static_cast<int>(kTile) + static_cast<int>(kTile) - 1, static_cast<int>(I.w) - 1);
                 const int y1 = std::min(ty * static_cast<int>(kTile) + static_cast<int>(kTile) - 1, static_cast<int>(I.h) - 1);
-                collectWriters(I.psm, I.tbp, I.tbw, x0, y0, x1, y1, I.writers, I.cells, I.cellsKnown);
+                tracker->CollectWriters(I.psm, I.tbp, I.tbw, x0, y0, x1, y1, I.writers, I.cells, I.cellsKnown);
             }
     }
 
@@ -1312,22 +703,13 @@ struct Census::Impl
             s += "0,0,0,0,0,0,0,0,";
         appendf(s, "%016llx,%u,%u,%u", static_cast<unsigned long long>(I.clutWriters.empty() ? 0ull : I.clutWriters[0].payload),
                 static_cast<uint32_t>(I.clutWriters.size()), usedEntries, I.paletteCount);
+        // the live key (task t1b): the key the renderer gave this texture when it was created
+        if (I.hasLive)
+            appendf(s, ",%d,%016llx,%d,%d,%d,%d,%u,%d", static_cast<int>(I.live.status), static_cast<unsigned long long>(I.live.k3i), I.live.rect.x0, I.live.rect.y0,
+                    I.live.rect.width(), I.live.rect.height(), I.live.writers, I.live.exact ? 1 : 0);
+        else
+            s += ",-1,0,0,0,0,0,0,0";
         return s;
-    }
-
-    static uint64_t pickKey(const KeySet &k, const std::string &name)
-    {
-        if (name == "k1") return k.k1;
-        if (name == "k2b_i") return k.k2b_i;
-        if (name == "k2b_c") return k.k2b_c;
-        if (name == "k2t_i") return k.k2t_i;
-        if (name == "k2t_c") return k.k2t_c;
-        if (name == "k2s_i") return k.k2s_i;
-        if (name == "k2s_c") return k.k2s_c;
-        if (name == "k3_i") return k.k3_i;
-        if (name == "k3_c") return k.k3_c;
-        if (name == "k3m_c") return k.k3m_c;
-        return k.k3m_i;
     }
 
     void writeSidecars(uint64_t id, const Instance &I, const std::bitset<256> &usedGuard)
@@ -1406,120 +788,6 @@ struct Census::Impl
         }
     }
 
-    // ---------------------------------------------------------------- the dumper
-    void buildImages(const Instance &I, const Rect &r, std::vector<uint8_t> &rgba, std::vector<uint8_t> &idx) const
-    {
-        const size_t w = static_cast<size_t>(r.x1 - r.x0 + 1), h = static_cast<size_t>(r.y1 - r.y0 + 1);
-        rgba.assign(w * h * 4u, 0);
-        if (I.indexed)
-            idx.assign(w * h, 0);
-        for (int y = r.y0; y <= r.y1; ++y)
-            for (int x = r.x0; x <= r.x1; ++x)
-            {
-                const auto it = I.tiles.find(static_cast<uint32_t>(y / static_cast<int>(kTile)) * kTilesPerSide + static_cast<uint32_t>(x / static_cast<int>(kTile)));
-                if (it == I.tiles.end())
-                    continue;
-                const size_t texel = static_cast<size_t>(y % kTile) * kTile + static_cast<size_t>(x % kTile);
-                const size_t o = static_cast<size_t>(y - r.y0) * w + static_cast<size_t>(x - r.x0);
-                if (I.indexed)
-                {
-                    const uint8_t index = it->second.data[texel];
-                    idx[o] = index;
-                    texelToRgba8(I.palette[index], &rgba[o * 4u]);
-                }
-                else
-                {
-                    uint32_t px;
-                    std::memcpy(&px, &it->second.data[texel * 4u], 4);
-                    texelToRgba8(px, &rgba[o * 4u]);
-                }
-            }
-    }
-
-    // Returns the file name written (without folder), or empty.
-    std::string maybeDump(const Instance &I, const KeySet &k)
-    {
-        if (!dump || I.dynamic != 0 || I.guard.empty() || dumpCount >= dumpMax)
-            return {};
-        uint64_t key = pickKey(k, dumpKeyName);
-        if (key == 0)
-            key = k.k2b_i;
-        if (key == 0)
-            return {};
-        const uint32_t area = static_cast<uint32_t>(std::min<int64_t>(I.guard.area(), 0x7FFFFFFF));
-        char name[64];
-        std::snprintf(name, sizeof(name), "%016llx", static_cast<unsigned long long>(key));
-        auto found = dumpedArea.find(key);
-        const bool first = found == dumpedArea.end();
-        std::vector<uint8_t> rgba, idx;
-        const uint32_t w = static_cast<uint32_t>(I.guard.x1 - I.guard.x0 + 1), h = static_cast<uint32_t>(I.guard.y1 - I.guard.y0 + 1);
-        if (first || area > found->second)
-        {
-            buildImages(I, I.guard, rgba, idx);
-            PngJob colour;
-            colour.path = dumpDir + "/" + name + ".png";
-            colour.w = w;
-            colour.h = h;
-            colour.colorType = 6;
-            colour.pixels = rgba;
-            enqueue(std::move(colour));
-            if (I.indexed)
-            {
-                PngJob index;
-                index.path = dumpDir + "/" + name + "_idx.png";
-                index.w = w;
-                index.h = h;
-                index.colorType = 3;
-                index.pixels = idx;
-                for (uint32_t i = 0; i < 256u; ++i)
-                {
-                    uint8_t px[4];
-                    texelToRgba8(I.palette[i], px);
-                    index.plte.insert(index.plte.end(), {px[0], px[1], px[2]});
-                    index.trns.push_back(px[3]);
-                }
-                enqueue(std::move(index));
-                PngJob pal;
-                pal.path = dumpDir + "/" + name + "_pal.png";
-                pal.w = 16u * 8u;
-                pal.h = (I.paletteCount / 16u) * 8u;
-                pal.colorType = 6;
-                pal.pixels.assign(static_cast<size_t>(pal.w) * pal.h * 4u, 0);
-                for (uint32_t i = 0; i < I.paletteCount; ++i)
-                {
-                    uint8_t px[4];
-                    texelToRgba8(I.palette[i], px);
-                    for (uint32_t yy = 0; yy < 8u; ++yy)
-                        for (uint32_t xx = 0; xx < 8u; ++xx)
-                            std::memcpy(&pal.pixels[((static_cast<size_t>(i / 16u) * 8u + yy) * pal.w + (i % 16u) * 8u + xx) * 4u], px, 4);
-                }
-                enqueue(std::move(pal));
-                dumpedPalettes[key].insert(I.clutHash);
-            }
-            dumpedArea[key] = area;
-            ++dumpCount;
-            return std::string(name) + ".png";
-        }
-        // the same key, another colouring of an indexed texture: keep the coloured picture (up to eight per key)
-        if (I.indexed && dumpedPalettes[key].size() < 8 && !dumpedPalettes[key].count(I.clutHash))
-        {
-            dumpedPalettes[key].insert(I.clutHash);
-            buildImages(I, I.guard, rgba, idx);
-            PngJob colour;
-            char variant[96];
-            std::snprintf(variant, sizeof(variant), "%s__%08llx.png", name, static_cast<unsigned long long>(I.clutHash & 0xFFFFFFFFull));
-            colour.path = dumpDir + "/" + variant;
-            colour.w = w;
-            colour.h = h;
-            colour.colorType = 6;
-            colour.pixels = std::move(rgba);
-            enqueue(std::move(colour));
-            ++dumpCount;
-            return variant;
-        }
-        return {};
-    }
-
     // ---------------------------------------------------------------- scenes
     void writeUploads()
     {
@@ -1559,14 +827,11 @@ struct Census::Impl
             if (csv)
                 std::fprintf(csv, "%s\n", row.c_str());
             writeSidecars(id, I, usedGuard);
-            const std::string file = maybeDump(I, keys);
-            if (!file.empty() && texCsv)
-                std::fprintf(texCsv, "%s,%s\n", file.c_str(), row.c_str());
         }
         instances.clear();
         slotCounts.clear();
         ++scenesClosed;
-        for (std::FILE *f : {csv, tilesCsv, palCsv, texCsv})
+        for (std::FILE *f : {csv, tilesCsv, palCsv})
             if (f)
                 std::fflush(f);
         if (final)
@@ -1585,15 +850,7 @@ struct Census::Impl
 
     void markDone()
     {
-        const std::string path = censusPath + ".done";
-        if (worker.joinable())
-        {
-            PngJob job;
-            job.path = path;
-            job.markDone = true;
-            enqueue(std::move(job));
-        }
-        else if (std::FILE *f = std::fopen(path.c_str(), "wb"))
+        if (std::FILE *f = std::fopen((censusPath + ".done").c_str(), "wb"))
             std::fclose(f);
     }
 
@@ -1623,7 +880,6 @@ struct Census::Impl
         }
     }
 };
-
 // ------------------------------------------------------------------------------------------------
 Census::Census() : m(std::make_unique<Impl>()) {}
 
@@ -1632,37 +888,22 @@ Census::~Census()
     Finish();
 }
 
-std::unique_ptr<Census> Census::FromEnvironment()
+std::unique_ptr<Census> Census::FromEnvironment(TexKeys::Tracker &tracker)
 {
     const char *censusEnv = std::getenv("PS2X_TEX_CENSUS");
-    const char *dumpEnv = std::getenv("PS2X_TEX_DUMP");
-    const bool haveCensus = censusEnv && censusEnv[0] != '\0';
-    const bool haveDump = dumpEnv && dumpEnv[0] != '\0';
-    if (!haveCensus && !haveDump)
+    if (!censusEnv || censusEnv[0] == '\0')
         return nullptr;
     std::unique_ptr<Census> c(new Census());
     Impl &m = *c->m;
-    m.dump = haveDump;
-    if (haveDump)
-        m.dumpDir = dumpEnv;
-    while (!m.dumpDir.empty() && (m.dumpDir.back() == '/' || m.dumpDir.back() == '\\'))
-        m.dumpDir.pop_back();
-    m.censusPath = haveCensus ? std::string(censusEnv) : m.dumpDir + "/census.csv";
+    m.tracker = &tracker;
+    m.censusPath = censusEnv;
     m.scenePath = m.censusPath + ".scene";
-    if (const char *key = std::getenv("PS2X_TEX_DUMP_KEY"))
-        if (key[0] != '\0')
-            m.dumpKeyName = key;
-    if (const char *max = std::getenv("PS2X_TEX_DUMP_MAX"))
-        if (std::atol(max) > 0)
-            m.dumpMax = static_cast<uint32_t>(std::atol(max));
     const char *stats = std::getenv("PS2X_TEX_CENSUS_STATS");
     m.statsOn = stats && stats[0] == '1';
     const char *verify = std::getenv("PS2X_TEX_CENSUS_VERIFY");
     m.verify = verify && verify[0] == '1';
     std::error_code ec;
     std::filesystem::create_directories(std::filesystem::path(m.censusPath).parent_path(), ec);
-    if (m.dump)
-        std::filesystem::create_directories(m.dumpDir, ec);
     std::filesystem::remove(m.censusPath + ".done", ec);
     m.csv = std::fopen(m.censusPath.c_str(), "w");
     m.tilesCsv = std::fopen((m.censusPath + ".tiles.csv").c_str(), "w");
@@ -1677,15 +918,9 @@ std::unique_ptr<Census> Census::FromEnvironment()
         std::fprintf(m.tilesCsv, "row,tx,ty,raw_hash,rgba_hash,distinct,cov\n");
     if (m.palCsv)
         std::fprintf(m.palCsv, "row,clut_hash,n,palette,hist\n");
-    if (m.dump)
-    {
-        m.texCsv = std::fopen((m.dumpDir + "/textures.csv").c_str(), "w");
-        if (m.texCsv)
-            std::fprintf(m.texCsv, "file,%s\n", Impl::header());
-        m.startWorker();
-    }
-    std::fprintf(stderr, "[tex:census] on: census %s%s%s, scene file %s%s\n", m.censusPath.c_str(), m.dump ? ", dump " : "", m.dump ? m.dumpDir.c_str() : "",
-                 m.scenePath.c_str(), m.verify ? ", verifying the block map" : "");
+    Impl *impl = &m;
+    tracker.SetCloseCallback([impl](const TexKeys::TransferRec &r) { impl->transferClosed(r); });
+    std::fprintf(stderr, "[tex:census] on: census %s, scene file %s%s\n", m.censusPath.c_str(), m.scenePath.c_str(), m.verify ? ", verifying the block map" : "");
     return c;
 }
 
@@ -1694,7 +929,7 @@ void Census::BeginTransfer(const GSTransferCommand &command)
     if (command.direction != 0u)
         return;
     const uint64_t t0 = nowNs();
-    m->beginTransfer(command, m->curMarker);
+    m->beginTransfer(command);
     m->costBeginNs += nowNs() - t0;
     m->costNs += nowNs() - t0;
 }
@@ -1702,24 +937,21 @@ void Census::BeginTransfer(const GSTransferCommand &command)
 void Census::BeforeUpload(const uint8_t *vram)
 {
     Impl &s = *m;
-    if (!s.verify || s.cur < 0 || !vram)
+    if (!s.verify || !vram)
         return;
-    const UploadRec &r = s.recs[static_cast<size_t>(s.cur)];
-    s.beforeSpan = GSGpu::BufferPageSpan(r.dpsm, r.dbp, r.dbw, r.x, r.y, r.w, r.h);
+    const TexKeys::TransferRec *r = s.tracker->CurrentTransfer();
+    if (!r)
+        return;
+    s.beforeSpan = GSGpu::BufferPageSpan(r->dpsm, r->dbp, r->dbw, r->x, r->y, r->w, r->h);
     s.beforePages.resize(static_cast<size_t>(s.beforeSpan.count) * 8192u);
     for (uint32_t i = 0; i < s.beforeSpan.count; ++i)
         std::memcpy(&s.beforePages[static_cast<size_t>(i) * 8192u], vram + static_cast<size_t>((s.beforeSpan.first + i) & 511u) * 8192u, 8192u);
 }
 
-void Census::AfterUpload(const uint8_t *vram, const uint8_t *data, uint32_t bytes)
+void Census::AfterUpload(const uint8_t *vram)
 {
     Impl &s = *m;
-    if (s.cur < 0)
-        return;
     const uint64_t t0 = nowNs();
-    UploadRec &r = s.recs[static_cast<size_t>(s.cur)];
-    r.stream.update(data, bytes);
-    r.bytes += bytes;
     ++s.uploadCalls;
     if (s.verify && vram && !s.beforePages.empty())
     {
@@ -1748,15 +980,6 @@ void Census::AfterUpload(const uint8_t *vram, const uint8_t *data, uint32_t byte
     s.costNs += nowNs() - t0;
 }
 
-void Census::MemoryReset()
-{
-    Impl &s = *m;
-    std::fill(s.blockWriter.begin(), s.blockWriter.end(), 0u);
-    s.recs.clear();
-    s.freeRecs.clear();
-    s.cur = -1;
-}
-
 void Census::Draw(const DrawInfo &draw)
 {
     const uint64_t t0 = nowNs();
@@ -1780,10 +1003,9 @@ void Census::Marker(uint64_t marker)
     if (s.statsOn && marker - s.lastStatsMarker >= 600u)
     {
         s.lastStatsMarker = marker;
-        std::fprintf(stderr, "[tex:census] marker %llu: %zu instances live, %llu rows, cost %.1f ms (%llu draws, %llu uploads), png queue %.1f MB, written %llu\n",
+        std::fprintf(stderr, "[tex:census] marker %llu: %zu instances live, %llu rows, cost %.1f ms (%llu draws, %llu uploads)\n",
                      static_cast<unsigned long long>(marker), s.instances.size(), static_cast<unsigned long long>(s.rowCounter), static_cast<double>(s.costNs) / 1.0e6,
-                     static_cast<unsigned long long>(s.drawCalls), static_cast<unsigned long long>(s.uploadCalls), static_cast<double>(s.queuedBytes) / 1048576.0,
-                     static_cast<unsigned long long>(s.pngWritten));
+                     static_cast<unsigned long long>(s.drawCalls), static_cast<unsigned long long>(s.uploadCalls));
         std::fprintf(stderr,
                      "[tex:census]   cost split ms: transfers begin %.1f, upload data %.1f, new instances %.1f (%llu), growth %.1f (%llu growths, %llu tiles read), scene poll %.1f, scene closes %.1f\n",
                      static_cast<double>(s.costBeginNs) / 1.0e6, static_cast<double>(s.costAfterNs) / 1.0e6, static_cast<double>(s.costCreateNs) / 1.0e6,
@@ -1801,8 +1023,7 @@ void Census::Finish()
     s.finished = true;
     s.closeScene(true);
     s.markDone();
-    s.stopWorker();
-    for (std::FILE *f : {s.csv, s.tilesCsv, s.palCsv, s.texCsv})
+    for (std::FILE *f : {s.csv, s.tilesCsv, s.palCsv})
         if (f)
             std::fflush(f);
 }

@@ -481,6 +481,51 @@ void register_mod_manager_tests()
             t.IsTrue(contains(absolute.error, "absolute"), absolute.error);
         });
 
+        tc.Run("readPackageEntryAt reads stored, deflated and empty entries without the central directory, and checks them", [](TestCase &t)
+        {
+            std::string big;
+            for (int i = 0; i < 3000; ++i)
+                big += "texture " + std::to_string(i % 17) + " ";
+            Files files = {{"mod.toml", tomlFor("rd.mod")}, {"assets/big.txt", big}, {"assets/small.bin", std::string("\x01\x02\x03", 3)}, {"assets/empty.bin", ""}};
+            for (int i = 0; i < 200; ++i)
+                files.emplace_back("assets/f" + std::to_string(i) + ".txt", "file " + std::to_string(i * 7919));
+            fs::path dir = tempDir("readat");
+            const fs::path file = dir / "rd.fprmod";
+            auto zip = buildPackage(files);
+            t.IsTrue(zip.has_value() && writeBytesToFile(file, *zip), "package written");
+            PackageResult read = readPackage(file);
+            t.IsTrue(read.package.has_value(), "package reads: " + read.error);
+            if (!read.package)
+                return;
+            auto find = [&](const std::string &name) -> const PackageEntry * { return read.package->find(name); };
+            for (const auto &f : files)
+            {
+                if (f.first == "mod.toml")
+                    continue;
+                const PackageEntry *entry = find(f.first);
+                t.IsTrue(entry != nullptr, "entry listed: " + f.first);
+                if (!entry)
+                    continue;
+                std::string error;
+                auto bytes = readPackageEntryAt(file, *entry, 1 << 20, &error);
+                t.IsTrue(bytes.has_value() && std::string(bytes->begin(), bytes->end()) == f.second, "the same bytes as put in: " + f.first + " " + error);
+            }
+            const PackageEntry *entry = find("assets/big.txt");
+            t.IsTrue(entry && entry->method == 8 && entry->packedSize < entry->size, "the big file is deflated");
+            std::string error;
+            t.IsFalse(readPackageEntryAt(file, *entry, 100, &error).has_value(), "over the byte limit");
+            PackageEntry wrong = *entry;
+            wrong.crc32 ^= 1;
+            t.IsFalse(readPackageEntryAt(file, wrong, 1 << 20, &error).has_value(), "a wrong checksum is refused");
+            t.IsTrue(error.find("checksum") != std::string::npos, "says so: " + error);
+            wrong = *entry;
+            wrong.localOffset += 5;
+            t.IsFalse(readPackageEntryAt(file, wrong, 1 << 20, &error).has_value(), "a wrong place is refused");
+            t.IsFalse(readPackageEntryAt(dir / "none.fprmod", *entry, 1 << 20, &error).has_value(), "a missing file");
+            std::error_code ec;
+            fs::remove_all(dir, ec);
+        });
+
         tc.Run("names that differ only in capitals are refused", [](TestCase &t)
         {
             const fs::path dir = tempDir("pkg_case");
@@ -1063,6 +1108,30 @@ void register_mod_manager_tests()
             t.Equals(conflicts.size(), static_cast<size_t>(1), "one shared path");
             if (!conflicts.empty())
                 t.IsTrue(conflicts[0].path == "assets/shared.txt" && conflicts[0].providers.size() == 2, "it is assets/shared.txt, with both mods");
+
+            // The listing the texture packs index their files with: every content path once, with the mod that wins it.
+            const auto assets = env.manager.sessionFiles("assets/");
+            t.Equals(assets.size(), static_cast<size_t>(3), "three asset paths");
+            bool listingOk = assets.size() == 3;
+            if (listingOk)
+            {
+                listingOk = assets[0].path == "assets/only-a.txt" && assets[0].modId == "aaa.mod" && assets[0].order == 0 &&
+                            assets[1].path == "assets/only-b.txt" && assets[1].modId == "bbb.mod" && assets[1].order == 1 &&
+                            assets[2].path == "assets/shared.txt" && assets[2].modId == "bbb.mod" && assets[2].order == 1;
+            }
+            t.IsTrue(listingOk, "sorted by path, the winner of each, its load order position");
+            t.Equals(env.manager.sessionFiles("assets/sh").size(), static_cast<size_t>(1), "a longer prefix");
+            t.Equals(env.manager.sessionFiles("data/").size(), static_cast<size_t>(1), "another content folder");
+            t.IsTrue(env.manager.sessionFiles("textures/").empty() && env.manager.sessionFiles("misc/").empty(), "nothing there, and misc/ is not a content folder");
+
+            // Notes the running game attaches to a mod (a refused texture), kept once and capped.
+            env.manager.addRuntimeNote("aaa.mod", "0123.png is too big");
+            env.manager.addRuntimeNote("aaa.mod", "0123.png is too big");
+            t.Equals(env.manager.runtimeNotes("aaa.mod").size(), static_cast<size_t>(1), "a repeated note is kept once");
+            for (int i = 0; i < 40; ++i)
+                env.manager.addRuntimeNote("aaa.mod", "note " + std::to_string(i));
+            t.Equals(env.manager.runtimeNotes("aaa.mod").size(), Manager::kMaxRuntimeNotes, "capped");
+            t.IsTrue(env.manager.runtimeNotes("bbb.mod").empty(), "per mod");
 
             // A mod that is off still shows its pictures to the manager.
             std::string error;

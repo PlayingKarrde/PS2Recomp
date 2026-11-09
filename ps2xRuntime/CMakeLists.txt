@@ -449,6 +449,10 @@ if(NOT PS2X_IS_VITA)
     target_sources(ps2_runtime PRIVATE src/lib/gs/gs_gpu_backend.cpp)
     # The texture census and dumper (task t1a; opt-in through PS2X_TEX_CENSUS / PS2X_TEX_DUMP). No SDL; nothing generated code includes refers to it.
     target_sources(ps2_runtime PRIVATE src/lib/gs/gs_tex_census.cpp)
+    # Texture replacement and the dumper for texture authors (task t1b): the key tracker, the PNG codec, the dumper and the pack store.
+    # Plain C++ with no SDL; nothing generated code includes refers to them. (The tracker, PNG codec and store are compiled for every
+    # build that has the GPU renderer, whether or not mods are built: a pack can also come from a folder, PS2X_TEX_PACK_DIR.)
+    target_sources(ps2_runtime PRIVATE src/lib/gs/gs_tex_keys.cpp src/lib/gs/gs_png.cpp src/lib/gs/gs_tex_dump.cpp src/lib/gs/gs_tex_pack.cpp)
     # M3: the main-thread presenter of the direct picture path (its compiled shaders) and the code that chooses and
     # wires up the GPU renderer for the game (it asks the host presenter for its device).
     target_sources(ps2_runtime PRIVATE src/lib/gs/gs_gpu_present.cpp src/lib/gs/gs_gpu_host.cpp)

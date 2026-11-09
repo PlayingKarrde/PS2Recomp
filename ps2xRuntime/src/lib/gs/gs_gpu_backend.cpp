@@ -78,12 +78,16 @@
 #include "runtime/gs/gs_presentation.h"
 #include "runtime/gs/gs_recording.h"
 #include "runtime/gs/gs_tex_census.h"
+#include "runtime/gs/gs_tex_dump.h"
+#include "runtime/gs/gs_tex_keys.h"
+#include "runtime/gs/gs_tex_pack.h"
 #include "runtime/gs/gs_texel.h"
 #include "runtime/gs/ps2_gs_memory.h"
 #include "runtime/gs/ps2_gs_transfer.h"
 
 #include "gpu/gpu_shaders.h"
 #include "shaders/compiled/gs_frag.h"
+#include "shaders/compiled/gs_rep_frag.h"
 #include "shaders/compiled/gszcopy_frag.h"
 #include "shaders/compiled/gs_vert.h"
 
@@ -155,6 +159,22 @@ namespace
         return (v + a - 1u) & ~(a - 1u);
     }
 
+    // What the texture packs make of a texture (task t1b; gs_tex_keys.h, gs_tex_pack.h). Decided when a draw first uses the texture.
+    struct TexRep
+    {
+        bool keyed = false;
+        enum class State : uint8_t { None, Pending, Attached } state = State::None;
+        uint64_t storeGeneration = 0;      // the store's generation that `state` was decided under
+        TexKeys::LiveKey key;              // the live key; for a fallback key `key.rect` is the tile rectangle
+        uint64_t primary = 0, k3c = 0;     // the key the files are named by, and the colouring key (0: none)
+        bool fallback = false;
+        uint32_t paletteCount = 0;         // indexed textures: 16 or 256
+        std::shared_ptr<std::array<uint32_t, 256>> palette; // indexed textures: the resolved palette
+        uint64_t repId = 0;                // Attached: the replacement picture's id in Impl::repTextures
+        int scale = 0;
+        bool index = false;
+    };
+
     // A cached GPU texture. It is created at the size the game declared, but its texels are decoded from GS memory
     // only where a draw can reach them (see the texture cache comment at the top): `tiles` says which 16 x 16 texel
     // tiles hold texels, and the rest of the GPU texture is undefined and never sampled.
@@ -170,7 +190,37 @@ namespace
         // A tile-aligned rectangle (inclusive) of which every tile is decoded: a draw whose reach lies inside it needs
         // nothing, which is checked without looking at the tile map (most draws reuse an area some draw already decoded).
         TexelRect validRect;
+        TexRep rep;
     };
+
+    // A replacement picture on the GPU: S times the replaced rectangle, RGBA8 or (an index image) R8.
+    struct RepGpu
+    {
+        SDL_GPUTexture *tex = nullptr;
+        uint32_t w = 0, h = 0;
+        int scale = 1;
+        TexPack::Kind kind = TexPack::Kind::Rgba;
+        uint64_t bytes = 0;
+        uint64_t lastUsedFlush = 0;
+    };
+
+    // What a draw that uses a replacement needs besides the usual uniforms: the picture, its rectangle and scale, the palette.
+    struct RepDraw
+    {
+        SDL_GPUTexture *tex = nullptr;
+        uint32_t info[4] = {0, 0, 0, 0}; // x: rect x0 | y0 << 16, y: rect w | h << 16, z: S | kind << 8, w: palette mask
+        std::shared_ptr<std::array<uint32_t, 256>> palette;
+        bool same(const RepDraw &o) const { return tex == o.tex && palette == o.palette && std::memcmp(info, o.info, sizeof(info)) == 0; }
+    };
+
+    // The uniform block of gs_rep.frag.hlsl: the usual block, then the replacement's.
+    struct RepUniforms
+    {
+        FragUniforms base;
+        uint32_t info[4];
+        uint32_t palette[256];
+    };
+    static_assert(sizeof(RepUniforms) == 64 + 16 + 1024, "gs_rep.frag.hlsl: four-component members only");
 
     struct SigKey
     {
@@ -253,6 +303,7 @@ namespace
         FragUniforms uniforms{};
         SDL_GPUTexture *texture = nullptr; // nullptr: the 1x1 white dummy
         int32_t sx = 0, sy = 0, sw = 0, sh = 0; // scissor, in target pixels
+        uint32_t rep = 0;                  // 1 + the index of the draw's RepDraw in Impl::repDraws; 0: not replaced (gs.frag.hlsl)
     };
 
     SDL_GPUBlendFactor toSdl(BlendFactor f)
@@ -293,6 +344,7 @@ namespace
 
     // Pipeline state packed into 16 bits: blend factors and op, whether blending is on, depth compare, depth write.
     constexpr uint32_t kZRestoreKey = 1u << 12; // the pipeline that copies decoded Z pages into the depth target
+    constexpr uint32_t kRepKey = 1u << 13;      // the pipeline for textures a pack replaces (gs_rep.frag.hlsl, two samplers)
 
     uint32_t pipelineKey(const BlendState &blend, uint32_t compare, bool depthWrite)
     {
@@ -301,13 +353,21 @@ namespace
     }
 }
 
-// The texture census (PS2X_TEX_CENSUS, PS2X_TEX_DUMP; task t1a, gs_tex_census.h) is a file-scope pointer, not a member of Impl, so that
-// Impl (and the draw path's view of it) is exactly what it was without the census: a null pointer, one test per hook. One backend
-// per process owns it (the game and the replayer create one); a second backend would find it taken and run without.
+// The texture tools (tasks t1a and t1b) are file-scope pointers, not members of Impl, so that Impl (and the draw path's view of it) is
+// what it was without them: a null pointer and one test per hook. `keys` (the key tracker, gs_tex_keys.h) exists when anything
+// needs it: a texture pack (gs_tex_pack.h), the dumper (PS2X_TEX_DUMP, gs_tex_dump.h) or the census (PS2X_TEX_CENSUS, gs_tex_census.h).
+// One backend per process owns them (the game and the replayer create one); a second backend would find them taken and run without.
 namespace
 {
+    std::unique_ptr<TexKeys::Tracker> gKeys;
     std::unique_ptr<TexCensus::Census> gCensus;
-    TexCensus::Census *census = nullptr; // gCensus.get(), set by the backend that owns it
+    std::unique_ptr<TexDump::Dumper> gDump;
+    std::shared_ptr<TexPack::Store> gStore;
+    TexKeys::Tracker *keys = nullptr;
+    TexCensus::Census *census = nullptr;
+    TexDump::Dumper *dumper = nullptr;
+    TexPack::Store *packStore = nullptr; // null when no pack is loaded (the usual case)
+    bool gTexToolsInit = false;
 }
 
 struct GSGpuBackend::Impl
@@ -368,7 +428,7 @@ struct GSGpuBackend::Impl
     mutable std::mutex mutex;
     Stats stats;
     bool ready = false;
-    bool ownsCensus = false;
+    bool ownsTexTools = false;
 
     // ---- GS memory image and the state outside it
     uint8_t *vram = nullptr;
@@ -397,6 +457,23 @@ struct GSGpuBackend::Impl
     std::vector<FrameTarget> frames;
     std::vector<DepthTarget> depths;
     uint64_t frameTargetBytes = 0, depthTargetBytes = 0, fieldTextureBytes = 0;
+
+    // ---- texture replacement (task t1b)
+    SDL_GPUShader *repShader = nullptr;
+    std::unordered_map<uint64_t, RepGpu> repTextures; // by RepGpu id (a hash of the picture's path)
+    uint64_t repBytes = 0, repBudget = 512ull << 20;
+    std::vector<RepDraw> repDraws; // this flush's
+    std::atomic<uint32_t> repDrawsFrame{0}, repTexturesFrame{0}; // of the last completed frame
+    uint32_t repDrawsNow = 0;
+    std::vector<uint64_t> repSeenNow; // ids of the replacements drawn since the last marker (small)
+    std::atomic<uint64_t> repGpuBytesShared{0};
+    uint64_t repGeneration = 0; // the store generation the replacement pictures on the GPU belong to
+    std::string repReloadTrigger; // PS2X_TEX_PACK_RELOAD_FILE: when this file appears the packs are reloaded and the file is deleted
+    void prepareReplacement(GpuTexture &g, const GSDrawState &state, const Setup &setup);
+    void keyTexture(GpuTexture &g, const GSDrawState &state, const Setup &setup);
+    void lookupReplacement(GpuTexture &g, const GSDrawState &state);
+    RepGpu *replacementGpu(const TexPack::Lookup &lookup);
+    uint32_t addRepDraw(const GpuTexture &g);
 
     // ---- texture cache
     std::unordered_map<uint64_t, GpuTexture> contentTextures; // by content hash
@@ -580,12 +657,56 @@ struct GSGpuBackend::Impl
 bool GSGpuBackend::Impl::init(SDL_GPUDevice *device, uint32_t s, GSGpuBackend::FieldMode fieldMode)
 {
     dev = device;
-    if (!gCensus)
+    if (!gTexToolsInit)
     {
-        gCensus = TexCensus::Census::FromEnvironment();
-        ownsCensus = gCensus != nullptr;
-        census = gCensus.get();
+        // The texture tools (see the comment at gKeys). Created once, by the first backend.
+        gTexToolsInit = true;
+        ownsTexTools = true;
+        gDump = TexDump::Dumper::FromEnvironment();
+        dumper = gDump.get();
+        const char *packSwitch = std::getenv("PS2X_TEX_PACK");
+        if (!(packSwitch && packSwitch[0] == '0'))
+            if (std::shared_ptr<TexPack::FileSource> source = TexPack::DefaultSource())
+            {
+                TexPack::Store::Options options;
+                if (const char *mb = std::getenv("PS2X_TEX_PACK_CACHE_MB"))
+                    if (std::atol(mb) >= 8)
+                        options.cacheBytes = static_cast<uint64_t>(std::atol(mb)) << 20;
+                if (const char *prefetch = std::getenv("PS2X_TEX_PACK_PREFETCH"))
+                    options.prefetch = !(prefetch[0] == '0');
+                auto store = std::make_shared<TexPack::Store>(source, options);
+                if (store->empty())
+                {
+                    std::fprintf(stderr, "[tex:pack] the enabled mods hold no texture files\n");
+                }
+                else
+                {
+                    gStore = store;
+                    const TexPack::Stats stats = store->stats();
+                    std::fprintf(stderr, "[tex:pack] %u texture files indexed%s (cache %llu MB)\n", stats.files,
+                                 stats.ignored ? (" (" + std::to_string(stats.ignored) + " other files ignored)").c_str() : "",
+                                 static_cast<unsigned long long>(options.cacheBytes >> 20));
+                }
+            }
+        packStore = gStore.get();
+        const char *censusEnv = std::getenv("PS2X_TEX_CENSUS");
+        const bool wantCensus = censusEnv && censusEnv[0] != '\0';
+        if (dumper || packStore || wantCensus)
+        {
+            gKeys = std::make_unique<TexKeys::Tracker>();
+            keys = gKeys.get();
+        }
+        if (wantCensus)
+        {
+            gCensus = TexCensus::Census::FromEnvironment(*gKeys);
+            census = gCensus.get();
+        }
+        if (const char *mb = std::getenv("PS2X_TEX_PACK_GPU_MB"))
+            if (std::atol(mb) >= 8)
+                repBudget = static_cast<uint64_t>(std::atol(mb)) << 20;
     }
+    if (const char *trigger = std::getenv("PS2X_TEX_PACK_RELOAD_FILE"))
+        repReloadTrigger = trigger;
     scale = std::max(1u, s);
     mode = fieldMode;
     if (scale > 1u && !progressive())
@@ -740,6 +861,16 @@ bool GSGpuBackend::Impl::init(SDL_GPUDevice *device, uint32_t s, GSGpuBackend::F
     zcopyShader = ps2x::gpu::createShader(dev, ps2x::gpu::shaders::gszcopy_frag);
     if (!vertexShader || !fragmentShader || !zcopyShader)
         return false;
+    if (packStore)
+    {
+        repShader = ps2x::gpu::createShader(dev, ps2x::gpu::shaders::gs_rep_frag);
+        if (!repShader)
+        {
+            std::fprintf(stderr, "[tex:pack] the replacement shader could not be created; texture packs are off\n");
+            packStore = nullptr;
+            gStore.reset();
+        }
+    }
 
     SDL_GPUSamplerCreateInfo si = {};
     si.min_filter = SDL_GPU_FILTER_NEAREST;
@@ -896,10 +1027,16 @@ void GSGpuBackend::Impl::makerLoop()
 
 GSGpuBackend::Impl::~Impl()
 {
-    if (ownsCensus)
+    if (ownsTexTools)
     {
         census = nullptr;
         gCensus.reset(); // finishes the census (writes its files)
+        dumper = nullptr;
+        gDump.reset();
+        packStore = nullptr;
+        gStore.reset();  // joins the decoding thread
+        keys = nullptr;
+        gKeys.reset();
     }
     stopMaker();
     if (!missLogPath.empty())
@@ -923,6 +1060,8 @@ GSGpuBackend::Impl::~Impl()
         SDL_ReleaseGPUGraphicsPipeline(dev, p.second);
     for (auto &t : contentTextures)
         SDL_ReleaseGPUTexture(dev, t.second.tex);
+    for (auto &r : repTextures)
+        SDL_ReleaseGPUTexture(dev, r.second.tex);
     for (auto &bucket : texturePool)
         for (const PooledTexture &p : bucket.second)
             SDL_ReleaseGPUTexture(dev, p.tex);
@@ -947,6 +1086,8 @@ GSGpuBackend::Impl::~Impl()
         SDL_ReleaseGPUShader(dev, fragmentShader);
     if (zcopyShader)
         SDL_ReleaseGPUShader(dev, zcopyShader);
+    if (repShader)
+        SDL_ReleaseGPUShader(dev, repShader);
     for (SDL_GPUTexture *t : transientTextures)
         SDL_ReleaseGPUTexture(dev, t);
 }
@@ -1238,6 +1379,7 @@ SDL_GPUGraphicsPipeline *GSGpuBackend::Impl::pipeline(uint32_t key)
     SDL_GPUColorTargetDescription ct = {};
     ct.format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
     const bool zrestore = (key & kZRestoreKey) != 0u;
+    const bool replaced = (key & kRepKey) != 0u;
     if (zrestore)
     {
         ct.blend_state.enable_color_write_mask = true; // no colour channel is written
@@ -1257,7 +1399,7 @@ SDL_GPUGraphicsPipeline *GSGpuBackend::Impl::pipeline(uint32_t key)
 
     SDL_GPUGraphicsPipelineCreateInfo info = {};
     info.vertex_shader = vertexShader;
-    info.fragment_shader = zrestore ? zcopyShader : fragmentShader;
+    info.fragment_shader = zrestore ? zcopyShader : (replaced ? repShader : fragmentShader);
     info.vertex_input_state.vertex_buffer_descriptions = &vb;
     info.vertex_input_state.num_vertex_buffers = 1;
     info.vertex_input_state.vertex_attributes = attrs;
@@ -1544,7 +1686,208 @@ void GSGpuBackend::Impl::censusDraw(const GpuTexture &texture, const GSDrawState
     info.vram = vram;
     info.clut = &clut;
     info.marker = markerSeq;
+    info.live = texture.rep.keyed ? &texture.rep.key : nullptr;
     census->Draw(info);
+}
+
+// ------------------------------------------------------------------------------------------------
+// texture replacement (task t1b)
+//
+// Every textured draw comes through prepareReplacement after its texture was resolved. The first draw of a texture gives it its live key
+// (keyTexture: the tracker's writers, the colouring key, the dump), then the store is asked for a picture (lookupReplacement). The
+// answer is kept in GpuTexture::rep: None (nothing to replace; asked again only when the store was reloaded), Pending (the store is
+// reading the picture; this draw uses the original and the next one asks again) or Attached (the picture is on the GPU).
+
+void GSGpuBackend::Impl::prepareReplacement(GpuTexture &g, const GSDrawState &state, const Setup &setup)
+{
+    TexRep &r = g.rep;
+    if (!r.keyed)
+        keyTexture(g, state, setup);
+    if (!packStore)
+        return;
+    const uint64_t generation = packStore->generation();
+    if (generation != repGeneration)
+    {
+        // The packs were reloaded (the F1 panel's button): the pictures on the GPU may be stale. Submit what is recorded, then release them.
+        if (repGeneration != 0)
+        {
+            flushLocked(false);
+            for (auto &entry : repTextures)
+                releaseTexture(entry.second.tex);
+            repTextures.clear();
+            repBytes = 0;
+            repGpuBytesShared.store(0, std::memory_order_relaxed);
+        }
+        repGeneration = generation;
+    }
+    if (r.storeGeneration == generation)
+    {
+        if (r.state == TexRep::State::None)
+            return;
+        if (r.state == TexRep::State::Attached && repTextures.find(r.repId) != repTextures.end())
+            return; // still resident
+    }
+    lookupReplacement(g, state);
+}
+
+void GSGpuBackend::Impl::keyTexture(GpuTexture &g, const GSDrawState &state, const Setup &setup)
+{
+    TexRep &r = g.rep;
+    r.keyed = true;
+    const GSTex0Reg &t = state.context.tex0;
+    const TexKeys::TextureDesc desc{t.tbp0, t.tbw, t.psm, g.w, g.h};
+    const bool indexed = desc.indexed();
+    r.key = keys->KeyFor(desc);
+    uint64_t clutKey = 0;
+    if (indexed)
+    {
+        // The palette as the texture's draws see it: one per texture, because the texture cache's key includes the CLUT.
+        const uint32_t count = isFourBitIndexedPsm(t.psm) ? 16u : 256u;
+        r.paletteCount = count;
+        r.palette = std::make_shared<std::array<uint32_t, 256>>();
+        for (uint32_t i = 0; i < 256u; ++i)
+            (*r.palette)[i] = LookupClutEntry(clut.data(), state.texa, static_cast<uint8_t>(i % count), t.cpsm, t.csm, t.csa, t.psm);
+        clutKey = clutHash(state);
+    }
+    if (r.key.status == TexKeys::LiveKey::Status::Ok)
+    {
+        r.primary = r.key.k3i;
+    }
+    else if (r.key.status == TexKeys::LiveKey::Status::NoWriter)
+    {
+        // Nothing uploaded this texture (a recording or a state load): name it by the tiles this first draw reaches.
+        const TexelRect reach = TextureReach(setup, state.context.clamp, g.w, g.h);
+        TexKeys::Rect rect;
+        const uint64_t fallback = TexKeys::FallbackKey(vram, desc, state.texa, TexKeys::Rect{reach.x0, reach.y0, reach.x1, reach.y1}, rect);
+        if (fallback != 0)
+        {
+            r.primary = fallback;
+            r.fallback = true;
+            r.key.rect = rect;
+        }
+    }
+    std::vector<uint8_t> texels;
+    bool haveTexels = false;
+    if (r.primary != 0 && indexed && r.key.rect.area() <= TexKeys::kMaxColourTexels)
+    {
+        TexKeys::ReadTexels(vram, desc, state.texa, r.key.rect, texels);
+        haveTexels = true;
+        r.k3c = TexKeys::ColouringKey(r.primary, texels, r.palette->data());
+    }
+    if (dumper)
+    {
+        TexDump::Sighting sight;
+        sight.k1 = g.contentHash;
+        sight.desc = desc;
+        sight.key = r.key;
+        sight.primary = r.primary;
+        sight.fallback = r.fallback;
+        sight.k3c = r.k3c;
+        sight.clutHash = clutKey;
+        sight.palette = r.palette ? r.palette->data() : nullptr;
+        sight.paletteCount = r.paletteCount;
+        sight.texels = haveTexels ? &texels : nullptr;
+        sight.vram = vram;
+        sight.texa = state.texa;
+        sight.marker = markerSeq;
+        dumper->Seen(sight);
+    }
+}
+
+void GSGpuBackend::Impl::lookupReplacement(GpuTexture &g, const GSDrawState &state)
+{
+    TexRep &r = g.rep;
+    r.storeGeneration = packStore->generation();
+    r.state = TexRep::State::None;
+    if (r.primary == 0 || r.key.rect.empty())
+        return;
+    const GSTex0Reg &t = state.context.tex0;
+    const bool indexed = isFourBitIndexedPsm(t.psm) || isEightBitIndexedPsm(t.psm);
+    const TexPack::Lookup lookup = packStore->find(r.primary, r.k3c, r.key.rect.width(), r.key.rect.height(), indexed, r.paletteCount);
+    if (lookup.state == TexPack::Lookup::State::Pending)
+    {
+        r.state = TexRep::State::Pending;
+        return;
+    }
+    if (lookup.state != TexPack::Lookup::State::Ready)
+        return;
+    RepGpu *gpu = replacementGpu(lookup);
+    if (!gpu)
+        return;
+    r.repId = GSRec::Hash64(lookup.image->path.data(), lookup.image->path.size(), 0x7265ull);
+    r.scale = lookup.scale;
+    r.index = lookup.image->kind == TexPack::Kind::Index;
+    r.state = TexRep::State::Attached;
+}
+
+// The GPU texture of a replacement picture, made (and its upload staged) on first use.
+RepGpu *GSGpuBackend::Impl::replacementGpu(const TexPack::Lookup &lookup)
+{
+    const TexPack::Image &img = *lookup.image;
+    const uint64_t id = GSRec::Hash64(img.path.data(), img.path.size(), 0x7265ull);
+    const auto found = repTextures.find(id);
+    if (found != repTextures.end())
+    {
+        found->second.lastUsedFlush = flushIndex;
+        return &found->second;
+    }
+    SDL_GPUTextureCreateInfo ti = {};
+    ti.type = SDL_GPU_TEXTURETYPE_2D;
+    ti.format = img.kind == TexPack::Kind::Rgba ? SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM : SDL_GPU_TEXTUREFORMAT_R8_UNORM;
+    ti.usage = SDL_GPU_TEXTUREUSAGE_SAMPLER;
+    ti.width = img.width;
+    ti.height = img.height;
+    ti.layer_count_or_depth = 1;
+    ti.num_levels = 1;
+    ti.sample_count = SDL_GPU_SAMPLECOUNT_1;
+    SDL_GPUTexture *tex = SDL_CreateGPUTexture(dev, &ti);
+    if (!tex)
+    {
+        std::fprintf(stderr, "[tex:pack] cannot create a %ux%u replacement texture: %s\n", img.width, img.height, SDL_GetError());
+        return nullptr;
+    }
+    const size_t offset = allocateStage(img.pixels.size());
+    std::memcpy(stage.data() + offset, img.pixels.data(), img.pixels.size());
+    pendingUploads.push_back({tex, img.width, img.height, offset, 0, 0});
+    RepGpu &g = repTextures[id];
+    g.tex = tex;
+    g.w = img.width;
+    g.h = img.height;
+    g.scale = lookup.scale;
+    g.kind = img.kind;
+    g.bytes = img.pixels.size();
+    g.lastUsedFlush = flushIndex;
+    repBytes += g.bytes;
+    repGpuBytesShared.store(repBytes, std::memory_order_relaxed);
+    ++stats.repCreated;
+    return &g;
+}
+
+// The draw's replacement block (its picture, rectangle, scale and palette), shared with the previous draw when it is the same.
+uint32_t GSGpuBackend::Impl::addRepDraw(const GpuTexture &g)
+{
+    const auto found = repTextures.find(g.rep.repId);
+    if (found == repTextures.end())
+        return 0;
+    RepGpu &gpu = found->second;
+    gpu.lastUsedFlush = flushIndex;
+    const TexKeys::Rect &rect = g.rep.key.rect;
+    RepDraw d;
+    d.tex = gpu.tex;
+    d.info[0] = static_cast<uint32_t>(rect.x0) | (static_cast<uint32_t>(rect.y0) << 16);
+    d.info[1] = static_cast<uint32_t>(rect.width()) | (static_cast<uint32_t>(rect.height()) << 16);
+    d.info[2] = static_cast<uint32_t>(gpu.scale) | ((gpu.kind == TexPack::Kind::Index ? 2u : 1u) << 8);
+    d.info[3] = gpu.kind == TexPack::Kind::Index ? g.rep.paletteCount - 1u : 0u;
+    if (gpu.kind == TexPack::Kind::Index)
+        d.palette = g.rep.palette;
+    ++repDrawsNow;
+    const uint64_t id = g.rep.repId;
+    if (std::find(repSeenNow.begin(), repSeenNow.end(), id) == repSeenNow.end() && repSeenNow.size() < 4096)
+        repSeenNow.push_back(id);
+    if (!repDraws.empty() && repDraws.back().same(d))
+        return static_cast<uint32_t>(repDraws.size());
+    repDraws.push_back(std::move(d));
+    return static_cast<uint32_t>(repDraws.size());
 }
 
 GpuTexture *GSGpuBackend::Impl::resolveTexture(const GSDrawState &state)
@@ -1634,6 +1977,28 @@ GpuTexture *GSGpuBackend::Impl::resolveTexture(const GSDrawState &state)
 
 void GSGpuBackend::Impl::evictTextures()
 {
+    if (repBytes > repBudget)
+    {
+        // Replacement pictures, least recently used first, never what the list just submitted used. A texture that still points at an
+        // evicted picture finds it missing at its next draw and asks the store again.
+        std::vector<std::pair<uint64_t, uint64_t>> order; // lastUsedFlush, id
+        for (const auto &e : repTextures)
+            if (e.second.lastUsedFlush + 1u < flushIndex)
+                order.emplace_back(e.second.lastUsedFlush, e.first);
+        std::sort(order.begin(), order.end());
+        const uint64_t target = repBudget / 4u * 3u;
+        for (const auto &o : order)
+        {
+            if (repBytes <= target)
+                break;
+            const auto it = repTextures.find(o.second);
+            repBytes -= it->second.bytes;
+            releaseTexture(it->second.tex);
+            repTextures.erase(it);
+            ++stats.repEvicted;
+        }
+        repGpuBytesShared.store(repBytes, std::memory_order_relaxed);
+    }
     if (textureBytes <= textureBudget)
         return;
     // Least recently used first, never what the list just submitted used.
@@ -1782,9 +2147,17 @@ void GSGpuBackend::Impl::submitSetup(const GSDrawState &state, const Setup &setu
         if (!texture)
             return;
         decodeTexels(*texture, state, setup);
+        if (keys)
+            prepareReplacement(*texture, state, setup);
         if (census)
             censusDraw(*texture, state, setup);
         d.texture = texture->tex;
+        if (texture->rep.state == TexRep::State::Attached)
+        {
+            d.rep = addRepDraw(*texture);
+            if (d.rep != 0)
+                d.pipeline |= kRepKey;
+        }
         if (!missLogPath.empty())
             noteTextureUse(d.texture, state, setup);
     }
@@ -1807,7 +2180,7 @@ void GSGpuBackend::Impl::submitSetup(const GSDrawState &state, const Setup &setu
     if (!draws.empty())
     {
         Draw &last = draws.back();
-        if (last.frame == d.frame && last.depth == d.depth && last.pipeline == d.pipeline && last.texture == d.texture &&
+        if (last.frame == d.frame && last.depth == d.depth && last.pipeline == d.pipeline && last.texture == d.texture && last.rep == d.rep &&
             last.sx == d.sx && last.sy == d.sy && last.sw == d.sw && last.sh == d.sh && last.uniforms == d.uniforms)
         {
             last.vertexCount += setup.count;
@@ -1995,6 +2368,7 @@ void GSGpuBackend::Impl::flushLocked(bool wait, const FieldCopy *fieldCopies, in
     uint32_t curFrame = ~0u, curDepth = ~0u;
     uint32_t curPipeline = ~0u;
     SDL_GPUTexture *curTexture = reinterpret_cast<SDL_GPUTexture *>(~uintptr_t(0));
+    SDL_GPUTexture *curRepTexture = reinterpret_cast<SDL_GPUTexture *>(~uintptr_t(0));
     for (const Draw &d : draws)
     {
         if (!pass || d.frame != curFrame || d.depth != curDepth)
@@ -2023,6 +2397,7 @@ void GSGpuBackend::Impl::flushLocked(bool wait, const FieldCopy *fieldCopies, in
             curDepth = d.depth;
             curPipeline = ~0u;
             curTexture = reinterpret_cast<SDL_GPUTexture *>(~uintptr_t(0));
+            curRepTexture = reinterpret_cast<SDL_GPUTexture *>(~uintptr_t(0));
         }
         if (d.pipeline != curPipeline)
         {
@@ -2032,13 +2407,39 @@ void GSGpuBackend::Impl::flushLocked(bool wait, const FieldCopy *fieldCopies, in
             SDL_BindGPUGraphicsPipeline(pass, p);
             curPipeline = d.pipeline;
         }
-        if (d.texture != curTexture)
+        const RepDraw *rd = d.rep != 0u ? &repDraws[d.rep - 1u] : nullptr;
+        if (d.texture != curTexture || (rd && rd->tex != curRepTexture))
         {
-            SDL_GPUTextureSamplerBinding binding = {d.texture ? d.texture : dummy, sampler};
-            SDL_BindGPUFragmentSamplers(pass, 0, &binding, 1);
+            if (rd)
+            {
+                // A replaced texture: the original in slot 0, the replacement picture in slot 1 (gs_rep.frag.hlsl)
+                const SDL_GPUTextureSamplerBinding bindings[2] = {{d.texture ? d.texture : dummy, sampler}, {rd->tex, sampler}};
+                SDL_BindGPUFragmentSamplers(pass, 0, bindings, 2);
+                curRepTexture = rd->tex;
+            }
+            else
+            {
+                SDL_GPUTextureSamplerBinding binding = {d.texture ? d.texture : dummy, sampler};
+                SDL_BindGPUFragmentSamplers(pass, 0, &binding, 1);
+            }
             curTexture = d.texture;
         }
-        SDL_PushGPUFragmentUniformData(cmd, 0, &d.uniforms, sizeof(d.uniforms));
+        if (rd)
+        {
+            RepUniforms u;
+            u.base = d.uniforms;
+            std::memcpy(u.info, rd->info, sizeof(u.info));
+            if (rd->palette)
+                std::memcpy(u.palette, rd->palette->data(), sizeof(u.palette));
+            else
+                std::memset(u.palette, 0, sizeof(u.palette));
+            SDL_PushGPUFragmentUniformData(cmd, 0, &u, sizeof(u));
+            ++stats.repDrawCalls;
+        }
+        else
+        {
+            SDL_PushGPUFragmentUniformData(cmd, 0, &d.uniforms, sizeof(d.uniforms));
+        }
         const SDL_Rect scissor = {d.sx, d.sy, d.sw, d.sh};
         SDL_SetGPUScissor(pass, &scissor);
         SDL_DrawGPUPrimitives(pass, d.vertexCount, 1, d.firstVertex, 0);
@@ -2105,6 +2506,7 @@ void GSGpuBackend::Impl::flushLocked(bool wait, const FieldCopy *fieldCopies, in
         SDL_WaitForGPUIdle(dev);
 
     draws.clear();
+    repDraws.clear();
     vertices.clear();
     pendingUploads.clear();
     stage.clear();
@@ -2624,6 +3026,18 @@ void GSGpuBackend::Impl::printStats()
                 static_cast<double>(uploadBufferBytes) * mb, static_cast<double>(vertexBufferBytes) * mb, static_cast<double>(textureBytes) * mb,
                 static_cast<double>(poolBytesNow()) * mb, static_cast<unsigned long long>(texturesPrecreated.load()));
     std::fflush(stdout);
+    if (keys)
+    {
+        // Texture replacement (task t1b): only when a pack, the dumper or the census is on.
+        const TexPack::Stats pack = packStore ? packStore->stats() : TexPack::Stats{};
+        std::printf("[gs:gpu-rep] pack files=%u decoded=%u refused=%u waiting=%u cache=%.1fMB | replaced this frame: %u textures in %u draws | on the GPU: %llu pictures "
+                    "%.1fMB (created %llu, evicted %llu) | draw calls with replacement %llu | tracker transfers=%llu | worker: read %.1fms, png decode %.1fms\n",
+                    pack.files, pack.decoded, pack.refused, pack.pending, static_cast<double>(pack.cacheBytes) * mb, repTexturesFrame.load(), repDrawsFrame.load(),
+                    static_cast<unsigned long long>(repTextures.size()), static_cast<double>(repBytes) * mb, static_cast<unsigned long long>(a.repCreated),
+                    static_cast<unsigned long long>(a.repEvicted), d(a.repDrawCalls, b.repDrawCalls), static_cast<unsigned long long>(keys->TransferCount()),
+                    static_cast<double>(pack.readNanos) / 1e6, static_cast<double>(pack.decodeNanos) / 1e6);
+        std::fflush(stdout);
+    }
     statsPrev = stats;
     statsMarkers = 0;
     statsLastNs = now;
@@ -2922,8 +3336,8 @@ void GSGpuBackend::Initialize(uint8_t *vram, uint32_t vramSize)
     s.localToHostPos = 0u;
     s.touchAll();
     s.recentValid = false;
-    if (census)
-        census->MemoryReset();
+    if (keys)
+        keys->MemoryReset();
 }
 
 void GSGpuBackend::Reset()
@@ -2943,8 +3357,8 @@ void GSGpuBackend::Reset()
     s.localToHostPos = 0u;
     s.touchAll();
     s.recentValid = false;
-    if (census)
-        census->MemoryReset();
+    if (keys)
+        keys->MemoryReset();
 }
 
 void GSGpuBackend::ImportRecordingState(const GSRec::BackendState &state)
@@ -2993,8 +3407,12 @@ void GSGpuBackend::BeginTransfer(const GSTransferCommand &command)
     GSTransfer::Begin(command, s.transferState);
     if (!s.vram)
         return;
-    if (census)
-        census->BeginTransfer(command);
+    if (keys)
+    {
+        keys->BeginTransfer(command, s.markerSeq);
+        if (census)
+            census->BeginTransfer(command);
+    }
     const auto &b = command.bitbltbuf;
     if (command.direction == 2u)
     {
@@ -3031,8 +3449,12 @@ void GSGpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
     if (census)
         census->BeforeUpload(s.vram);
     GSTransfer::UploadImage(s.vram, s.transfer, s.transferState, data, sizeBytes);
-    if (census)
-        census->AfterUpload(s.vram, data, sizeBytes);
+    if (keys)
+    {
+        keys->UploadData(data, sizeBytes);
+        if (census)
+            census->AfterUpload(s.vram);
+    }
     const auto &b = s.transfer.bitbltbuf;
     s.touchBuffer(b.dpsm, b.dbp, std::max<uint32_t>(b.dbw, 1u), s.transfer.trxpos.dsax, s.transfer.trxpos.dsay,
                   s.transfer.trxreg.rrw, s.transfer.trxreg.rrh);
@@ -3087,6 +3509,24 @@ GSGpuBackend::MarkResult GSGpuBackend::MarkPresentation(const GSPresentationRequ
     ++s.markerSeq;
     if (census)
         census->Marker(s.markerSeq);
+    if (packStore && !s.repReloadTrigger.empty() && s.markerSeq % 15u == 0u)
+    {
+        // A test and author aid: create the file named by PS2X_TEX_PACK_RELOAD_FILE and the packs are read again (like the F1 panel's button).
+        std::error_code ec;
+        if (std::filesystem::exists(s.repReloadTrigger, ec))
+        {
+            std::filesystem::remove(s.repReloadTrigger, ec);
+            const uint32_t n = packStore->reload();
+            std::fprintf(stderr, "[tex:pack] reloaded on request: %u texture files\n", n);
+        }
+    }
+    if (packStore)
+    {
+        s.repDrawsFrame.store(s.repDrawsNow, std::memory_order_relaxed);
+        s.repTexturesFrame.store(static_cast<uint32_t>(s.repSeenNow.size()), std::memory_order_relaxed);
+        s.repDrawsNow = 0;
+        s.repSeenNow.clear();
+    }
     if (s.wideLog)
         s.logWideRow(request);
     if (s.markerLog)
@@ -3289,6 +3729,8 @@ void GSGpuBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t 
     if (!s.vram)
         return;
     GSTransfer::WritePixel(s.vram, psm, base, bw, x, y, value);
+    if (keys)
+        keys->WritePixel(psm, base, bw, x, y);
     s.touchBuffer(psm, base, bw, x, y, 1u, 1u);
 }
 
@@ -3311,6 +3753,32 @@ GSTransferSnapshot GSGpuBackend::GetTransferSnapshot() const
     GSTransferSnapshot result = s.transferState;
     result.localToHostPendingBytes = s.localToHostPos < s.localToHost.size() ? s.localToHost.size() - s.localToHostPos : 0u;
     return result;
+}
+
+uint32_t GSGpuBackend::ReloadTexturePacks()
+{
+    return packStore ? packStore->reload() : 0u;
+}
+
+GSGpuBackend::ReplacementReport GSGpuBackend::Replacement() const
+{
+    ReplacementReport report;
+    report.dumping = dumper != nullptr;
+    report.dumpedFiles = dumper ? dumper->FilesWritten() : 0u;
+    if (packStore)
+    {
+        const TexPack::Stats stats = packStore->stats();
+        report.active = true;
+        report.packFiles = stats.files;
+        report.decoded = stats.decoded;
+        report.refused = stats.refused;
+        report.pending = stats.pending;
+        report.cacheBytes = stats.cacheBytes;
+        report.drawsThisFrame = m_impl->repDrawsFrame.load(std::memory_order_relaxed);
+        report.texturesThisFrame = m_impl->repTexturesFrame.load(std::memory_order_relaxed);
+        report.gpuBytes = m_impl->repGpuBytesShared.load(std::memory_order_relaxed);
+    }
+    return report;
 }
 
 GSGpuBackend::Stats GSGpuBackend::GetStats() const

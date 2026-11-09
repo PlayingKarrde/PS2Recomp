@@ -1,5 +1,7 @@
 #include "ps2_host_mods.h"
 
+#include "runtime/gs/gs_tex_pack.h"
+
 #if defined(PS2X_HAS_MODS)
 #include "mod_manager.h"
 #include "ps2_settings.h"
@@ -40,6 +42,42 @@ namespace ps2x_host_mods
             const auto text = path.u8string();
             return std::string(text.begin(), text.end());
         }
+
+        // The mods' files for the texture pack store: lists and reads through the manager's session lookup, and hands the store's
+        // complaints back to the manager as notes on the mod that provided the file (the Mods tab shows them).
+        class ModTextureSource final : public TexPack::FileSource
+        {
+        public:
+            explicit ModTextureSource(ps2x::mods::Manager *manager) : m_manager(manager) {}
+
+            std::vector<Entry> list(const std::string &prefix) override
+            {
+                std::vector<Entry> out;
+                for (const auto &file : m_manager->sessionFiles(prefix))
+                    out.push_back(Entry{file.path, file.modId, file.order});
+                return out;
+            }
+
+            bool read(const std::string &path, std::vector<uint8_t> &bytes, std::string &error) override
+            {
+                auto data = m_manager->open(path);
+                if (!data)
+                {
+                    error = "the mod no longer has the file";
+                    return false;
+                }
+                bytes = std::move(*data);
+                return true;
+            }
+
+            void problem(const std::string &provider, const std::string &message) override
+            {
+                m_manager->addRuntimeNote(provider, message);
+            }
+
+        private:
+            ps2x::mods::Manager *m_manager;
+        };
     }
 
     void initialize()
@@ -91,6 +129,7 @@ namespace ps2x_host_mods
                     std::printf("[mods] %s is not usable: %s\n", mod.file.c_str(), mod.error.c_str());
             std::fflush(stdout);
             h.manager = std::move(manager);
+            TexPack::SetDefaultSource(std::make_shared<ModTextureSource>(h.manager.get()));
         });
     }
 
@@ -103,6 +142,12 @@ namespace ps2x_host_mods
     {
         ps2x::mods::Manager *m = manager();
         return m ? utf8(m->modsDir()) : std::string();
+    }
+
+    std::shared_ptr<TexPack::FileSource> texturePackSource()
+    {
+        ps2x::mods::Manager *m = manager();
+        return m ? std::make_shared<ModTextureSource>(m) : nullptr;
     }
 
     std::vector<std::string> themeStyleSheets()
@@ -144,6 +189,7 @@ namespace ps2x_host_mods
     void initialize() {}
     ps2x::mods::Manager *manager() { return nullptr; }
     std::string modsFolder() { return std::string(); }
+    std::shared_ptr<TexPack::FileSource> texturePackSource() { return nullptr; }
     std::vector<std::string> themeStyleSheets() { return {}; }
     bool readVirtualFile(const std::string &, std::vector<uint8_t> &) { return false; }
     DropOutcome installDropped(const std::string &)

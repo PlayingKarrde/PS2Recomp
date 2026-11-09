@@ -615,6 +615,22 @@ body
     color: #e7bc3d;
 }
 
+#mod-notes
+{
+    margin-top: 6dp;
+    font-size: 16dp;
+    font-weight: normal;
+    letter-spacing: 0.5dp;
+    color: #e7bc3d;
+}
+
+.mod-notes-line
+{
+    margin-top: 2dp;
+    font-size: 14dp;
+    color: #f2eedc;
+}
+
 #mod-links,
 #mod-note
 {

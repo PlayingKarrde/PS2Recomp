@@ -195,6 +195,9 @@ namespace ps2x::mods
             entry.size = stat.m_uncomp_size;
             entry.packedSize = stat.m_comp_size;
             entry.isDirectory = stat.m_is_directory != 0;
+            entry.localOffset = stat.m_local_header_ofs;
+            entry.crc32 = stat.m_crc32;
+            entry.method = stat.m_method;
             if (!entry.isDirectory)
             {
                 if (stat.m_is_encrypted)
@@ -285,6 +288,54 @@ namespace ps2x::mods
         package.manifest = std::move(*manifest.manifest);
         result.package = std::move(package);
         return result;
+    }
+
+    std::optional<std::vector<uint8_t>> readPackageEntryAt(const fs::path &file, const PackageEntry &entry, uint64_t maxBytes, std::string *error)
+    {
+        auto fail = [&](const std::string &message) -> std::optional<std::vector<uint8_t>> {
+            if (error)
+                *error = message;
+            return std::nullopt;
+        };
+        if (entry.isDirectory)
+            return fail("'" + shown(entry.name) + "' is a folder.");
+        if (entry.size > maxBytes)
+            return fail("The package entry '" + shown(entry.name) + "' is larger than " + mib(maxBytes) + ".");
+        if (entry.method != 0 && entry.method != 8)
+            return fail("The package entry '" + shown(entry.name) + "' cannot be read.");
+        std::ifstream in(file, std::ios::binary);
+        if (!in)
+            return fail("The file cannot be opened.");
+        in.seekg(static_cast<std::streamoff>(entry.localOffset));
+        uint8_t header[30];
+        in.read(reinterpret_cast<char *>(header), sizeof(header));
+        if (!in || header[0] != 'P' || header[1] != 'K' || header[2] != 3 || header[3] != 4)
+            return fail("The package entry '" + shown(entry.name) + "' cannot be found where the zip says.");
+        const uint64_t dataOffset = entry.localOffset + 30u + (header[26] | (header[27] << 8)) + (header[28] | (header[29] << 8));
+        in.seekg(static_cast<std::streamoff>(dataOffset));
+        std::vector<uint8_t> packed(static_cast<size_t>(entry.packedSize));
+        if (!packed.empty())
+        {
+            in.read(reinterpret_cast<char *>(packed.data()), static_cast<std::streamsize>(packed.size()));
+            if (!in)
+                return fail("The package entry '" + shown(entry.name) + "' is cut short.");
+        }
+        std::vector<uint8_t> bytes(static_cast<size_t>(entry.size));
+        if (entry.method == 0)
+        {
+            if (packed.size() != bytes.size())
+                return fail("The package entry '" + shown(entry.name) + "' is damaged.");
+            bytes = std::move(packed);
+        }
+        else if (!bytes.empty())
+        {
+            const size_t got = tinfl_decompress_mem_to_mem(bytes.data(), bytes.size(), packed.data(), packed.size(), 0);
+            if (got != bytes.size())
+                return fail("The package entry '" + shown(entry.name) + "' cannot be unpacked.");
+        }
+        if (!bytes.empty() && static_cast<uint32_t>(mz_crc32(MZ_CRC32_INIT, bytes.data(), bytes.size())) != entry.crc32)
+            return fail("The package entry '" + shown(entry.name) + "' is damaged (its checksum fails).");
+        return bytes;
     }
 
     std::optional<std::vector<uint8_t>> readPackageEntry(const fs::path &file, const std::string &name, uint64_t maxBytes,

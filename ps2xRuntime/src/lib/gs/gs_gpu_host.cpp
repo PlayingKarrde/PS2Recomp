@@ -219,6 +219,34 @@ namespace ps2x_gs
         return gpuInUse;
     }
 
+    std::string debugPanelTextureLine()
+    {
+        if (!g.backend)
+            return "";
+        const GSGpuBackend::ReplacementReport r = g.backend->Replacement();
+        if (!r.active && !r.dumping)
+            return "";
+        char text[320];
+        int n = 0;
+        if (r.active)
+            n += std::snprintf(text + n, sizeof(text) - static_cast<size_t>(n),
+                               "Texture packs: %u textures replaced this frame (%u draws), %u pictures loaded of %u files, %u refused, %u waiting, %.1f MB on the GPU",
+                               r.texturesThisFrame, r.drawsThisFrame, r.decoded, r.packFiles, r.refused, r.pending, static_cast<double>(r.gpuBytes) / 1048576.0);
+        if (r.dumping)
+            n += std::snprintf(text + n, sizeof(text) - static_cast<size_t>(n), "%sTexture dump: %u files written", n ? "; " : "", r.dumpedFiles);
+        return std::string(text, static_cast<size_t>(std::max(n, 0)));
+    }
+
+    std::string reloadTexturePacks()
+    {
+        if (!g.backend)
+            return "";
+        const uint32_t n = g.backend->ReloadTexturePacks();
+        char text[96];
+        std::snprintf(text, sizeof(text), "Texture packs reloaded: %u texture files", n);
+        return text;
+    }
+
     std::string debugPanelNote()
     {
         if (!g.backend)

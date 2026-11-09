@@ -96,6 +96,14 @@ namespace ps2x::mods
         std::vector<std::string> providers; // mod ids in load order; the last one wins
     };
 
+    // One content file of the session, as the winning mod provides it.
+    struct SessionFile
+    {
+        std::string path;
+        std::string modId;   // the last session mod that has the path
+        uint32_t order = 0;  // that mod's place in the session's load order (0 = loads first); the later one wins
+    };
+
     class Manager
     {
     public:
@@ -158,6 +166,16 @@ namespace ps2x::mods
         std::vector<std::string> providers(const std::string &path) const;
         // Every content path that more than one session mod provides.
         std::vector<PathConflict> conflicts() const;
+        // Every content path whose name starts with `prefix` (for example "assets/textures/"), once, with the mod that wins it. No
+        // file is read. The kinds that read many files (texture packs) index them at start with this.
+        std::vector<SessionFile> sessionFiles(const std::string &prefix) const;
+
+        // ---- notes from the running game ----
+        // A line the game attaches to a mod while it runs (a texture the pack could not use, with the reason). The Mods tab shows them
+        // on the mod's page. Repeated lines are kept once, and at most kMaxRuntimeNotes per mod.
+        static constexpr size_t kMaxRuntimeNotes = 24;
+        void addRuntimeNote(const std::string &modId, const std::string &note);
+        std::vector<std::string> runtimeNotes(const std::string &modId) const;
         // One file of one installed mod, on or off (the details page's pictures, a theme's images). nullopt if missing.
         std::optional<std::vector<uint8_t>> readFile(const std::string &modId, const std::string &path, uint64_t maxBytes = 16ull * 1024 * 1024,
                                                      std::string *error = nullptr) const;
@@ -196,5 +214,6 @@ namespace ps2x::mods
         std::unique_ptr<State> m_state;
         std::vector<std::unique_ptr<Slot>> m_slots; // valid mods in load order, then the invalid ones by file name
         std::unique_ptr<Session> m_session;
+        std::map<std::string, std::vector<std::string>> m_runtimeNotes; // by mod id
     };
 }
