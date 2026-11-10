@@ -92,6 +92,8 @@ namespace ps2x::ui
                 tools.cardLine = [this]() { return host->cardLine(); };
                 tools.canKeepCard = [this]() { return host->canKeepCard(); };
                 tools.keepCard = [this]() { return host->keepCard(); };
+                tools.canBackToOwnCard = [this]() { return host->canBackToOwnCard(); };
+                tools.backToOwnCard = [this]() { return host->backToOwnCard(); };
                 mods.setTools(std::move(tools));
                 modsAttached = true;
             }

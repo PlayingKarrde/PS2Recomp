@@ -5,6 +5,7 @@
 #include "mini_json.h"
 #include "mod_manager.h"
 #include "mod_package.h"
+#include "path_text.h"
 #include "profile.h"
 
 #include <algorithm>
@@ -1120,6 +1121,336 @@ void register_data_pack_tests()
             t.Equals(profile::slot2Root(fs::path("/x/profile/MC0")), fs::path("/x/profile/mc1"), "the name is matched without regard to capitals");
             t.Equals(profile::slot2Root(fs::path("/x/card")), fs::path("/x/card_slot1"), "another name gets a suffix");
             t.IsTrue(!profile::baseCardLine().empty() && contains(profile::baseCardLine(), "your own card"), "the line for no data packs");
+        });
+    });
+
+    // ------------------------------------------------------------------------------- which card (task s3: staying on the profile)
+    MiniTest::Case("DataPackCardChoice", [](TestCase &tc)
+    {
+        tc.Run("no data pack and no profile save: the base card, and nothing is made or read", [](TestCase &t)
+        {
+            const Bytes base = makeSave();
+            Cards cards("choice_none", &base);
+            int tableLoads = 0;
+            profile::Config cfg = cards.config({});
+            cfg.crcTable = nullptr;
+            cfg.loadCrcTable = [&](CrcTable &table, std::string *) { ++tableLoads; table = testTable(); return true; };
+            profile::Selection s = profile::select(cfg);
+            t.IsTrue(!s.useProfile && s.why == profile::CardWhy::NoProfile, "the base card");
+            t.Equals(s.line, profile::baseCardLine(), "the base card's line");
+            t.IsFalse(fs::exists(cards.profile), "no profile folder was made");
+            t.Equals(tableLoads, 0, "the executable was not read");
+            // a profile folder that holds no save yet is the same
+            std::error_code ec;
+            fs::create_directories(cards.profile / "mc0" / kSaveName, ec);
+            fs::create_directories(cards.profile / "mc1", ec);
+            s = profile::select(cfg);
+            t.IsTrue(!s.useProfile && s.why == profile::CardWhy::NoProfile && tableLoads == 0, "empty card folders are no profile");
+            // no pref folder at all
+            profile::Config nowhere;
+            nowhere.baseCard0 = cards.base0;
+            s = profile::select(nowhere);
+            t.IsTrue(!s.useProfile && s.why == profile::CardWhy::NoProfile, "no profile folder given: the base card");
+        });
+
+        tc.Run("a data pack is on: the profile card", [](TestCase &t)
+        {
+            const Bytes base = makeSave();
+            Cards cards("choice_on", &base);
+            int tableLoads = 0;
+            profile::Config cfg = cards.config({packInput("a.pack", "1.0.0", renameFirst({{1, "FromA"}}))});
+            cfg.crcTable = nullptr;
+            cfg.loadCrcTable = [&](CrcTable &table, std::string *) { ++tableLoads; table = testTable(); return true; };
+            const profile::Selection s = profile::select(cfg);
+            t.IsTrue(s.useProfile && s.why == profile::CardWhy::DataPacksOn && s.result.applied, "the profile, applied: " + s.line);
+            t.IsTrue(contains(s.line, "profile card with 1 data pack on") && contains(s.line, "your own card is not changed"), s.line);
+            t.Equals(s.result.root0, cards.profile / "mc0", "the card root");
+            t.Equals(tableLoads, 1, "the checksum table was read once, for the profile");
+            t.IsTrue(sameFirst(readAll(cards.profileSave()), 1, "FromA"), "the pack is in");
+            t.IsTrue(readAll(cards.base0 / kSaveName / kSaveName) == base, "the base card is untouched");
+            // the loader's failure is a reason, not a crash
+            Cards failing("choice_on_fail", &base);
+            profile::Config bad = failing.config({packInput("a.pack", "1.0.0", renameFirst({{1, "FromA"}}))});
+            bad.crcTable = nullptr;
+            bad.loadCrcTable = [](CrcTable &, std::string *why) { *why = "no executable"; return false; };
+            const profile::Selection f = profile::select(bad);
+            t.IsTrue(f.useProfile && !f.result.applied && contains(f.result.problem, "checksum table could not be read (no executable)"), f.result.problem);
+        });
+
+        tc.Run("the last pack goes off: the game stays on the profile, the packs' fields go back and the player's changes stay", [](TestCase &t)
+        {
+            const Bytes base = makeSave();
+            Cards cards("choice_stay", &base);
+            const auto a = packInput("a.pack", "1.0.0", renameFirst({{1, "FromA"}, {2, "OnlyA"}}));
+            profile::select(cards.config({a}));
+            playerEdit(cards.profileSave(), [](Bytes &image) {
+                put(image, kOffNames + 1 * kNameStride + 1, textBytes("Mine", kWidthFirst));  // a field the pack had written
+                put(image, kOffNames + 5 * kNameStride + 1, textBytes("Mine5", kWidthFirst)); // a field it never touched
+            });
+            const Bytes baseBefore = readAll(cards.base0 / kSaveName / kSaveName);
+            const profile::Selection s = profile::select(cards.config({}));
+            t.IsTrue(s.useProfile && s.why == profile::CardWhy::StayedOnProfile && s.result.applied, "still the profile card: " + s.line);
+            t.Equals(s.line, std::string("Memory card: profile card (no data packs on; Back to my card returns to yours)."), "the line says which card and why");
+            t.Equals(s.result.root0, cards.profile / "mc0", "the card root is the profile's");
+            const Bytes saved = readAll(cards.profileSave());
+            t.IsTrue(checkIntegrity(saved, testTable()).allOk(), "the profile's save verifies");
+            t.IsTrue(sameFirst(saved, 1, "Mine") && sameFirst(saved, 5, "Mine5"), "the player's names stay");
+            t.IsTrue(sameFirst(saved, 2, "First2"), "the field the pack wrote and the player did not touch is back to the default");
+            t.IsTrue(sameFirst(saved, 3, "First3"), "the others are as they were");
+            t.IsFalse(contains(readText(cards.ledger()), "\"w"), "the ledger is empty");
+            t.IsTrue(readAll(cards.base0 / kSaveName / kSaveName) == baseBefore, "the base card is unchanged");
+            // the next start with no pack writes nothing
+            fs::last_write_time(cards.profileSave(), fs::file_time_type::clock::now() - std::chrono::hours(5));
+            const auto stamp = fs::last_write_time(cards.profileSave());
+            const profile::Selection again = profile::select(cards.config({}));
+            t.IsTrue(again.useProfile && !again.result.imageChanged && fs::last_write_time(cards.profileSave()) == stamp, "a second start is quiet");
+            t.IsTrue(readAll(cards.profileSave()) == saved, "same bytes");
+        });
+
+        tc.Run("a profile whose pack never changed anything is still the card once the pack is off", [](TestCase &t)
+        {
+            // the profile exists because a pack was on (it holds a copy of the base card); no in-game save was made
+            const Bytes base = makeSave();
+            Cards cards("choice_copy", &base);
+            profile::select(cards.config({packInput("a.pack", "1.0.0", renameFirst({{1, "FromA"}}))}));
+            const profile::Selection s = profile::select(cards.config({}));
+            t.IsTrue(s.useProfile && s.why == profile::CardWhy::StayedOnProfile, "the rule is about the profile having a save");
+            t.IsTrue(readAll(cards.profileSave()) == base, "with the pack off it equals the base card's save again, to the byte");
+        });
+
+        tc.Run("a save in the profile's second slot only counts as a profile save", [](TestCase &t)
+        {
+            Cards cards("choice_slot2", nullptr);
+            t.IsFalse(profile::profileHasAnySave(cards.profile), "nothing yet");
+            writeAll(cards.profile / "mc1" / kSaveName / kSaveName, Bytes{1, 2, 3});
+            t.IsTrue(profile::profileHasAnySave(cards.profile), "slot 2 counts");
+            t.IsFalse(profile::profileHasSave(cards.profile), "Keep this card still looks at slot 1");
+            const profile::Selection s = profile::select(cards.config({}));
+            t.IsTrue(s.useProfile && s.why == profile::CardWhy::StayedOnProfile, "the player's slot 2 save is not hidden");
+            t.IsTrue(contains(s.line, "no data packs on") && contains(s.line, "has no save yet"), s.line);
+            t.IsTrue(readAll(cards.profile / "mc1" / kSaveName / kSaveName) == (Bytes{1, 2, 3}), "and it is left alone");
+        });
+
+        tc.Run("Back to my card: the base card is used from the next start and the profile does not change", [](TestCase &t)
+        {
+            const Bytes base = makeSave();
+            Cards cards("choice_back", &base);
+            const auto a = packInput("a.pack", "1.0.0", renameFirst({{1, "FromA"}, {2, "OnlyA"}}));
+            profile::select(cards.config({a}));
+            playerEdit(cards.profileSave(), [](Bytes &image) { put(image, kOffNames + 5 * kNameStride + 1, textBytes("Mine5", kWidthFirst)); });
+            profile::select(cards.config({})); // the pack went off; stay on the profile
+            std::string message;
+            t.IsTrue(profile::recordOwnCard(cards.profile, &message) && oneLine(message), message);
+            t.IsTrue(profile::choseOwnCard(cards.profile), "the choice is on disk");
+            const std::string record = readText(cards.profile / "card.json");
+            t.IsTrue(contains(record, "\"format\": \"fpr-card\"") && contains(record, "\"use\": \"base\""), "a small named record: " + record);
+            t.IsFalse(fs::exists(cards.profile / "card.json.tmp"), "no temporary file is left");
+            // everything under profile/ as it is now (bytes and times)
+            std::map<std::string, std::pair<Bytes, fs::file_time_type>> before;
+            for (const auto &entry : fs::recursive_directory_iterator(cards.profile))
+                if (entry.is_regular_file())
+                    before[entry.path().lexically_relative(cards.profile).generic_string()] = {readAll(entry.path()), fs::last_write_time(entry.path())};
+            const Bytes baseBefore = readAll(cards.base0 / kSaveName / kSaveName);
+            for (int start = 0; start < 2; ++start)
+            {
+                const profile::Selection s = profile::select(cards.config({}));
+                t.IsTrue(!s.useProfile && s.why == profile::CardWhy::ChoseOwnCard, "the base card (start " + std::to_string(start + 1) + ")");
+                t.Equals(s.line, profile::ownCardChoiceLine(), "the line says it is the player's choice");
+                t.IsTrue(contains(s.line, "your own card") && contains(s.line, "Back to my card"), s.line);
+            }
+            std::map<std::string, std::pair<Bytes, fs::file_time_type>> after;
+            for (const auto &entry : fs::recursive_directory_iterator(cards.profile))
+                if (entry.is_regular_file())
+                    after[entry.path().lexically_relative(cards.profile).generic_string()] = {readAll(entry.path()), fs::last_write_time(entry.path())};
+            t.IsTrue(before == after, "nothing under profile/ changed (every file's bytes and time)");
+            t.IsTrue(readAll(cards.base0 / kSaveName / kSaveName) == baseBefore, "and the base card is untouched");
+        });
+
+        tc.Run("a pack on again after Back to my card uses the profile again, and staying on it is the rule again after that", [](TestCase &t)
+        {
+            const Bytes base = makeSave();
+            Cards cards("choice_again", &base);
+            const auto a = packInput("a.pack", "1.0.0", renameFirst({{1, "FromA"}, {2, "OnlyA"}}));
+            profile::select(cards.config({a}));
+            playerEdit(cards.profileSave(), [](Bytes &image) { put(image, kOffNames + 1 * kNameStride + 1, textBytes("Mine", kWidthFirst)); });
+            profile::select(cards.config({}));
+            t.IsTrue(profile::recordOwnCard(cards.profile, nullptr), "Back to my card");
+            t.IsTrue(!profile::select(cards.config({})).useProfile, "the base card");
+            // the pack comes back
+            const profile::Selection on = profile::select(cards.config({a}));
+            t.IsTrue(on.useProfile && on.why == profile::CardWhy::DataPacksOn && on.result.applied, "the profile again: " + on.line);
+            t.IsFalse(fs::exists(cards.profile / "card.json"), "the choice is cleared");
+            Bytes saved = readAll(cards.profileSave());
+            t.IsTrue(sameFirst(saved, 1, "FromA") && sameFirst(saved, 2, "OnlyA"), "the pack's names are back (the player's value became the field's before)");
+            // the pack goes off again: no new choice was made, so the profile is the card
+            const profile::Selection off = profile::select(cards.config({}));
+            t.IsTrue(off.useProfile && off.why == profile::CardWhy::StayedOnProfile, "off again: the profile");
+            saved = readAll(cards.profileSave());
+            t.IsTrue(sameFirst(saved, 1, "Mine") && sameFirst(saved, 2, "First2"), "the player's name returns, the rest is the default");
+        });
+
+        tc.Run("Back to my card needs a profile save", [](TestCase &t)
+        {
+            Cards cards("choice_refuse", nullptr);
+            std::string message;
+            t.IsFalse(profile::recordOwnCard(cards.profile, &message), "no profile at all");
+            t.IsTrue(contains(message, "no save") && oneLine(message), message);
+            t.IsFalse(fs::exists(cards.profile), "nothing was made");
+            std::error_code ec;
+            fs::create_directories(cards.profile / "mc0", ec);
+            t.IsFalse(profile::recordOwnCard(cards.profile, &message), "a profile folder with no save");
+            t.IsFalse(fs::exists(cards.profile / "card.json"), "no record");
+        });
+
+        tc.Run("the choice record is written through a temporary file and survives a crash", [](TestCase &t)
+        {
+            const Bytes base = makeSave();
+            Cards cards("choice_record", &base);
+            profile::select(cards.config({packInput("a.pack", "1.0.0", renameFirst({{1, "FromA"}}))}));
+            profile::select(cards.config({}));
+            const fs::path record = cards.profile / "card.json";
+            const fs::path temp = cards.profile / "card.json.tmp";
+            // a crash while writing it left half a temporary file: no choice, and the next write replaces it
+            writeAll(temp, Bytes{'{', '"', 'f', 'o', 'r'});
+            bool unreadable = true;
+            t.IsFalse(profile::choseOwnCard(cards.profile, &unreadable) || unreadable, "a leftover temporary file is not a choice");
+            t.IsTrue(profile::planCard(cards.profile, 0).useProfile, "the profile is still the card (the data-preserving default)");
+            t.IsTrue(profile::recordOwnCard(cards.profile, nullptr) && !fs::exists(temp), "the next write replaces it and leaves no temporary file");
+            t.IsTrue(profile::choseOwnCard(cards.profile), "and the choice is there");
+            // a leftover next to a good record changes nothing
+            writeAll(temp, Bytes{'x'});
+            t.IsTrue(profile::choseOwnCard(cards.profile), "a stale temporary file does not undo the choice");
+            // clearing takes both away
+            t.IsTrue(profile::clearOwnCardChoice(cards.profile), "cleared");
+            t.IsTrue(!fs::exists(record) && !fs::exists(temp) && !profile::choseOwnCard(cards.profile), "no record, no leftover");
+            // a record that cannot be understood is no choice, and the log says so
+            const std::vector<std::string> garbled = {"{\"format\": \"fpr-card\", \"ver", "not json at all", "{\"format\": \"other\", \"version\": 1, \"use\": \"base\"}",
+                                                      "{\"format\": \"fpr-card\", \"version\": 2, \"use\": \"base\"}", "{\"format\": \"fpr-card\", \"version\": 1}", "[]"};
+            for (const std::string &text : garbled)
+            {
+                writeAll(record, Bytes(text.begin(), text.end()));
+                unreadable = false;
+                t.IsFalse(profile::choseOwnCard(cards.profile, &unreadable), "not a choice: " + text);
+                t.IsTrue(unreadable, "reported as unreadable: " + text);
+                const profile::Selection s = profile::select(cards.config({}));
+                bool said = false;
+                for (const auto &line : s.log)
+                    said = said || contains(line, "card.json could not be understood");
+                t.IsTrue(s.useProfile && s.why == profile::CardWhy::StayedOnProfile && said, "the profile stays and the log says why: " + text);
+            }
+            // another word for "use" is no choice but not damage either
+            const std::string otherWord = "{\"format\": \"fpr-card\", \"version\": 1, \"use\": \"profile\"}";
+            writeAll(record, Bytes(otherWord.begin(), otherWord.end()));
+            unreadable = true;
+            t.IsFalse(profile::choseOwnCard(cards.profile, &unreadable) || unreadable, "use = profile is a valid record that means no choice");
+            // a write that cannot happen keeps the old state: a folder is in the way
+            profile::clearOwnCardChoice(cards.profile);
+            std::error_code ec;
+            fs::create_directories(record / "inner", ec);
+            std::string message;
+            t.IsFalse(profile::recordOwnCard(cards.profile, &message), "the write fails");
+            t.IsTrue(contains(message, "could not be saved") && oneLine(message), message);
+            t.IsTrue(fs::is_directory(record / "inner") && !fs::exists(temp), "the old state is intact and nothing is left behind");
+            t.IsTrue(profile::planCard(cards.profile, 0).useProfile, "so the profile is still the card");
+        });
+
+        tc.Run("a crash after the choice was cleared, before the profile was built, leaves the profile in use", [](TestCase &t)
+        {
+            const Bytes base = makeSave();
+            const auto a = packInput("a.pack", "1.0.0", renameFirst({{1, "FromA"}, {3, "ThreeA"}}));
+            // the reference: no crash
+            Cards clean("choice_crash_ref", &base);
+            profile::select(clean.config({a}));
+            const Bytes refSave = readAll(clean.profileSave());
+            const std::string refLedger = readText(clean.ledger());
+            Cards cards("choice_crash", &base);
+            profile::select(cards.config({a}));
+            profile::select(cards.config({}));
+            t.IsTrue(profile::recordOwnCard(cards.profile, nullptr), "Back to my card");
+            profile::Config cfg = cards.config({a});
+            cfg.failpoint = 3;
+            profile::Selection dying = profile::select(cfg); // "dies" here
+            t.IsTrue(dying.useProfile && !fs::exists(cards.profile / "card.json"), "the choice is already cleared");
+            t.IsTrue(profile::planCard(cards.profile, 0).useProfile, "a start with no pack now uses the profile (nothing was lost)");
+            const profile::Selection next = profile::select(cards.config({a}));
+            t.IsTrue(next.result.applied && readAll(cards.profileSave()) == refSave && readText(cards.ledger()) == refLedger, "the next start gives what a clean run gives");
+        });
+
+        tc.Run("a crash while the last pack's fields are put back finishes at the next start", [](TestCase &t)
+        {
+            const Bytes base = makeSave();
+            const auto a = packInput("a.pack", "1.0.0", renameFirst({{1, "FromA"}, {2, "TwoA"}}));
+            Cards clean("choice_off_ref", &base);
+            profile::select(clean.config({a}));
+            playerEdit(clean.profileSave(), [](Bytes &image) { put(image, kOffNames + 1 * kNameStride + 1, textBytes("Mine", kWidthFirst)); });
+            profile::select(clean.config({}));
+            const Bytes refSave = readAll(clean.profileSave());
+            const std::string refLedger = readText(clean.ledger());
+            for (int failpoint : {1, 2})
+            {
+                Cards cards(failpoint == 1 ? "choice_off_1" : "choice_off_2", &base);
+                profile::select(cards.config({a}));
+                playerEdit(cards.profileSave(), [](Bytes &image) { put(image, kOffNames + 1 * kNameStride + 1, textBytes("Mine", kWidthFirst)); });
+                profile::Config cfg = cards.config({});
+                cfg.failpoint = failpoint;
+                profile::select(cfg); // "dies" here
+                t.IsTrue(fs::exists(cards.profile / "ledger.json.new"), "an update was left half done (failpoint " + std::to_string(failpoint) + ")");
+                const profile::Selection s = profile::select(cards.config({}));
+                t.IsTrue(s.useProfile && s.why == profile::CardWhy::StayedOnProfile, "still the profile");
+                t.IsFalse(fs::exists(cards.profile / "ledger.json.new"), "settled");
+                t.IsTrue(readAll(cards.profileSave()) == refSave && readText(cards.ledger()) == refLedger, "the same state as a clean run (failpoint " + std::to_string(failpoint) + ")");
+            }
+        });
+
+        tc.Run("a save the game would refuse stays as it is while no pack is on, and the card is still the profile", [](TestCase &t)
+        {
+            const Bytes base = makeSave();
+            Cards cards("choice_corrupt", &base);
+            profile::select(cards.config({packInput("a.pack", "1.0.0", renameFirst({{1, "FromA"}}))}));
+            Bytes bad = readAll(cards.profileSave());
+            bad[0x4000] ^= 1;
+            bad[0x9000] ^= 1;
+            writeAll(cards.profileSave(), bad);
+            const profile::Selection s = profile::select(cards.config({}));
+            t.IsTrue(s.useProfile && !s.result.applied && contains(s.result.problem, "does not pass the game's own checks"), s.result.problem);
+            t.IsTrue(contains(s.line, "profile card (no data packs on)") && contains(s.line, "so the profile card was left as it was"), s.line);
+            t.IsTrue(readAll(cards.profileSave()) == bad, "and the save was not touched");
+        });
+    });
+
+    // ------------------------------------------------------------------------------------------------ the Mods tab's short labels
+    MiniTest::Case("ModsTabText", [](TestCase &tc)
+    {
+        tc.Run("a path that fits is left alone, a long one loses its middle", [](TestCase &t)
+        {
+            t.Equals(shortenPath("C:\\Users\\a\\mods", 40), std::string("C:\\Users\\a\\mods"), "fits");
+            const std::string win = "C:\\Users\\sethp\\AppData\\Roaming\\FPWR-Recomp\\FPWR\\mods";
+            const std::string cut = shortenPath(win, 40);
+            t.IsTrue(textLength(cut) <= 40 && cut.rfind("C:\\Users\\...", 0) == 0, "Windows path: " + cut);
+            t.Equals(cut, std::string("C:\\Users\\...\\FPWR-Recomp\\FPWR\\mods"), "the start and whole folders from the end are kept: " + cut);
+            const std::string unix = "/home/sethp/.local/share/FPWR-Recomp/FPWR/mods";
+            t.Equals(shortenPath(unix, 37), std::string("/home/sethp/.../FPWR-Recomp/FPWR/mods"), "Unix path");
+            for (size_t limit = 12; limit < textLength(win); ++limit)
+                t.IsTrue(textLength(shortenPath(win, limit)) <= limit, "never longer than the limit " + std::to_string(limit) + ": " + shortenPath(win, limit));
+            // one very long folder name: its end is kept
+            const std::string longName = "C:\\Users\\x\\" + std::string(80, 'n') + "\\mods";
+            t.IsTrue(textLength(shortenPath(longName, 30)) <= 30, "a folder that is too long on its own");
+            t.IsTrue(shortenPath("no-separators-at-all-here", 10).rfind("...", 0) == 0, "no separators: the end is kept");
+            // non-ASCII text is cut on character boundaries
+            const std::string accents = "C:\\Users\\J\xC3\xBC" "rgen\\Dokumente\\\xC3\x84" "rger\\FPWR\\mods";
+            const std::string c = shortenPath(accents, 28);
+            t.IsTrue(textLength(c) <= 28, "within the limit: " + c);
+            for (size_t i = 0; i < c.size(); ++i)
+                if ((static_cast<unsigned char>(c[i]) & 0xC0) == 0xC0)
+                    t.IsTrue(i + 1 < c.size() && (static_cast<unsigned char>(c[i + 1]) & 0xC0) == 0x80, "no cut inside a character");
+        });
+
+        tc.Run("a long message is cut at its end", [](TestCase &t)
+        {
+            t.Equals(shortenEnd("short", 20), std::string("short"), "fits");
+            t.Equals(shortenEnd("0123456789", 8), std::string("01234..."), "cut");
+            t.Equals(textLength(shortenEnd("\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9", 5)), static_cast<size_t>(5), "characters, not bytes");
+            t.Equals(shortenEnd("abcdef", 2), std::string("ab"), "a tiny limit");
         });
     });
 

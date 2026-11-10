@@ -763,7 +763,26 @@ body
     color: #e7bc3d;
 }
 
+/* The foot of the tab: the memory card line over the whole width (it may take two lines), then the folder lines at the left and the
+   small buttons at the right. min-width: 0 lets the folder column shrink to what is left beside the buttons instead of growing to
+   its text, which would run under them. */
 #mods-foot
+{
+    display: block;
+}
+
+#mods-card
+{
+    min-height: 20dp;
+    max-height: 38dp;
+    overflow: hidden;
+    font-size: 14dp;
+    font-weight: normal;
+    letter-spacing: 0.3dp;
+    color: #cfcbbb;
+}
+
+#mods-lower
 {
     display: flex;
     flex-direction: row;
@@ -774,12 +793,12 @@ body
 #mods-paths
 {
     flex: 1 1 0;
+    min-width: 0;
     overflow: hidden;
 }
 
 #mods-folder,
-#dev-folder,
-#mods-card
+#dev-folder
 {
     height: 20dp;
     overflow: hidden;
@@ -794,17 +813,19 @@ body
 {
     display: flex;
     flex-direction: row;
+    flex: 0 0 auto;
     margin-left: 12dp;
 }
 
 .mbtn.small
 {
-    width: 134dp;
+    width: 116dp;
     height: 30dp;
-    padding-top: 3dp;
+    padding-top: 4dp;
     margin-right: 0;
-    margin-left: 6dp;
-    font-size: 15dp;
+    margin-left: 5dp;
+    font-size: 14dp;
+    letter-spacing: 0.5dp;
 }
 
 /* Scroll bars (a list or a details page longer than its box): a cream-framed trough with the blue thumb of the game's own lists. */

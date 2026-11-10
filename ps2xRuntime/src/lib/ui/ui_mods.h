@@ -66,6 +66,10 @@ namespace ps2x::ui
             std::function<std::string()> cardLine;
             std::function<bool()> canKeepCard;
             std::function<std::string()> keepCard;
+            // "Back to my card" (#back-card: shown only while canBackToOwnCard() is true; asks first; backToOwnCard() records the choice and
+            // returns one sentence).
+            std::function<bool()> canBackToOwnCard;
+            std::function<std::string()> backToOwnCard;
         };
         void setTools(Tools tools);
 
@@ -102,8 +106,12 @@ namespace ps2x::ui
         size_t m_picture = 0;     // which of the mod's pictures shows
         bool m_confirming = false;
         std::string m_confirmKey; // the mod the question is about
-        bool m_confirmKeep = false; // the question is "Keep this card?" rather than the uninstall one
+        // What the question on the confirm layer is about.
+        enum class Ask { Uninstall, KeepCard, BackToOwnCard };
+        Ask m_ask = Ask::Uninstall;
         void openKeepConfirm();
+        void openBackConfirm();
+        void openCardConfirm(Ask ask, const char *title, const char *body, const char *yes, const char *yesHelp);
         void updateCardRow();
         std::function<void()> m_onChange;
         Tools m_tools;

@@ -43,6 +43,7 @@ namespace ps2x_host_mods
             fs::path profileDir; // <pref folder>/profile ("" without a pref folder)
             fs::path baseCard0;  // the base card's slot 1 root, as the runtime had it before any redirect
             std::string line;
+            bool usingProfile = false; // this session plays from the profile card
         };
 
         CardState &card()
@@ -227,6 +228,19 @@ namespace ps2x_host_mods
         return true;
     }
 
+    namespace
+    {
+        // The data packs that are on now (what the next start would use), not the ones the running game started with.
+        size_t liveDataPacks(ps2x::mods::Manager *m)
+        {
+            size_t count = 0;
+            for (const auto &mod : m->list())
+                if (mod.valid && mod.active && mod.kind == ps2x::mods::Kind::Data)
+                    ++count;
+            return count;
+        }
+    }
+
     void selectCard(const std::string &elfPath)
     {
         ps2x::mods::Manager *m = manager();
@@ -241,6 +255,7 @@ namespace ps2x_host_mods
             if (!card().prefFolder.empty())
                 card().profileDir = card().prefFolder / "profile";
             card().baseCard0 = io.mcRoot;
+            card().usingProfile = false;
             config.profileDir = card().profileDir;
             card().line = profile::baseCardLine();
         }
@@ -269,29 +284,37 @@ namespace ps2x_host_mods
             }
             config.packs.push_back(std::move(pack));
         }
-        if (config.packs.empty() || config.profileDir.empty())
-            return; // no data pack: the base card, exactly as without mods; nothing is created or written
+        if (config.profileDir.empty())
+            return; // no preference folder: the base card, exactly as without mods
 
-        fpr::CrcTable table{};
-        std::string tableError;
-        if (fpr::crcTableFromElf(fromUtf8(elfPath), table, &tableError))
-            config.crcTable = &table;
-        else
-            config.crcTableError = tableError;
+        // Which card, and (when it is the profile) building it: mods/profile.h select(). The checksum table is read from the executable
+        // only if the profile is going to be used.
+        config.loadCrcTable = [elfPath](fpr::CrcTable &table, std::string *why) { return fpr::crcTableFromElf(fromUtf8(elfPath), table, why); };
 
-        profile::Result result;
+        profile::Selection selection;
         try
         {
-            result = profile::prepare(config);
+            selection = profile::select(config);
         }
         catch (const std::exception &e)
         {
-            // prepare() does not throw by design; if something still does, the game plays from the base card as if no pack were on.
+            // select() does not throw by design; if something still does, the game plays from the base card as if no pack were on.
             std::fprintf(stderr, "[mods] the profile card could not be prepared (%s); using your own card\n", e.what());
             std::lock_guard<std::mutex> lock(card().mutex);
             card().line = "Memory card: your own card (the profile card could not be prepared).";
             return;
         }
+        for (const std::string &line : selection.log)
+            std::printf("[mods] %s\n", line.c_str());
+        if (!selection.useProfile)
+        {
+            // The base card: nothing under the profile folder was made or touched.
+            std::lock_guard<std::mutex> lock(card().mutex);
+            card().line = selection.line;
+            std::fflush(stdout);
+            return;
+        }
+        const profile::Result &result = selection.result;
         for (size_t i = 0; i < result.packs.size(); ++i)
         {
             const profile::PackReport &report = result.packs[i];
@@ -302,16 +325,15 @@ namespace ps2x_host_mods
         }
         {
             std::lock_guard<std::mutex> lock(card().mutex);
-            card().line = result.line;
+            card().line = selection.line;
+            card().usingProfile = true;
         }
         // The game plays from the profile card from here on. mc1 follows by the card code's own rule (the folder next to mc0).
         PS2Runtime::IoPaths redirected = io;
         redirected.mcRoot = result.root0;
         PS2Runtime::setIoPaths(redirected);
 
-        for (const std::string &line : result.log)
-            std::printf("[mods] %s\n", line.c_str());
-        std::printf("[mods] %s (%.1f ms, profile %s)\n", result.line.c_str(), result.milliseconds, utf8(config.profileDir).c_str());
+        std::printf("[mods] %s (%.1f ms, profile %s)\n", selection.line.c_str(), result.milliseconds, utf8(config.profileDir).c_str());
         for (const profile::PackReport &report : result.packs)
         {
             std::printf("[mods]   %s: %zu fields written, %zu kept (changed by you), %zu overridden by a later pack%s%s\n", report.id.c_str(), report.written,
@@ -324,8 +346,20 @@ namespace ps2x_host_mods
 
     std::string cardLine()
     {
-        std::lock_guard<std::mutex> lock(card().mutex);
-        return card().line;
+        fs::path profileDir;
+        std::string line;
+        bool usingProfile = false;
+        {
+            std::lock_guard<std::mutex> lock(card().mutex);
+            profileDir = card().profileDir;
+            line = card().line;
+            usingProfile = card().usingProfile;
+        }
+        // "Back to my card" was pressed during this session: the card in use does not change until the next start, so say what will happen.
+        ps2x::mods::Manager *m = manager();
+        if (m && usingProfile && !profileDir.empty() && liveDataPacks(m) == 0 && ps2x::mods::profile::choseOwnCard(profileDir))
+            return "Memory card: profile card until the next start. You chose Back to my card: your own card is used from then, and the profile card stays on disk.";
+        return line;
     }
 
     bool canKeepCard()
@@ -348,6 +382,35 @@ namespace ps2x_host_mods
         std::printf("[mods] keep this card: %s\n", result.message.c_str());
         std::fflush(stdout);
         return result.message;
+    }
+
+    bool canBackToOwnCard()
+    {
+        ps2x::mods::Manager *m = manager();
+        fs::path profileDir;
+        {
+            std::lock_guard<std::mutex> lock(card().mutex);
+            profileDir = card().profileDir;
+        }
+        if (!m || profileDir.empty() || liveDataPacks(m) != 0)
+            return false;
+        return ps2x::mods::profile::profileHasAnySave(profileDir) && !ps2x::mods::profile::choseOwnCard(profileDir);
+    }
+
+    std::string backToOwnCard()
+    {
+        if (!canBackToOwnCard())
+            return "Back to my card is not available now (a data pack is on, or there is no profile save).";
+        fs::path profileDir;
+        {
+            std::lock_guard<std::mutex> lock(card().mutex);
+            profileDir = card().profileDir;
+        }
+        std::string message;
+        ps2x::mods::profile::recordOwnCard(profileDir, &message);
+        std::printf("[mods] back to my card: %s\n", message.c_str());
+        std::fflush(stdout);
+        return message;
     }
 
     DropOutcome installDropped(const std::string &utf8Path)
@@ -378,6 +441,8 @@ namespace ps2x_host_mods
     std::string cardLine() { return std::string(); }
     bool canKeepCard() { return false; }
     std::string keepCard() { return std::string(); }
+    bool canBackToOwnCard() { return false; }
+    std::string backToOwnCard() { return std::string(); }
     DropOutcome installDropped(const std::string &)
     {
         DropOutcome outcome;

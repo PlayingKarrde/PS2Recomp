@@ -34,7 +34,10 @@
 //                 instead of the demo page. --set k=v,... gives starting values, --startup k=v,... what the "running game"
 //                 started with (a different current value then shows RESTART), --env-lock k=NAME,... settings fixed by an
 //                 environment variable. --expect then checks the stand-in's values. --quit-blocked TEXT dims Quit Game with
-//                 TEXT as the reason (the host does this while the game writes the memory card). Besides the setting
+//                 TEXT as the reason (the host does this while the game writes the memory card). --card-line TEXT sets the Mods tab's
+//                 memory card line, and --card-buttons keep,back shows the Keep Card and Back to My Card buttons,
+//                 --dev-line TEXT the Mods tab's dev pack line (the modder's buttons show with it). --expect also understands mods-card
+//                 (its text), back-card and keep-card (shown or hidden) and back-asked (1 once the Back to My Card question was answered Yes). Besides the setting
 //                 values, --expect understands focus (the id of the focused element), confirm (shown or hidden: the
 //                 Quit Game question), quit (asked, once Quit was confirmed), quit-locked (1 or empty), help (the
 //                 help line's text) and tab (the selected tab).
@@ -105,7 +108,7 @@ namespace
         bool breakScissor = false; // --validation-selftest
         bool virtualPad = false;   // --virtual-pad
         bool menu = false;         // --menu
-        std::string menuSet, menuStartup, menuEnvLock, quitBlocked;
+        std::string menuSet, menuStartup, menuEnvLock, quitBlocked, cardLine, cardButtons, devLine;
         std::string modsDir, modsState;
         std::string page = "pages/settings.rml";
         int frames = 0;
@@ -456,6 +459,22 @@ namespace
             values["quit"] = "asked";
         }
         std::string quitBlockedReason() override { return quitBlocked; }
+        // Task s3: the memory card line and its two buttons (the host's answers are fixed by --card-line and --card-buttons).
+        std::string cardLineText;
+        bool keepShown = false, backShown = false;
+        std::string cardLine() override { return cardLineText; }
+        std::string devLineText;
+        std::string devPackLine() override { return devLineText; }
+        bool canKeepCard() override { return keepShown; }
+        std::string keepCard() override { return "Copied the profile card's save to your own card."; }
+        bool canBackToOwnCard() override { return backShown && !backDone; }
+        std::string backToOwnCard() override
+        {
+            backDone = true;
+            std::printf("back to my card\n");
+            return "From the next start the game plays from your own card. The profile card stays on disk; turn a data pack on to use it again.";
+        }
+        bool backDone = false;
         std::vector<ControlLine> controls() override
         {
             return {{"Move", "Arrow keys, W A S D", "D-pad, left stick"}, {"Cross", "X, Space", "A (bottom button)"},
@@ -821,6 +840,21 @@ namespace
             document->QuerySelectorAll(rows, ".mod.selected");
             return rows.empty() ? std::string("(none)") : rows.front()->GetAttribute<Rml::String>("data-key", "");
         }
+        if (key == "mods-card")
+        {
+            Rml::Element *element = document->GetElementById("mods-card");
+            return element ? element->GetInnerRML() : std::string("(no element)");
+        }
+        if (key == "back-card" || key == "keep-card")
+        {
+            Rml::Element *element = document->GetElementById(key);
+            if (!element)
+                return std::string("(no element)");
+            const Rml::Property *display = element->GetProperty("display");
+            return display && display->ToString() == "none" ? "hidden" : "shown";
+        }
+        if (key == "back-asked")
+            return d.fake.backDone ? "1" : "0";
         if (key == "mods-status" || key == "mod-title" || key == "mod-problem" || key == "restart-note")
         {
             const char *id = key == "mods-status" ? "mods-status" : (key == "mod-title" ? "mod-title" : (key == "mod-problem" ? "mod-problem" : "restart-note"));
@@ -912,6 +946,12 @@ int main(int argc, char **argv)
             opt.menuEnvLock = next();
         else if (a == "--quit-blocked" && i + 1 < argc)
             opt.quitBlocked = next();
+        else if (a == "--card-line" && i + 1 < argc)
+            opt.cardLine = next();
+        else if (a == "--card-buttons" && i + 1 < argc)
+            opt.cardButtons = next();
+        else if (a == "--dev-line" && i + 1 < argc)
+            opt.devLine = next();
         else if (a == "--mods-dir" && i + 1 < argc)
             opt.modsDir = next();
         else if (a == "--mods-state" && i + 1 < argc)
@@ -996,6 +1036,10 @@ int main(int argc, char **argv)
             d.fake.startup[kv.first] = kv.second;
         d.fake.env = parsePairs(opt.menuEnvLock);
         d.fake.quitBlocked = opt.quitBlocked;
+        d.fake.cardLineText = opt.cardLine;
+        d.fake.devLineText = opt.devLine;
+        d.fake.keepShown = opt.cardButtons.find("keep") != std::string::npos;
+        d.fake.backShown = opt.cardButtons.find("back") != std::string::npos;
 #if defined(PS2X_DEMO_MODS)
         if (!opt.modsDir.empty())
         {
@@ -1136,7 +1180,8 @@ int main(int argc, char **argv)
                 std::string got = opt.menu ? d.fake.values[key] : d.page.value(key);
                 if (opt.menu && (key == "focus" || key == "confirm" || key == "quit-locked" || key == "help" || key == "tab" ||
                                  key == "mod-confirm" || key == "selected-mod" || key == "mods-status" || key == "mod-title" ||
-                                 key == "mod-problem" || key == "restart-note"))
+                                 key == "mod-problem" || key == "restart-note" || key == "mods-card" || key == "back-card" || key == "keep-card" ||
+                                 key == "back-asked"))
                     got = menuState(d, key);
 #if defined(PS2X_DEMO_MODS)
                 if (opt.menu && d.fake.manager && (key == "mods-on" || key == "mods-active" || key == "mods-order" || key == "mods-restart" || key == "mods-count"))

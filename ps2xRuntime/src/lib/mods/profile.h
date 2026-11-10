@@ -20,6 +20,16 @@
 // is first written as ledger.json.new together with the SHA-256 of the save it belongs to; whichever file the next session finds,
 // it finishes or abandons that update).
 //
+// Which card the game plays from (task s3; docs/mod-layer.md "Leaving profiles"), decided by select() at the start of a session:
+//   - at least one data pack active: the profile card;
+//   - no data pack, but the profile has a save and the player has not chosen "Back to my card": the profile card still, with every
+//     field the packs wrote put back to its "before" bytes (what prepare() does with an empty pack list; the player's own changes stay);
+//   - no data pack and the player chose "Back to my card", or there is no profile save at all: the base card, and nothing under the
+//     profile folder is touched.
+// The choice is one small file of its own, <profile>/card.json ({"format": "fpr-card", "version": 1, "use": "base"}), written through a
+// temporary file and a rename. It is removed at the start of any session that has a data pack active, so the profile is used again and
+// "stay on the profile" is the rule again after that pack goes off.
+//
 // No SDL, no game code and no Manager here: the host (ps2_host_mods.cpp) reads the packs out of the manager and hands them in, so the
 // unit tests drive this with a temporary folder and a made-up checksum table.
 #pragma once
@@ -28,6 +38,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -52,8 +63,12 @@ namespace ps2x::mods::profile
         std::vector<PackInput> packs;      // the session's active data packs, in load order (the last one wins)
         const fpr::CrcTable *crcTable = nullptr; // null: the checksum table could not be read, so no save can be checked or fixed
         std::string crcTableError;         // why not
+        // select() only: reads the checksum table when (and only when) the profile is going to be used, so a start that uses the base
+        // card does not read the executable. Used when crcTable is null.
+        std::function<bool(fpr::CrcTable &, std::string *)> loadCrcTable;
         // Tests only: stop at a point as if the process had died there. 0 none; 1 after ledger.json.new is written; 2 after the save
         // is replaced but before ledger.json is.
+        // 3 (select() only): after the card choice was cleared, before the profile is prepared.
         int failpoint = 0;
     };
 
@@ -84,8 +99,48 @@ namespace ps2x::mods::profile
     // notes, and the profile card is still the one to use.
     Result prepare(const Config &config);
 
-    // The Mods tab line when no data pack is on.
+    // The Mods tab line when the base card is in use because there is no profile save (no data pack is on).
     std::string baseCardLine();
+    // The line when the player chose "Back to my card" and no data pack is on.
+    std::string ownCardChoiceLine();
+
+    // ---- which card (task s3) ----
+    enum class CardWhy
+    {
+        NoProfile,       // no data pack and no save on the profile: the base card, nothing made
+        DataPacksOn,     // at least one data pack is active: the profile
+        StayedOnProfile, // no data pack, the profile has a save and the player did not leave it: the profile
+        ChoseOwnCard,    // no data pack, the profile has a save, and the player chose "Back to my card": the base card
+    };
+    struct CardPlan
+    {
+        bool useProfile = false;
+        CardWhy why = CardWhy::NoProfile;
+        bool recordUnreadable = false; // card.json exists but could not be understood (treated as no choice)
+    };
+    // True when the profile has a save in either card slot (a save the player would not see on the base card).
+    bool profileHasAnySave(const std::filesystem::path &profileDir);
+    // The recorded choice: true when <profile>/card.json says "Back to my card" (an absent or unreadable record is no choice; *unreadable
+    // is set for the second).
+    bool choseOwnCard(const std::filesystem::path &profileDir, bool *unreadable = nullptr);
+    // The rule above, reading the disk and changing nothing.
+    CardPlan planCard(const std::filesystem::path &profileDir, size_t activePacks);
+    // Records "Back to my card" (needs a save on the profile: false with *message saying so otherwise). One crash-safe write.
+    bool recordOwnCard(const std::filesystem::path &profileDir, std::string *message);
+    // Forgets the choice (the file is removed). True when there is no record afterwards.
+    bool clearOwnCardChoice(const std::filesystem::path &profileDir);
+
+    struct Selection
+    {
+        bool useProfile = false;           // point the card root at result.root0
+        CardWhy why = CardWhy::NoProfile;
+        std::string line;                  // "Memory card: ..." for the Mods tab
+        Result result;                     // meaningful when useProfile
+        std::vector<std::string> log;      // lines for the log (this and result.log)
+    };
+    // The session's start: decides the card (planCard), clears the choice when a data pack is on, and builds or updates the profile
+    // when it is the one to use. Never throws. With a base card nothing under the profile folder is made, read or changed.
+    Selection select(const Config &config);
 
     struct KeepResult
     {

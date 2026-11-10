@@ -334,6 +334,141 @@ namespace ps2x::mods::profile
         return fs::is_regular_file(save, ec) && fs::file_size(save, ec) == fpr::kSaveSize;
     }
 
+    // ---- which card (task s3) -----------------------------------------------------------------------------------------
+
+    std::string ownCardChoiceLine()
+    {
+        return "Memory card: your own card (you chose Back to my card; turn a data pack on to use the profile card again).";
+    }
+
+    bool profileHasAnySave(const fs::path &profileDir)
+    {
+        if (profileDir.empty())
+            return false;
+        std::error_code ec;
+        for (const char *slot : {"mc0", "mc1"})
+            if (fs::is_regular_file(profileDir / slot / fpr::kSaveName / fpr::kSaveName, ec))
+                return true;
+        return false;
+    }
+
+    bool choseOwnCard(const fs::path &profileDir, bool *unreadable)
+    {
+        if (unreadable)
+            *unreadable = false;
+        const fs::path path = profileDir / "card.json";
+        std::error_code ec;
+        if (!fs::exists(path, ec))
+            return false;
+        auto unusable = [&]() {
+            if (unreadable)
+                *unreadable = true;
+            return false;
+        };
+        Bytes text;
+        if (!readFileBytes(path, text))
+            return unusable();
+        json::Value doc;
+        std::string why;
+        if (!json::parse(std::string(text.begin(), text.end()), doc, &why) || !doc.isObject())
+            return unusable();
+        const json::Value *format = doc.find("format");
+        const json::Value *version = doc.find("version");
+        const json::Value *use = doc.find("use");
+        if (!format || !format->isString() || format->text != "fpr-card" || !version || !version->isInt() || version->integer != 1 || !use || !use->isString())
+            return unusable();
+        return use->text == "base"; // any other word is no choice
+    }
+
+    CardPlan planCard(const fs::path &profileDir, size_t activePacks)
+    {
+        CardPlan plan;
+        if (activePacks > 0 && !profileDir.empty())
+        {
+            plan.useProfile = true;
+            plan.why = CardWhy::DataPacksOn;
+            return plan;
+        }
+        if (profileDir.empty() || !profileHasAnySave(profileDir))
+            return plan; // the base card; nothing was made and nothing is read
+        if (choseOwnCard(profileDir, &plan.recordUnreadable))
+        {
+            plan.why = CardWhy::ChoseOwnCard;
+            return plan;
+        }
+        plan.useProfile = true;
+        plan.why = CardWhy::StayedOnProfile;
+        return plan;
+    }
+
+    bool recordOwnCard(const fs::path &profileDir, std::string *message)
+    {
+        auto say = [&](const std::string &text) {
+            if (message)
+                *message = text;
+        };
+        if (!profileHasAnySave(profileDir))
+        {
+            say("The profile card has no save, so there is nothing to go back from.");
+            return false;
+        }
+        if (!writeFileAtomic(profileDir / "card.json", "{\n \"format\": \"fpr-card\",\n \"version\": 1,\n \"use\": \"base\"\n}\n"))
+        {
+            say("Your choice could not be saved (the file card.json in " + utf8(profileDir) + " could not be written), so nothing was changed.");
+            return false;
+        }
+        say("From the next start the game plays from your own card. The profile card stays on disk; turn a data pack on to use it again.");
+        return true;
+    }
+
+    bool clearOwnCardChoice(const fs::path &profileDir)
+    {
+        std::error_code ec;
+        fs::remove(profileDir / "card.json", ec);
+        fs::path leftover = profileDir / "card.json";
+        leftover += ".tmp";
+        fs::remove(leftover, ec);
+        return !fs::exists(profileDir / "card.json", ec);
+    }
+
+    Selection select(const Config &cfg)
+    {
+        Selection s;
+        const CardPlan plan = planCard(cfg.profileDir, cfg.packs.size());
+        s.useProfile = plan.useProfile;
+        s.why = plan.why;
+        if (plan.recordUnreadable)
+            s.log.push_back("profile: card.json could not be understood, so it counts as no choice");
+        if (!plan.useProfile)
+        {
+            s.line = plan.why == CardWhy::ChoseOwnCard ? ownCardChoiceLine() : baseCardLine();
+            if (plan.why == CardWhy::ChoseOwnCard)
+                s.log.push_back("profile: you chose Back to my card, so the game plays from your own card; the profile was not touched");
+            return s;
+        }
+        s.result.root0 = cfg.profileDir / "mc0";
+        // A data pack is on: the profile is the card again, and "stay on the profile" is the rule again after the pack goes off. The choice
+        // is cleared first, so a crash before the profile is built leaves the data-preserving state (the profile in use).
+        if (!cfg.packs.empty() && !clearOwnCardChoice(cfg.profileDir))
+            s.log.push_back("profile: card.json could not be removed");
+        if (cfg.failpoint == 3)
+            return s;
+        Config c = cfg;
+        fpr::CrcTable table{};
+        if (!c.crcTable && c.loadCrcTable)
+        {
+            std::string why;
+            if (c.loadCrcTable(table, &why))
+                c.crcTable = &table;
+            else
+                c.crcTableError = why;
+        }
+        s.result = prepare(c);
+        s.line = s.result.line;
+        s.log.insert(s.log.end(), s.result.log.begin(), s.result.log.end());
+        return s;
+    }
+
     // ---- building the profile -----------------------------------------------------------------------------------------
 
     Result prepare(const Config &cfg)
@@ -347,7 +482,11 @@ namespace ps2x::mods::profile
         r.packs.resize(cfg.packs.size());
         for (size_t i = 0; i < cfg.packs.size(); ++i)
             r.packs[i].id = cfg.packs[i].id;
-        const std::string cardWord = std::to_string(cfg.packs.size()) + " data " + plural(cfg.packs.size(), "pack", "packs");
+        const bool noPacks = cfg.packs.empty();
+        // "profile card with 2 data packs on", or, when the player stays on the profile with every pack off, "profile card (no data packs on)"
+        const std::string cardPhrase = noPacks ? std::string("profile card (no data packs on)")
+                                               : "profile card with " + std::to_string(cfg.packs.size()) + " data " + plural(cfg.packs.size(), "pack", "packs") + " on";
+        const std::string kNoApply = noPacks ? ", so the profile card was left as it was." : ", so no data pack was applied.";
 
         auto finish = [&]() {
             r.milliseconds = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
@@ -355,7 +494,7 @@ namespace ps2x::mods::profile
         };
         auto stop = [&](const std::string &reason) {
             r.problem = reason;
-            r.line = "Memory card: profile card with " + cardWord + " on. " + reason;
+            r.line = "Memory card: " + cardPhrase + ". " + reason;
             for (PackReport &p : r.packs)
                 if (p.error.empty())
                     p.notes.push_back(reason);
@@ -367,7 +506,7 @@ namespace ps2x::mods::profile
         fs::create_directories(r.root0, ec);
         fs::create_directories(root1, ec);
         if (!fs::is_directory(r.root0, ec))
-            return stop("The profile folder " + utf8(r.root0) + " cannot be created, so no data pack was applied.");
+            return stop("The profile folder " + utf8(r.root0) + " cannot be created" + kNoApply);
 
         settleInterruptedUpdate(cfg.profileDir, profileSave, r.log);
 
@@ -381,7 +520,7 @@ namespace ps2x::mods::profile
             {
                 std::string why;
                 if (!copyCardFolder(from, to, &why))
-                    return stop("The base card's save could not be copied to the profile (" + why + "), so no data pack was applied.");
+                    return stop("The base card's save could not be copied to the profile (" + why + ")" + kNoApply);
                 copied = true;
                 r.log.push_back("profile: copied the base card's slot " + std::to_string(slot + 1) + " save to the profile");
             }
@@ -390,7 +529,7 @@ namespace ps2x::mods::profile
         // 2. no save anywhere: nothing to apply to
         if (!fs::is_regular_file(profileSave, ec))
         {
-            r.line = "Memory card: profile card with " + cardWord + " on, but it has no save yet.";
+            r.line = "Memory card: " + cardPhrase + ", but it has no save yet.";
             for (PackReport &p : r.packs)
                 p.notes.push_back("No save to apply to yet: save once in the game, then restart.");
             r.log.push_back("profile: no save on the base card or the profile; nothing to apply");
@@ -400,17 +539,17 @@ namespace ps2x::mods::profile
 
         Bytes P;
         if (!readFileBytes(profileSave, P) || P.size() != fpr::kSaveSize)
-            return stop("The save on the profile card is not a Fire Pro Wrestling Returns save (" + std::to_string(P.size()) + " bytes), so no data pack was applied.");
+            return stop("The save on the profile card is not a Fire Pro Wrestling Returns save (" + std::to_string(P.size()) + " bytes)" + kNoApply);
         if (!cfg.crcTable)
             return stop("The game's checksum table could not be read (" + (cfg.crcTableError.empty() ? std::string("unknown reason") : cfg.crcTableError) +
-                        "), so no data pack was applied.");
+                        ")" + kNoApply);
         const fpr::CrcTable &table = *cfg.crcTable;
         {
             const fpr::Integrity in = fpr::checkIntegrity(P, table);
             if (!in.allOk())
-                return stop("The save on the profile card does not pass the game's own checks, so no data pack was applied.");
+                return stop("The save on the profile card does not pass the game's own checks" + kNoApply);
             if (!in.markersOk)
-                return stop("The save on the profile card is not from this version of the game, so no data pack was applied.");
+                return stop("The save on the profile card is not from this version of the game" + kNoApply);
         }
 
         // The ledger.
@@ -563,14 +702,14 @@ namespace ps2x::mods::profile
         {
             const std::string sha = fpr::sha256Hex(W);
             if (!writeFileAtomic(cfg.profileDir / "ledger.json.new", ledgerText(next, sha)))
-                return stop("The profile's ledger could not be written, so no data pack was applied.");
+                return stop("The profile's ledger could not be written" + kNoApply);
             if (cfg.failpoint == 1)
                 return finish();
             if (!writeFileAtomic(profileSave, std::string(reinterpret_cast<const char *>(W.data()), W.size())))
             {
                 std::error_code removeError;
                 fs::remove(cfg.profileDir / "ledger.json.new", removeError);
-                return stop("The profile's save could not be written, so no data pack was applied.");
+                return stop("The profile's save could not be written" + kNoApply);
             }
             if (cfg.failpoint == 2)
                 return finish();
@@ -585,7 +724,8 @@ namespace ps2x::mods::profile
                 r.log.push_back("profile: the ledger could not be written");
         }
         r.applied = true;
-        r.line = "Memory card: profile card with " + cardWord + " on (your own card is not changed).";
+        r.line = noPacks ? "Memory card: profile card (no data packs on; Back to my card returns to yours)."
+                         : "Memory card: " + cardPhrase + " (your own card is not changed).";
         r.log.push_back("profile: " + std::to_string(cfg.packs.size()) + " data " + plural(cfg.packs.size(), "pack", "packs") + ", " + std::to_string(next.size()) +
                         " fields owned (" + std::to_string(reverted) + " reverted first, " + std::to_string(frozen.size()) + " held by the player), save " +
                         (dataChanged ? "rewritten" : "unchanged") + (copied ? ", base card copied in" : ""));

@@ -79,6 +79,11 @@ namespace ps2x::ui
         virtual std::string cardLine() { return std::string(); }
         virtual bool canKeepCard() { return false; }
         virtual std::string keepCard() { return std::string(); }
+        // Task s3: "Back to my card" (the game plays from the player's own card again from the next start). canBackToOwnCard() is true only
+        // while no data pack is on and the profile has a save; backToOwnCard() records the choice (the menu has already asked) and returns
+        // one sentence.
+        virtual bool canBackToOwnCard() { return false; }
+        virtual std::string backToOwnCard() { return std::string(); }
     };
 
     class GameMenu

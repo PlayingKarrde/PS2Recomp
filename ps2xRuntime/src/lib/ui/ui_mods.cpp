@@ -1,6 +1,7 @@
 #include "ui_mods.h"
 
 #include "mod_manager.h"
+#include "path_text.h"
 
 #include <RmlUi/Core/Core.h>
 #include <RmlUi/Core/Element.h>
@@ -83,7 +84,7 @@ namespace ps2x::ui
             case Kind::Theme: return "A theme changes how this menu looks. It takes effect when the game starts.";
             case Kind::Assets: return "Replacement pictures (texture packs). They take effect when the game starts, and only with the GPU renderer.";
             case Kind::Code: return "Code mods are not supported yet, so this does nothing.";
-            case Kind::Data: return "A data pack changes what is in your save (names, for now). While one is on, the game plays from a copy of your memory card, and your own card is not changed. It takes effect when the game starts.";
+            case Kind::Data: return "A data pack changes what is in your save (names, for now). While one is on, the game plays from a copy of your memory card (the profile card), and your own card is not changed. It takes effect when the game starts. When the last one is turned off the game stays on the profile card, so your edits and saves are not hidden; Back to my card returns to your own.";
             default: return "This kind of mod does nothing yet. Support comes in a later version.";
             }
         }
@@ -140,7 +141,9 @@ namespace ps2x::ui
         if (Rml::Element *folder = byId("mods-folder"))
         {
             const auto folderText = m_manager->modsDir().u8string();
-            folder->SetInnerRML("Mods folder: " + text(std::string(folderText.begin(), folderText.end())));
+            // A long path would run into the buttons beside the line, so it is shortened in the middle.
+            static const std::string label = "Mods folder: ";
+            folder->SetInnerRML(label + text(ps2x::mods::shortenPath(std::string(folderText.begin(), folderText.end()), ps2x::mods::kModsLabelChars - label.size())));
         }
         refresh();
         return true;
@@ -598,7 +601,7 @@ namespace ps2x::ui
         if (!info || !window || !confirm || !cancel || m_confirming)
             return;
         m_confirming = true;
-        m_confirmKeep = false;
+        m_ask = Ask::Uninstall;
         m_confirmKey = info->key;
         if (Rml::Element *title = byId("mod-confirm-title"))
             title->SetInnerRML("Uninstall " + text(info->name) + "?");
@@ -609,14 +612,16 @@ namespace ps2x::ui
             yes->SetInnerRML("Uninstall");
             yes->SetAttribute("data-help", "Move the mod's file to the .trash folder.");
         }
+        cancel->SetAttribute("data-help", "Keep the mod.");
         window->SetClass("confirming", true);
         confirm->SetClass("hidden", false);
         m_document->UpdateDocument();
         cancel->Focus(true);
     }
 
-    // "Keep this card?": the same layer as the uninstall question, with its own words. Cancel has the focus.
-    void ModsPage::openKeepConfirm()
+    // The questions about the memory card ("Keep this card?", "Back to my card?"): the same layer as the uninstall question, with their own
+    // words. Cancel has the focus.
+    void ModsPage::openCardConfirm(Ask ask, const char *title, const char *body, const char *yes, const char *yesHelp)
     {
         Rml::Element *window = byId("window");
         Rml::Element *confirm = byId("mod-confirm");
@@ -624,21 +629,37 @@ namespace ps2x::ui
         if (!window || !confirm || !cancel || m_confirming)
             return;
         m_confirming = true;
-        m_confirmKeep = true;
+        m_ask = ask;
         m_confirmKey.clear();
-        if (Rml::Element *title = byId("mod-confirm-title"))
-            title->SetInnerRML("Keep this card?");
-        if (Rml::Element *body = byId("mod-confirm-text"))
-            body->SetInnerRML("Copies the save on the profile card over the one on your own card. Your own card's files are saved first, in the profile folder.");
-        if (Rml::Element *yes = byId("mod-confirm-yes"))
+        if (Rml::Element *element = byId("mod-confirm-title"))
+            element->SetInnerRML(title);
+        if (Rml::Element *element = byId("mod-confirm-text"))
+            element->SetInnerRML(body);
+        if (Rml::Element *element = byId("mod-confirm-yes"))
         {
-            yes->SetInnerRML("Keep Card");
-            yes->SetAttribute("data-help", "Copy the profile card's save to your own card.");
+            element->SetInnerRML(yes);
+            element->SetAttribute("data-help", yesHelp);
         }
+        cancel->SetAttribute("data-help", "Change nothing.");
         window->SetClass("confirming", true);
         confirm->SetClass("hidden", false);
         m_document->UpdateDocument();
         cancel->Focus(true);
+    }
+
+    void ModsPage::openKeepConfirm()
+    {
+        openCardConfirm(Ask::KeepCard, "Keep this card?",
+                        "Copies the save on the profile card over the one on your own card. Your own card's files are saved first, in the profile folder.",
+                        "Keep Card", "Copy the profile card's save to your own card.");
+    }
+
+    void ModsPage::openBackConfirm()
+    {
+        openCardConfirm(Ask::BackToOwnCard, "Back to my card?",
+                        "From the next start the game plays from your own memory card. The profile card, with your edits and saves, stays on disk "
+                        "and comes back when you turn a data pack on.",
+                        "Use My Card", "Use your own memory card from the next start.");
     }
 
     // The card line and the Keep Card button follow the host.
@@ -648,15 +669,17 @@ namespace ps2x::ui
             line->SetInnerRML(m_tools.cardLine ? text(m_tools.cardLine()) : std::string());
         if (Rml::Element *button = byId("keep-card"))
             button->SetProperty("display", m_tools.canKeepCard && m_tools.keepCard && m_tools.canKeepCard() ? "block" : "none");
+        if (Rml::Element *button = byId("back-card"))
+            button->SetProperty("display", m_tools.canBackToOwnCard && m_tools.backToOwnCard && m_tools.canBackToOwnCard() ? "block" : "none");
     }
 
     void ModsPage::leaveConfirm(bool refocus)
     {
         if (!m_document || !m_confirming)
             return;
-        const bool wasKeep = m_confirmKeep;
+        const Ask was = m_ask;
         m_confirming = false;
-        m_confirmKeep = false;
+        m_ask = Ask::Uninstall;
         if (Rml::Element *window = byId("window"))
             window->SetClass("confirming", false);
         if (Rml::Element *confirm = byId("mod-confirm"))
@@ -664,10 +687,10 @@ namespace ps2x::ui
         m_document->UpdateDocument();
         if (refocus)
         {
-            if (wasKeep)
+            if (was == Ask::KeepCard || was == Ask::BackToOwnCard)
             {
-                if (Rml::Element *keep = byId("keep-card"))
-                    keep->Focus(true);
+                if (Rml::Element *button = byId(was == Ask::KeepCard ? "keep-card" : "back-card"))
+                    button->Focus(true);
             }
             else
             {
@@ -745,17 +768,32 @@ namespace ps2x::ui
                     openKeepConfirm();
                     return;
                 }
+                if (e->GetId() == "back-card" && !m_confirming)
+                {
+                    openBackConfirm();
+                    return;
+                }
                 if (e->GetId() == "mod-confirm-yes")
                 {
                     if (!m_confirming)
                         return;
-                    if (m_confirmKeep)
+                    if (m_ask == Ask::KeepCard)
                     {
                         leaveConfirm(false);
                         setStatus(m_tools.keepCard ? m_tools.keepCard() : std::string());
                         updateCardRow();
                         if (Rml::Element *keep = byId("keep-card"))
                             keep->Focus(true);
+                        return;
+                    }
+                    if (m_ask == Ask::BackToOwnCard)
+                    {
+                        leaveConfirm(false);
+                        setStatus(m_tools.backToOwnCard ? m_tools.backToOwnCard() : std::string());
+                        updateCardRow();
+                        m_document->UpdateDocument();
+                        // The button is gone once the choice is made: the focus goes back to the list.
+                        focusSelectedRow();
                         return;
                     }
                     const std::string key = m_confirmKey;

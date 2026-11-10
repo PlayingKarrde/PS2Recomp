@@ -43,6 +43,7 @@
 #include "ps2_host_ui.h"
 
 #include "ps2_host_backend.h"
+#include "mods/path_text.h"
 #include "ps2_host_mods.h"
 #include "ps2_settings.h"
 #include "runtime/gs/gs_gpu_host.h"
@@ -302,16 +303,21 @@ namespace ps2x_host::ui
                 const std::string folder = ps2x_gs::devPackFolder();
                 if (folder.empty())
                     return std::string();
-                // One line, no wrapping: the folder when all is well, the newest complaint about a file when there is one.
+                // One line, no wrapping: the folder when all is well, the newest complaint about a file when there is one. Both are kept
+                // short enough not to run into the buttons beside the line (a long folder is cut in the middle, a long complaint at its end).
                 const auto notes = ps2x_gs::devPackNotes();
                 if (!notes.empty())
-                    return "Dev pack: " + notes.back();
-                return "Dev pack folder: " + folder + (ps2x_gs::textureToolsOn() ? std::string() : std::string("  (Texture Tools are off)"));
+                    return "Dev pack: " + ps2x::mods::shortenEnd(notes.back(), ps2x::mods::kModsLabelChars - 10);
+                const std::string suffix = ps2x_gs::textureToolsOn() ? std::string() : std::string(" (Texture Tools off)");
+                const std::string label = "Dev pack folder: ";
+                return label + ps2x::mods::shortenPath(folder, ps2x::mods::kModsLabelChars - label.size() - suffix.size()) + suffix;
             }
             // Data packs (task s2): which memory card the game is using, and "Keep this card".
             std::string cardLine() override { return ps2x_host_mods::cardLine(); }
             bool canKeepCard() override { return ps2x_host_mods::canKeepCard(); }
             std::string keepCard() override { return ps2x_host_mods::keepCard(); }
+            bool canBackToOwnCard() override { return ps2x_host_mods::canBackToOwnCard(); }
+            std::string backToOwnCard() override { return ps2x_host_mods::backToOwnCard(); }
             std::string dumpTextures() override { return ps2x_gs::requestTextureDump(); }
             void openDumpsFolder() override { ps2x_gs::openFolder(ps2x_gs::dumpsFolder()); }
             std::string lastDumpResult() override

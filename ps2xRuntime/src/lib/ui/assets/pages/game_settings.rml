@@ -76,15 +76,20 @@
             </div>
             <div id="mods-status"></div>
             <div id="mods-foot">
-                <div id="mods-paths">
-                    <div id="mods-folder"></div>
-                    <div id="dev-folder"></div>
-                    <div id="mods-card"></div>
-                </div>
-                <div id="mods-tools">
-                    <div class="mbtn small" id="keep-card" data-help="Copy the profile card's save to your own card (asks first).">Keep Card</div>
-                    <div class="mbtn small" id="dump-textures" data-help="For modders: save this screen's textures and text to a dumps folder.">Dump Textures</div>
-                    <div class="mbtn small" id="open-dumps" data-help="For modders: open the folder the texture dumps go to.">Dumps Folder</div>
+                <!-- Which memory card is in use and why: the whole width, and it wraps. -->
+                <div id="mods-card"></div>
+                <div id="mods-lower">
+                    <!-- The folder lines are shortened in the middle by the code, and clipped here as a last resort, so they never run under the buttons. -->
+                    <div id="mods-paths">
+                        <div id="mods-folder"></div>
+                        <div id="dev-folder"></div>
+                    </div>
+                    <div id="mods-tools">
+                        <div class="mbtn small" id="keep-card" data-help="Copy the profile card's save to your own card (asks first).">Keep Card</div>
+                        <div class="mbtn small" id="back-card" data-help="Play from your own memory card from the next start (asks first).">Back to My Card</div>
+                        <div class="mbtn small" id="dump-textures" data-help="For modders: save this screen's textures and text to a dumps folder.">Dump Textures</div>
+                        <div class="mbtn small" id="open-dumps" data-help="For modders: open the folder the texture dumps go to.">Dumps Folder</div>
+                    </div>
                 </div>
             </div>
         </div>
