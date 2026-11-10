@@ -999,6 +999,11 @@ bool PS2Runtime::initialize(const char *title)
 bool PS2Runtime::loadELF(const std::string &elfPath)
 {
     configureIoPathsFromElf(elfPath);
+#if !defined(PLATFORM_VITA)
+    // Data packs (mod kind "data"): with at least one active, the memory card root becomes the profile card (a copy of the player's
+    // card with the packs applied), before the game's first card call. Without one this does nothing.
+    ps2x_host_mods::selectCard(elfPath);
+#endif
 
     std::ifstream file(elfPath, std::ios::binary);
     if (!file)

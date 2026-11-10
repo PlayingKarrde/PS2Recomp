@@ -624,6 +624,15 @@ body
     color: #e7bc3d;
 }
 
+#mod-infonotes
+{
+    margin-top: 6dp;
+    font-size: 16dp;
+    font-weight: normal;
+    letter-spacing: 0.5dp;
+    color: #8fd18f;
+}
+
 .mod-notes-line
 {
     margin-top: 2dp;
@@ -769,7 +778,8 @@ body
 }
 
 #mods-folder,
-#dev-folder
+#dev-folder,
+#mods-card
 {
     height: 20dp;
     overflow: hidden;

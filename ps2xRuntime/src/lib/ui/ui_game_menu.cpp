@@ -89,6 +89,9 @@ namespace ps2x::ui
                 tools.dumpTextures = [this]() { return host->dumpTextures(); };
                 tools.openDumpsFolder = [this]() { host->openDumpsFolder(); };
                 tools.lastDumpResult = [this]() { return host->lastDumpResult(); };
+                tools.cardLine = [this]() { return host->cardLine(); };
+                tools.canKeepCard = [this]() { return host->canKeepCard(); };
+                tools.keepCard = [this]() { return host->keepCard(); };
                 mods.setTools(std::move(tools));
                 modsAttached = true;
             }

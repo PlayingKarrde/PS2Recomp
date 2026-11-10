@@ -26,6 +26,7 @@ void register_gs_font_tests();
 void register_ui_settings_tests();
 #if defined(PS2X_HAS_MODS_TESTS)
 void register_mod_manager_tests();
+void register_data_pack_tests();
 #endif
 void reset_ps2_test_function_table();
 
@@ -65,6 +66,7 @@ int main()
     register_ui_settings_tests();
 #if defined(PS2X_HAS_MODS_TESTS)
     register_mod_manager_tests();
+    register_data_pack_tests();
 #endif
     int res = MiniTest::Run();
     std::cout.flush();

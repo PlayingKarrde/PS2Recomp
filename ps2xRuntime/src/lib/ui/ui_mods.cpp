@@ -83,6 +83,7 @@ namespace ps2x::ui
             case Kind::Theme: return "A theme changes how this menu looks. It takes effect when the game starts.";
             case Kind::Assets: return "Replacement pictures (texture packs). They take effect when the game starts, and only with the GPU renderer.";
             case Kind::Code: return "Code mods are not supported yet, so this does nothing.";
+            case Kind::Data: return "A data pack changes what is in your save (names, for now). While one is on, the game plays from a copy of your memory card, and your own card is not changed. It takes effect when the game starts.";
             default: return "This kind of mod does nothing yet. Support comes in a later version.";
             }
         }
@@ -135,6 +136,7 @@ namespace ps2x::ui
             document->AddEventListener(type, this);
         document->AddEventListener("keydown", this, true);
         listenToFocus(byId("mod-confirm"));
+        listenToFocus(byId("mods-tools")); // the Keep Card, Dump Textures and Dumps Folder buttons show their help line too
         if (Rml::Element *folder = byId("mods-folder"))
         {
             const auto folderText = m_manager->modsDir().u8string();
@@ -150,8 +152,11 @@ namespace ps2x::ui
         const std::string line = m_tools.devPackLine ? m_tools.devPackLine() : std::string();
         if (Rml::Element *dev = byId("dev-folder"))
             dev->SetInnerRML(line.empty() ? std::string() : text(line));
-        if (Rml::Element *buttons = byId("mods-tools"))
-            buttons->SetProperty("display", line.empty() ? "none" : "flex");
+        // The modder's buttons only with the dev pack line; the card row has its own button.
+        for (const char *id : {"dump-textures", "open-dumps"})
+            if (Rml::Element *button = byId(id))
+                button->SetProperty("display", line.empty() ? "none" : "block");
+        updateCardRow();
         if (m_tools.lastDumpResult)
         {
             const std::string last = m_tools.lastDumpResult();
@@ -205,6 +210,7 @@ namespace ps2x::ui
         if (m_tools.devPackLine)
             if (Rml::Element *dev = byId("dev-folder"))
                 dev->SetInnerRML(text(m_tools.devPackLine())); // the line carries the newest complaint about a dev pack file
+        updateCardRow();
         const auto mods = m_manager->list();
         const bool there = std::any_of(mods.begin(), mods.end(), [&](const ModInfo &m) { return m.key == m_selected; });
         if (!there)
@@ -340,6 +346,18 @@ namespace ps2x::ui
                     rml += "<div class=\"mod-notes-line\">" + text(notes[i]) + "</div>";
                 if (notes.size() > shown)
                     rml += "<div class=\"mod-notes-line\">and " + std::to_string(notes.size() - shown) + " more (see the log).</div>";
+                rml += "</div>";
+            }
+            // What a data pack did to the memory card (and what it kept of the player's own changes).
+            const std::vector<std::string> infos = m_manager->infoNotes(m.id);
+            if (!infos.empty())
+            {
+                rml += "<div id=\"mod-infonotes\">On your memory card:";
+                const size_t shown = std::min<size_t>(infos.size(), 5);
+                for (size_t i = 0; i < shown; ++i)
+                    rml += "<div class=\"mod-notes-line\">" + text(infos[i]) + "</div>";
+                if (infos.size() > shown)
+                    rml += "<div class=\"mod-notes-line\">and " + std::to_string(infos.size() - shown) + " more (see the log).</div>";
                 rml += "</div>";
             }
             std::string links;
@@ -580,29 +598,82 @@ namespace ps2x::ui
         if (!info || !window || !confirm || !cancel || m_confirming)
             return;
         m_confirming = true;
+        m_confirmKeep = false;
         m_confirmKey = info->key;
         if (Rml::Element *title = byId("mod-confirm-title"))
             title->SetInnerRML("Uninstall " + text(info->name) + "?");
         if (Rml::Element *body = byId("mod-confirm-text"))
             body->SetInnerRML("The file is moved to the .trash folder inside the mods folder. You can put it back by hand.");
+        if (Rml::Element *yes = byId("mod-confirm-yes"))
+        {
+            yes->SetInnerRML("Uninstall");
+            yes->SetAttribute("data-help", "Move the mod's file to the .trash folder.");
+        }
         window->SetClass("confirming", true);
         confirm->SetClass("hidden", false);
         m_document->UpdateDocument();
         cancel->Focus(true);
     }
 
+    // "Keep this card?": the same layer as the uninstall question, with its own words. Cancel has the focus.
+    void ModsPage::openKeepConfirm()
+    {
+        Rml::Element *window = byId("window");
+        Rml::Element *confirm = byId("mod-confirm");
+        Rml::Element *cancel = byId("mod-confirm-no");
+        if (!window || !confirm || !cancel || m_confirming)
+            return;
+        m_confirming = true;
+        m_confirmKeep = true;
+        m_confirmKey.clear();
+        if (Rml::Element *title = byId("mod-confirm-title"))
+            title->SetInnerRML("Keep this card?");
+        if (Rml::Element *body = byId("mod-confirm-text"))
+            body->SetInnerRML("Copies the save on the profile card over the one on your own card. Your own card's files are saved first, in the profile folder.");
+        if (Rml::Element *yes = byId("mod-confirm-yes"))
+        {
+            yes->SetInnerRML("Keep Card");
+            yes->SetAttribute("data-help", "Copy the profile card's save to your own card.");
+        }
+        window->SetClass("confirming", true);
+        confirm->SetClass("hidden", false);
+        m_document->UpdateDocument();
+        cancel->Focus(true);
+    }
+
+    // The card line and the Keep Card button follow the host.
+    void ModsPage::updateCardRow()
+    {
+        if (Rml::Element *line = byId("mods-card"))
+            line->SetInnerRML(m_tools.cardLine ? text(m_tools.cardLine()) : std::string());
+        if (Rml::Element *button = byId("keep-card"))
+            button->SetProperty("display", m_tools.canKeepCard && m_tools.keepCard && m_tools.canKeepCard() ? "block" : "none");
+    }
+
     void ModsPage::leaveConfirm(bool refocus)
     {
         if (!m_document || !m_confirming)
             return;
+        const bool wasKeep = m_confirmKeep;
         m_confirming = false;
+        m_confirmKeep = false;
         if (Rml::Element *window = byId("window"))
             window->SetClass("confirming", false);
         if (Rml::Element *confirm = byId("mod-confirm"))
             confirm->SetClass("hidden", true);
         m_document->UpdateDocument();
         if (refocus)
-            focusAction("uninstall");
+        {
+            if (wasKeep)
+            {
+                if (Rml::Element *keep = byId("keep-card"))
+                    keep->Focus(true);
+            }
+            else
+            {
+                focusAction("uninstall");
+            }
+        }
     }
 
     void ModsPage::closeConfirm()
@@ -669,10 +740,24 @@ namespace ps2x::ui
                     leaveConfirm(true);
                     return;
                 }
+                if (e->GetId() == "keep-card" && !m_confirming)
+                {
+                    openKeepConfirm();
+                    return;
+                }
                 if (e->GetId() == "mod-confirm-yes")
                 {
                     if (!m_confirming)
                         return;
+                    if (m_confirmKeep)
+                    {
+                        leaveConfirm(false);
+                        setStatus(m_tools.keepCard ? m_tools.keepCard() : std::string());
+                        updateCardRow();
+                        if (Rml::Element *keep = byId("keep-card"))
+                            keep->Focus(true);
+                        return;
+                    }
                     const std::string key = m_confirmKey;
                     leaveConfirm(false);
                     const ps2x::mods::Result result = m_manager->uninstall(key);

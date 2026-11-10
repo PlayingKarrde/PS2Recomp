@@ -74,6 +74,11 @@ namespace ps2x::ui
         virtual std::string dumpTextures() { return std::string(); }
         virtual void openDumpsFolder() {}
         virtual std::string lastDumpResult() { return std::string(); }
+        // Data packs (task s2): the line under the mods saying which memory card the game is using ("" leaves it out), whether "Keep this
+        // card" has a profile save to copy, and doing it (one sentence back; the menu has already asked "are you sure").
+        virtual std::string cardLine() { return std::string(); }
+        virtual bool canKeepCard() { return false; }
+        virtual std::string keepCard() { return std::string(); }
     };
 
     class GameMenu

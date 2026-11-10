@@ -1008,6 +1008,31 @@ namespace ps2x::mods
         return found == m_runtimeNotes.end() ? std::vector<std::string>() : found->second;
     }
 
+    void Manager::addInfoNote(const std::string &modId, const std::string &note)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        std::vector<std::string> &notes = m_infoNotes[modId];
+        if (notes.size() >= kMaxInfoNotes || std::find(notes.begin(), notes.end(), note) != notes.end())
+            return;
+        notes.push_back(note);
+    }
+
+    std::vector<std::string> Manager::infoNotes(const std::string &modId) const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        const auto found = m_infoNotes.find(modId);
+        return found == m_infoNotes.end() ? std::vector<std::string>() : found->second;
+    }
+
+    bool Manager::hasFile(const std::string &modId, const std::string &path) const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        const Slot *slot = slotLocked(modId);
+        if (!slot || !slot->info.valid)
+            return false;
+        return std::any_of(slot->entries.begin(), slot->entries.end(), [&](const PackageEntry &entry) { return !entry.isDirectory && entry.name == path; });
+    }
+
     std::optional<std::vector<uint8_t>> Manager::readFile(const std::string &modId, const std::string &path, uint64_t maxBytes,
                                                           std::string *error) const
     {

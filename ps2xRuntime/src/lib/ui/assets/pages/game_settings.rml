@@ -79,8 +79,10 @@
                 <div id="mods-paths">
                     <div id="mods-folder"></div>
                     <div id="dev-folder"></div>
+                    <div id="mods-card"></div>
                 </div>
                 <div id="mods-tools">
+                    <div class="mbtn small" id="keep-card" data-help="Copy the profile card's save to your own card (asks first).">Keep Card</div>
                     <div class="mbtn small" id="dump-textures" data-help="For modders: save this screen's textures and text to a dumps folder.">Dump Textures</div>
                     <div class="mbtn small" id="open-dumps" data-help="For modders: open the folder the texture dumps go to.">Dumps Folder</div>
                 </div>

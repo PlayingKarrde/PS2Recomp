@@ -61,6 +61,11 @@ namespace ps2x::ui
             std::function<std::string()> dumpTextures;
             std::function<void()> openDumpsFolder;
             std::function<std::string()> lastDumpResult;
+            // Data packs: the line saying which memory card is in use (#mods-card), and "Keep this card" (#keep-card: shown only while
+            // canKeepCard() is true; asks first; keepCard() does it and returns one sentence).
+            std::function<std::string()> cardLine;
+            std::function<bool()> canKeepCard;
+            std::function<std::string()> keepCard;
         };
         void setTools(Tools tools);
 
@@ -97,6 +102,9 @@ namespace ps2x::ui
         size_t m_picture = 0;     // which of the mod's pictures shows
         bool m_confirming = false;
         std::string m_confirmKey; // the mod the question is about
+        bool m_confirmKeep = false; // the question is "Keep this card?" rather than the uninstall one
+        void openKeepConfirm();
+        void updateCardRow();
         std::function<void()> m_onChange;
         Tools m_tools;
     };

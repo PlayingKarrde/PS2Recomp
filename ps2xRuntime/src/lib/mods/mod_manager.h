@@ -176,6 +176,14 @@ namespace ps2x::mods
         static constexpr size_t kMaxRuntimeNotes = 24;
         void addRuntimeNote(const std::string &modId, const std::string &note);
         std::vector<std::string> runtimeNotes(const std::string &modId) const;
+        // The same for lines that are not complaints (a data pack: "Changes 1,200 fields on the profile card.", "Kept your change to
+        // wrestler 12's FIRST name."). The Mods tab shows them on the mod's page under "On your memory card". Repeats are kept once, at
+        // most kMaxInfoNotes per mod.
+        static constexpr size_t kMaxInfoNotes = 40;
+        void addInfoNote(const std::string &modId, const std::string &note);
+        std::vector<std::string> infoNotes(const std::string &modId) const;
+        // True when the installed mod `modId` (on or off) has the file `path`.
+        bool hasFile(const std::string &modId, const std::string &path) const;
         // One file of one installed mod, on or off (the details page's pictures, a theme's images). nullopt if missing.
         std::optional<std::vector<uint8_t>> readFile(const std::string &modId, const std::string &path, uint64_t maxBytes = 16ull * 1024 * 1024,
                                                      std::string *error = nullptr) const;
@@ -215,5 +223,6 @@ namespace ps2x::mods
         std::vector<std::unique_ptr<Slot>> m_slots; // valid mods in load order, then the invalid ones by file name
         std::unique_ptr<Session> m_session;
         std::map<std::string, std::vector<std::string>> m_runtimeNotes; // by mod id
+        std::map<std::string, std::vector<std::string>> m_infoNotes;    // by mod id
     };
 }

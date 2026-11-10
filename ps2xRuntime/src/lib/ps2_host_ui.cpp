@@ -308,6 +308,10 @@ namespace ps2x_host::ui
                     return "Dev pack: " + notes.back();
                 return "Dev pack folder: " + folder + (ps2x_gs::textureToolsOn() ? std::string() : std::string("  (Texture Tools are off)"));
             }
+            // Data packs (task s2): which memory card the game is using, and "Keep this card".
+            std::string cardLine() override { return ps2x_host_mods::cardLine(); }
+            bool canKeepCard() override { return ps2x_host_mods::canKeepCard(); }
+            std::string keepCard() override { return ps2x_host_mods::keepCard(); }
             std::string dumpTextures() override { return ps2x_gs::requestTextureDump(); }
             void openDumpsFolder() override { ps2x_gs::openFolder(ps2x_gs::dumpsFolder()); }
             std::string lastDumpResult() override

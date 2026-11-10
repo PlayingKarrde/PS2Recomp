@@ -51,6 +51,34 @@ namespace ps2x_host_mods
     // pictures they and the Mods tab show. False when there is no such file.
     bool readVirtualFile(const std::string &name, std::vector<uint8_t> &bytes);
 
+    // ---- data packs: the profile card (docs/mod-layer.md "Data packs: save profiles") ----
+    // Called by the runtime when the game's executable is loaded, right after the memory card folders were set from it and before the
+    // game's first card call. If at least one data pack is active in the session, builds or updates the profile card
+    // (<pref folder>/profile, see mods/profile.h) and points the memory card root at its mc0; otherwise does nothing at all (no folder is
+    // made) and the game keeps using the base card next to the executable. `elfPath` is the game executable: the checksum table the
+    // game's save integrity needs is read from it.
+    void selectCard(const std::string &elfPath);
+    // The Mods tab's line saying which card the game is using ("" without a manager).
+    std::string cardLine();
+    // "Keep this card": true when the profile has a save to copy to the base card.
+    bool canKeepCard();
+    // Copies the profile's save to the base card (after backing the base card's files up). One sentence for the player.
+    std::string keepCard();
+
+    // ---- data packs: the profile card (docs/mod-layer.md "Data packs: save profiles") ----
+    // Called by the runtime when the game's executable is loaded, right after the memory card folders were set from it and before the
+    // game's first card call. If at least one data pack is active in the session, builds or updates the profile card
+    // (<pref folder>/profile, see mods/profile.h) and points the memory card root at its mc0; otherwise does nothing at all (no folder is
+    // made) and the game keeps using the base card next to the executable. `elfPath` is the game executable: the checksum table the
+    // game's save integrity needs is read from it.
+    void selectCard(const std::string &elfPath);
+    // The Mods tab's line saying which card the game is using ("" without a manager).
+    std::string cardLine();
+    // "Keep this card": true when the profile has a save to copy to the base card.
+    bool canKeepCard();
+    // Copies the profile's save to the base card (after backing the base card's files up). One sentence for the player.
+    std::string keepCard();
+
     struct DropOutcome
     {
         bool handled = false; // the manager exists and looked at the file
