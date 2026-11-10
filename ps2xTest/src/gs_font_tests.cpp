@@ -384,7 +384,7 @@ void register_gs_font_tests()
             source->addCoverage("c44.png", 128, flat128, "mod.b", 1); // same mod, same glyph: the code name wins over the character name
             FontHD::Atlas atlas(source);
             t.Equals(atlas.scale(), 4u, "the largest scale");
-            t.Equals(atlas.stats().files, 3u, "three glyphs have a usable picture (0x41, 0x42, 0x44)");
+            t.Equals(atlas.stats().files, 4u, "four glyphs have a usable picture (0x41, 0x42, 0x44, and the full-width D 0x8263 through u0044)");
             t.Equals(atlas.stats().refused, 1u, "one refused");
             t.IsTrue(!source->problems.empty() && source->problems[0].find("48x48") != std::string::npos, "the reason names the size");
             std::vector<uint8_t> small;
@@ -404,7 +404,22 @@ void register_gs_font_tests()
             std::vector<uint8_t> a;
             t.IsTrue(atlas.GlyphPicture(0x41, false, a) && a[16 * 32 + 16] == 200, "mod.b's u0041 beats mod.a's c41");
             t.IsTrue(!source->problems.empty() && source->problems[0].find("c8000.png") != std::string::npos, "c8000 is refused: no slot");
-            t.Equals(atlas.stats().files, 1u, "files counts the glyphs mods provide (u0041 stands for the one code 0x41)");
+            t.Equals(atlas.stats().files, 2u, "files counts the glyphs mods provide (u0041 stands for 0x41 and the full-width A 0x8260)");
+        });
+
+        tc.Run("an ASCII character name also covers its full-width form, unless the full-width one is named", [](TestCase &t)
+        {
+            auto source = std::make_shared<MemorySource>();
+            std::vector<uint8_t> ascii(32 * 32, 60), wide(32 * 32, 220);
+            source->addCoverage("u0041.png", 32, ascii);
+            source->addCoverage("u0042.png", 32, ascii);
+            source->addCoverage("uff22.png", 32, wide); // the full-width B named by its own character
+            FontHD::Atlas atlas(source);
+            std::vector<uint8_t> p;
+            t.IsTrue(atlas.GlyphPicture(0x8260, false, p) && p[16 * 32 + 16] == 60, "u0041 covers the full-width A (0x8260)");
+            t.IsTrue(atlas.GlyphPicture(0x41, false, p) && p[16 * 32 + 16] == 60, "and the ASCII A");
+            t.IsTrue(atlas.GlyphPicture(0x8261, false, p) && p[16 * 32 + 16] == 220, "uff22 beats u0042 for the full-width B");
+            t.IsTrue(atlas.GlyphPicture(0x42, false, p) && p[16 * 32 + 16] == 60, "u0042 still covers the ASCII B");
         });
 
         tc.Run("reload reads the files again and the generation changes", [](TestCase &t)

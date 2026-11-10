@@ -391,7 +391,9 @@ namespace
     {
         std::string path, provider;
         uint32_t order = 0;
-        bool codeName = false; // c41.png (beats u0041.png of the same mod)
+        // Within one mod: 2 = named by code (c8260.png), 1 = by its own character (uff21.png), 0 = folded from ASCII
+        // (u0041.png also standing for the full-width A that names use). A higher rank wins; a later mod wins whatever the rank.
+        uint8_t rank = 0;
         uint32_t scale = 0;    // from the picture's header; 0 until read
         bool refused = false;
     };
@@ -455,20 +457,20 @@ struct Atlas::Impl
         uint32_t files = 0, refused = 0;
         uint32_t maxScale = 1;
         std::vector<TexPack::FileSource::Entry> entries = source ? source->list(kFontPrefix) : std::vector<TexPack::FileSource::Entry>();
-        auto offer = [&](uint32_t id, const TexPack::FileSource::Entry &e, bool codeName)
+        auto offer = [&](uint32_t id, const TexPack::FileSource::Entry &e, uint8_t rank)
         {
             auto it = fresh.find(id);
             if (it != fresh.end())
             {
                 const FileRef &cur = it->second;
-                if (cur.order > e.order || (cur.order == e.order && cur.codeName >= codeName))
+                if (cur.order > e.order || (cur.order == e.order && cur.rank >= rank))
                     return;
             }
             FileRef ref;
             ref.path = e.path;
             ref.provider = e.provider;
             ref.order = e.order;
-            ref.codeName = codeName;
+            ref.rank = rank;
             fresh[id] = ref;
         };
         for (const auto &e : entries)
@@ -479,7 +481,12 @@ struct Atlas::Impl
             if (name.unicode)
             {
                 for (uint32_t code : CodesOfUnicode(name.value))
-                    offer(PackId(code, name.bold), e, false);
+                    offer(PackId(code, name.bold), e, 1);
+                // ASCII ! to ~ also stands for its full-width form (U+FF01..U+FF5E), which wrestler names and most menus use,
+                // unless a file names the full-width character or code itself.
+                if (name.value >= 0x21u && name.value <= 0x7Eu)
+                    for (uint32_t code : CodesOfUnicode(name.value + 0xFEE0u))
+                        offer(PackId(code, name.bold), e, 0);
             }
             else
             {
@@ -488,7 +495,7 @@ struct Atlas::Impl
                     note(e.provider, baseName(e.path) + " is not a glyph code the game's font has (codes are 0x20-0x7F and the Shift-JIS two-byte codes)");
                     continue;
                 }
-                offer(PackId(name.value, name.bold), e, true);
+                offer(PackId(name.value, name.bold), e, 2);
             }
         }
         // sizes: each distinct file once
