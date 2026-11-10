@@ -67,6 +67,13 @@ namespace ps2x::ui
         virtual std::string controllerName() { return std::string(); }
         // The mod manager the Mods tab works on, or nullptr: the tab is then left out of the menu. It must outlive the menu.
         virtual ps2x::mods::Manager *modManager() { return nullptr; }
+        // The modder's tools shown at the foot of the Mods tab (task t2): where the dev pack folder is, and the dump button. An empty
+        // devPackLine leaves the tools out. dumpTextures returns one line saying what started (or why not); openDumpsFolder opens the
+        // folder dumps go to; lastDumpResult is the result of the last dump ("" if none yet).
+        virtual std::string devPackLine() { return std::string(); }
+        virtual std::string dumpTextures() { return std::string(); }
+        virtual void openDumpsFolder() {}
+        virtual std::string lastDumpResult() { return std::string(); }
     };
 
     class GameMenu

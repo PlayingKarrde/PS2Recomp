@@ -84,6 +84,12 @@ namespace ps2x::ui
             if (withMods && mods.attach(document, host->modManager()))
             {
                 mods.setOnChange([this]() { refresh(); });
+                ModsPage::Tools tools;
+                tools.devPackLine = [this]() { return host->devPackLine(); };
+                tools.dumpTextures = [this]() { return host->dumpTextures(); };
+                tools.openDumpsFolder = [this]() { host->openDumpsFolder(); };
+                tools.lastDumpResult = [this]() { return host->lastDumpResult(); };
+                mods.setTools(std::move(tools));
                 modsAttached = true;
             }
 #endif

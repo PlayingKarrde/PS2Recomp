@@ -73,6 +73,8 @@
 #include "runtime/gs/gs_gpu_backend.h"
 
 #include "runtime/gs/gs_fast_hash.h"
+#include "runtime/gs/gs_font.h"
+#include "runtime/gs/gs_png.h"
 #include "runtime/gs/gs_gpu_threads.h"
 #include "runtime/gs/gs_gpu_math.h"
 #include "runtime/gs/gs_presentation.h"
@@ -106,9 +108,11 @@
 #include <deque>
 #include <filesystem>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 using namespace GSGpu;
@@ -168,6 +172,7 @@ namespace
         TexKeys::LiveKey key;              // the live key; for a fallback key `key.rect` is the tile rectangle
         uint64_t primary = 0, k3c = 0;     // the key the files are named by, and the colouring key (0: none)
         bool fallback = false;
+        bool font = false;                 // the game's glyph canvas, replaced by the HD text atlas (gs_font.h) rather than by a picture of a pack
         uint32_t paletteCount = 0;         // indexed textures: 16 or 256
         std::shared_ptr<std::array<uint32_t, 256>> palette; // indexed textures: the resolved palette
         uint64_t repId = 0;                // Attached: the replacement picture's id in Impl::repTextures
@@ -367,7 +372,26 @@ namespace
     TexCensus::Census *census = nullptr;
     TexDump::Dumper *dumper = nullptr;
     TexPack::Store *packStore = nullptr; // null when no pack is loaded (the usual case)
+    std::unique_ptr<FontHD::Atlas> gFont;
+    FontHD::Atlas *fontAtlas = nullptr;  // null when no mod ships glyph pictures (the usual case): HD text (task t2, gs_font.h)
+    bool gFontHide = false;              // PS2X_FONT_HIDE=1: do not draw the glyph canvas at all (a test aid: what text is NOT drawn from it?)
+    std::string gFontHideFile;           // PS2X_FONT_HIDE_FILE=<file>: hidden while that file exists (polled)
+    std::shared_ptr<TexPack::DevPackSource> gDevPack; // the dev pack folder (authoring), watched for changes
+    std::atomic<bool> gFontReload{false};              // asked for from another thread: the font pictures are read again at the next marker
+    uint64_t gFontPrepNanos = 0, gFontPrepMax = 0, gFontPrepCount = 0;
+    std::string gDumpRequestFile;                      // PS2X_TEX_DUMP_REQUEST_FILE=<file> (a test aid): while it exists its text is a folder to dump the screen to
     bool gTexToolsInit = false;
+    // PS2X_FONT_TRACE=<file>[,<tbp>] (task t2): a line for every textured draw from the texture at TBP (default 15872, the game's glyph
+    // canvas), with the draw's state and vertices, for finding out how the game draws text (docs/formats/text.md). Off unless set.
+    std::FILE *gFontTrace = nullptr;
+    std::string gFontTracePath;
+    uint32_t gFontTraceTbp = 15872u;
+    uint64_t gFontTraceSceneMarker = ~0ull;
+    uint64_t gFontTraceDrawMarker = ~0ull;
+    uint32_t gFontTraceDrawsInMarker = 0;
+    uint32_t gFontTraceEvery = 8, gFontTraceMaxPerMarker = 400;
+    std::string gFontTraceScene;
+    std::vector<uint64_t> gFontTraceCluts;
 }
 
 struct GSGpuBackend::Impl
@@ -470,7 +494,32 @@ struct GSGpuBackend::Impl
     uint64_t repGeneration = 0; // the store generation the replacement pictures on the GPU belong to
     std::string repReloadTrigger; // PS2X_TEX_PACK_RELOAD_FILE: when this file appears the packs are reloaded and the file is deleted
     void prepareReplacement(GpuTexture &g, const GSDrawState &state, const Setup &setup);
+    void prepareFont(GpuTexture &g, const GSDrawState &state);
+    void syncRepGeneration();
+    // ---- "Dump textures on this screen" (task t2): asked for from any thread (RequestTextureDump), carried out by the GS thread at markers.
+    // The textures the draws of the next two markers use are keyed and written (dumpDraw), then the glyphs of the text canvas they drew
+    // (finishDump), a contact sheet and the csv files.
+    mutable std::mutex dumpMutex;
+    std::string dumpAsked;               // the folder asked for (dumpState 1)
+    std::string dumpMessage;             // the last result, for the panel
+    std::atomic<int> dumpState{0};       // 0 idle, 1 asked, 2 capturing
+    std::unique_ptr<TexDump::Dumper> dumpOne;
+    std::string dumpDir;
+    uint32_t dumpFramesLeft = 0;
+    std::unordered_set<uint64_t> dumpSeen;
+    struct DumpCanvas
+    {
+        uint64_t content = 0;
+        std::vector<uint8_t> texels;
+    };
+    std::vector<DumpCanvas> dumpCanvases;
+    std::set<std::pair<uint32_t, uint32_t>> dumpCells; // (canvas, cell index) the capturing frames drew from
+    void dumpDraw(GpuTexture &g, const GSDrawState &state, const Setup &setup, bool fontCanvas);
+    void startDump();
+    void finishDump();
+    RepGpu *createRepGpu(uint64_t id, uint32_t w, uint32_t h, int scale, TexPack::Kind kind, const uint8_t *pixels, size_t bytes);
     void keyTexture(GpuTexture &g, const GSDrawState &state, const Setup &setup);
+    void keyInto(TexRep &r, const GpuTexture &g, const GSDrawState &state, const Setup &setup, TexDump::Dumper *to);
     void lookupReplacement(GpuTexture &g, const GSDrawState &state);
     RepGpu *replacementGpu(const TexPack::Lookup &lookup);
     uint32_t addRepDraw(const GpuTexture &g);
@@ -642,6 +691,7 @@ struct GSGpuBackend::Impl
     void printStats();
     void logMarkerRow(uint64_t markNs);
     void noteTextureUse(SDL_GPUTexture *tex, const GSDrawState &state, const Setup &setup);
+    void traceFontDraw(const GSDrawState &state, const Setup &setup);
     void writeMissLog();
     bool ensureBuffers(size_t vertexBytes, size_t transferBytes);
 
@@ -675,7 +725,7 @@ bool GSGpuBackend::Impl::init(SDL_GPUDevice *device, uint32_t s, GSGpuBackend::F
                 if (const char *prefetch = std::getenv("PS2X_TEX_PACK_PREFETCH"))
                     options.prefetch = !(prefetch[0] == '0');
                 auto store = std::make_shared<TexPack::Store>(source, options);
-                if (store->empty())
+                if (store->empty() && !TexPack::Authoring())
                 {
                     std::fprintf(stderr, "[tex:pack] the enabled mods hold no texture files\n");
                 }
@@ -689,6 +739,33 @@ bool GSGpuBackend::Impl::init(SDL_GPUDevice *device, uint32_t s, GSGpuBackend::F
                 }
             }
         packStore = gStore.get();
+        {
+            // HD text (task t2): the glyph pictures of the enabled mods. Created only when there are some, so with no font mod the game
+            // runs as before (and the override at 0x138210 reports nothing).
+            const char *fontSwitch = std::getenv("PS2X_FONT_PACK");
+            if (!(fontSwitch && fontSwitch[0] == '0'))
+                if (std::shared_ptr<TexPack::FileSource> source = TexPack::DefaultSource())
+                {
+                    auto atlas = std::make_unique<FontHD::Atlas>(source);
+                    if (!atlas->empty() || TexPack::Authoring())
+                    {
+                        const FontHD::AtlasStats fs = atlas->stats();
+                        std::fprintf(stderr, "[font:pack] %u glyph files indexed (%u refused), HD text at %ux\n", fs.files, fs.refused, fs.scale);
+                        gFont = std::move(atlas);
+                        fontAtlas = gFont.get();
+                        FontHD::SetCaptureWanted(true);
+                    }
+                }
+            const char *hide = std::getenv("PS2X_FONT_HIDE");
+            gFontHide = hide && hide[0] == '1';
+            if (const char *hideFile = std::getenv("PS2X_FONT_HIDE_FILE"))
+                gFontHideFile = hideFile;
+            gDevPack = TexPack::DevPack();
+            if (const char *requestFile = std::getenv("PS2X_TEX_DUMP_REQUEST_FILE"))
+                gDumpRequestFile = requestFile;
+            if (TexPack::Authoring())
+                FontHD::SetCaptureWanted(true); // the dump needs the glyph registry whether or not a font pack is on
+        }
         const char *censusEnv = std::getenv("PS2X_TEX_CENSUS");
         const bool wantCensus = censusEnv && censusEnv[0] != '\0';
         if (dumper || packStore || wantCensus)
@@ -704,6 +781,23 @@ bool GSGpuBackend::Impl::init(SDL_GPUDevice *device, uint32_t s, GSGpuBackend::F
         if (const char *mb = std::getenv("PS2X_TEX_PACK_GPU_MB"))
             if (std::atol(mb) >= 8)
                 repBudget = static_cast<uint64_t>(std::atol(mb)) << 20;
+        if (const char *trace = std::getenv("PS2X_FONT_TRACE"))
+            if (trace[0] != '\0')
+            {
+                std::string path = trace;
+                const size_t comma = path.rfind(',');
+                if (comma != std::string::npos)
+                {
+                    gFontTraceTbp = static_cast<uint32_t>(std::strtoul(path.c_str() + comma + 1, nullptr, 0));
+                    path.resize(comma);
+                }
+                gFontTrace = std::fopen(path.c_str(), "w");
+                if (const char *every = std::getenv("PS2X_FONT_TRACE_EVERY"))
+                    gFontTraceEvery = std::max<uint32_t>(1u, static_cast<uint32_t>(std::atoi(every)));
+                if (const char *most = std::getenv("PS2X_FONT_TRACE_MAX"))
+                    gFontTraceMaxPerMarker = std::max<uint32_t>(1u, static_cast<uint32_t>(std::atoi(most)));
+                gFontTracePath = path;
+            }
     }
     if (const char *trigger = std::getenv("PS2X_TEX_PACK_RELOAD_FILE"))
         repReloadTrigger = trigger;
@@ -861,14 +955,16 @@ bool GSGpuBackend::Impl::init(SDL_GPUDevice *device, uint32_t s, GSGpuBackend::F
     zcopyShader = ps2x::gpu::createShader(dev, ps2x::gpu::shaders::gszcopy_frag);
     if (!vertexShader || !fragmentShader || !zcopyShader)
         return false;
-    if (packStore)
+    if (packStore || fontAtlas)
     {
         repShader = ps2x::gpu::createShader(dev, ps2x::gpu::shaders::gs_rep_frag);
         if (!repShader)
         {
-            std::fprintf(stderr, "[tex:pack] the replacement shader could not be created; texture packs are off\n");
+            std::fprintf(stderr, "[tex:pack] the replacement shader could not be created; texture packs and HD text are off\n");
             packStore = nullptr;
             gStore.reset();
+            fontAtlas = nullptr;
+            gFont.reset();
         }
     }
 
@@ -1090,6 +1186,9 @@ GSGpuBackend::Impl::~Impl()
         SDL_ReleaseGPUShader(dev, repShader);
     for (SDL_GPUTexture *t : transientTextures)
         SDL_ReleaseGPUTexture(dev, t);
+    if (gFontPrepCount > 0)
+        std::fprintf(stderr, "[font:pack] at exit: %llu HD canvases made, %.2f ms each on average (largest %.2f ms)\n", static_cast<unsigned long long>(gFontPrepCount),
+                     static_cast<double>(gFontPrepNanos) / static_cast<double>(gFontPrepCount) / 1.0e6, static_cast<double>(gFontPrepMax) / 1.0e6);
 }
 
 void GSGpuBackend::Impl::note(unsigned kind, const char *text)
@@ -1706,20 +1805,7 @@ void GSGpuBackend::Impl::prepareReplacement(GpuTexture &g, const GSDrawState &st
     if (!packStore)
         return;
     const uint64_t generation = packStore->generation();
-    if (generation != repGeneration)
-    {
-        // The packs were reloaded (the F1 panel's button): the pictures on the GPU may be stale. Submit what is recorded, then release them.
-        if (repGeneration != 0)
-        {
-            flushLocked(false);
-            for (auto &entry : repTextures)
-                releaseTexture(entry.second.tex);
-            repTextures.clear();
-            repBytes = 0;
-            repGpuBytesShared.store(0, std::memory_order_relaxed);
-        }
-        repGeneration = generation;
-    }
+    syncRepGeneration();
     if (r.storeGeneration == generation)
     {
         if (r.state == TexRep::State::None)
@@ -1730,10 +1816,88 @@ void GSGpuBackend::Impl::prepareReplacement(GpuTexture &g, const GSDrawState &st
     lookupReplacement(g, state);
 }
 
-void GSGpuBackend::Impl::keyTexture(GpuTexture &g, const GSDrawState &state, const Setup &setup)
+// The packs (or the font pictures) were reloaded, or the HD text scale changed: the pictures on the GPU may be stale. Submit what is
+// recorded, then release them; a texture that pointed at one asks again at its next draw.
+void GSGpuBackend::Impl::syncRepGeneration()
+{
+    const uint64_t generation = (packStore ? packStore->generation() : 0ull) * 1000003ull + (fontAtlas ? fontAtlas->generation() : 0ull);
+    if (generation == repGeneration)
+        return;
+    if (repGeneration != 0)
+    {
+        flushLocked(false);
+        for (auto &entry : repTextures)
+            releaseTexture(entry.second.tex);
+        repTextures.clear();
+        repBytes = 0;
+        repGpuBytesShared.store(0, std::memory_order_relaxed);
+    }
+    repGeneration = generation;
+}
+
+// HD text (task t2): the glyph canvas of the game (gs_font.h) is replaced, as a whole, by the HD atlas the font pictures make. The atlas is
+// composed when the canvas texture is created (its bitmaps are final then; a new version of the canvas is a new texture) and shown as a
+// replacement picture of the canvas's whole 512 x 512 area, kind Ramp: the shader looks the coverage up on the canvas's own palette.
+void GSGpuBackend::Impl::prepareFont(GpuTexture &g, const GSDrawState &state)
 {
     TexRep &r = g.rep;
+    syncRepGeneration();
+    const uint64_t generation = fontAtlas->generation();
+    if (r.font && r.storeGeneration == generation)
+    {
+        if (r.state == TexRep::State::None)
+            return;
+        if (r.state == TexRep::State::Attached && repTextures.find(r.repId) != repTextures.end())
+            return; // still resident
+    }
     r.keyed = true;
+    r.font = true;
+    r.storeGeneration = generation;
+    r.state = TexRep::State::None;
+    const uint64_t prepStart = nowNanos();
+    const GSTex0Reg &t = state.context.tex0;
+    const uint32_t count = 16u;
+    r.paletteCount = count;
+    r.palette = std::make_shared<std::array<uint32_t, 256>>();
+    for (uint32_t i = 0; i < 256u; ++i)
+        (*r.palette)[i] = LookupClutEntry(clut.data(), state.texa, static_cast<uint8_t>(i % count), t.cpsm, t.csm, t.csa, t.psm);
+    const TexKeys::TextureDesc desc{t.tbp0, t.tbw, t.psm, g.w, g.h};
+    std::vector<uint8_t> texels;
+    TexKeys::ReadTexels(vram, desc, state.texa, TexKeys::Rect{0, 0, static_cast<int>(FontHD::kCanvasSize) - 1, static_cast<int>(FontHD::kCanvasSize) - 1}, texels);
+    const std::vector<uint8_t> *pixels = nullptr;
+    if (texels.size() != static_cast<size_t>(FontHD::kCanvasSize) * FontHD::kCanvasSize || !fontAtlas->Compose(texels.data(), pixels) || !pixels)
+        return;
+    const uint32_t scale = fontAtlas->scale();
+    const uint32_t size = FontHD::kCanvasSize * scale;
+    const uint64_t idKey[3] = {g.contentHash, generation, scale};
+    const uint64_t id = GSRec::Hash64(idKey, sizeof(idKey), 0x666F6Eull);
+    if (repTextures.find(id) == repTextures.end() && !createRepGpu(id, size, size, static_cast<int>(scale), TexPack::Kind::Ramp, pixels->data(), pixels->size()))
+        return;
+    r.repId = id;
+    r.scale = static_cast<int>(scale);
+    r.index = true;
+    r.key.rect = TexKeys::Rect{0, 0, static_cast<int>(FontHD::kCanvasSize) - 1, static_cast<int>(FontHD::kCanvasSize) - 1};
+    r.state = TexRep::State::Attached;
+    // what making an HD canvas costs the GS thread (read the 256 cells, compose, stage the upload): logged every 50th canvas
+    const uint64_t took = nowNanos() - prepStart;
+    gFontPrepNanos += took;
+    gFontPrepMax = std::max(gFontPrepMax, took);
+    if (++gFontPrepCount % 50u == 0u)
+        std::fprintf(stderr, "[font:pack] %llu HD canvases made, %.2f ms each on average (largest %.2f ms), %.1f MB staged each\n",
+                     static_cast<unsigned long long>(gFontPrepCount), static_cast<double>(gFontPrepNanos) / static_cast<double>(gFontPrepCount) / 1.0e6,
+                     static_cast<double>(gFontPrepMax) / 1.0e6, static_cast<double>(pixels->size()) / 1048576.0);
+}
+
+void GSGpuBackend::Impl::keyTexture(GpuTexture &g, const GSDrawState &state, const Setup &setup)
+{
+    g.rep.keyed = true;
+    keyInto(g.rep, g, state, setup, dumper);
+}
+
+// The live key of the texture a draw is using now, into `r`; the dumper `to` (may be null) is told about it. The one-off dump ("Dump
+// textures on this screen") calls this for the textures of a chosen frame with a TexRep of its own.
+void GSGpuBackend::Impl::keyInto(TexRep &r, const GpuTexture &g, const GSDrawState &state, const Setup &setup, TexDump::Dumper *to)
+{
     const GSTex0Reg &t = state.context.tex0;
     const TexKeys::TextureDesc desc{t.tbp0, t.tbw, t.psm, g.w, g.h};
     const bool indexed = desc.indexed();
@@ -1774,7 +1938,7 @@ void GSGpuBackend::Impl::keyTexture(GpuTexture &g, const GSDrawState &state, con
         haveTexels = true;
         r.k3c = TexKeys::ColouringKey(r.primary, texels, r.palette->data());
     }
-    if (dumper)
+    if (to)
     {
         TexDump::Sighting sight;
         sight.k1 = g.contentHash;
@@ -1790,8 +1954,225 @@ void GSGpuBackend::Impl::keyTexture(GpuTexture &g, const GSDrawState &state, con
         sight.vram = vram;
         sight.texa = state.texa;
         sight.marker = markerSeq;
-        dumper->Seen(sight);
+        to->Seen(sight);
     }
+}
+
+// ------------------------------------------------------------------------------------------------
+// "Dump textures on this screen" (task t2)
+//
+// RequestTextureDump (any thread) names a folder; at the next marker the GS thread starts capturing (startDump); the draws of the two
+// markers after it are sighted here (dumpDraw): an ordinary texture is keyed like a pack's texture and written by a dumper of its own
+// (textures/<key>.png ..., textures.csv), and a draw from the glyph canvas notes which cell it shows (the canvas itself is not written: it
+// changes with every string). finishDump looks the cells' bitmaps up in the glyph registry and writes each glyph as font/c<code>.png (white
+// ink on black, 32 x 32, the original's 16 grey levels; the outline version as .bold.png), glyphs.csv and one contact sheet.
+
+namespace
+{
+    std::string utf8Of(uint32_t cp)
+    {
+        std::string out;
+        if (cp < 0x80u)
+            out += static_cast<char>(cp);
+        else if (cp < 0x800u)
+        {
+            out += static_cast<char>(0xC0u | (cp >> 6));
+            out += static_cast<char>(0x80u | (cp & 0x3Fu));
+        }
+        else
+        {
+            out += static_cast<char>(0xE0u | (cp >> 12));
+            out += static_cast<char>(0x80u | ((cp >> 6) & 0x3Fu));
+            out += static_cast<char>(0x80u | (cp & 0x3Fu));
+        }
+        return out;
+    }
+}
+
+bool GSGpuBackend::RequestTextureDump(const std::string &folder)
+{
+    Impl &s = *m_impl;
+    if (!keys || folder.empty())
+        return false;
+    std::lock_guard<std::mutex> lock(s.dumpMutex);
+    if (s.dumpState.load() != 0)
+        return false;
+    s.dumpAsked = folder;
+    s.dumpMessage.clear();
+    s.dumpState.store(1);
+    return true;
+}
+
+bool GSGpuBackend::TextureDumpBusy() const
+{
+    return m_impl->dumpState.load() != 0;
+}
+
+std::string GSGpuBackend::TextureDumpMessage() const
+{
+    std::lock_guard<std::mutex> lock(m_impl->dumpMutex);
+    return m_impl->dumpMessage;
+}
+
+void GSGpuBackend::Impl::startDump()
+{
+    std::string folder;
+    {
+        std::lock_guard<std::mutex> lock(dumpMutex);
+        folder = dumpAsked;
+    }
+    dumpDir = folder;
+    dumpOne = TexDump::Dumper::Create(folder + "/textures", folder);
+    dumpSeen.clear();
+    dumpCanvases.clear();
+    dumpCells.clear();
+    if (!dumpOne)
+    {
+        std::lock_guard<std::mutex> lock(dumpMutex);
+        dumpMessage = "Could not write the dump folder " + folder;
+        dumpState.store(0);
+        return;
+    }
+    dumpFramesLeft = 2;
+    dumpState.store(2);
+}
+
+void GSGpuBackend::Impl::dumpDraw(GpuTexture &g, const GSDrawState &state, const Setup &setup, bool fontCanvas)
+{
+    if (fontCanvas)
+    {
+        size_t index = dumpCanvases.size();
+        for (size_t i = 0; i < dumpCanvases.size(); ++i)
+            if (dumpCanvases[i].content == g.contentHash)
+                index = i;
+        if (index == dumpCanvases.size())
+        {
+            if (dumpCanvases.size() >= 32)
+                return;
+            const GSTex0Reg &t = state.context.tex0;
+            const TexKeys::TextureDesc desc{t.tbp0, t.tbw, t.psm, g.w, g.h};
+            DumpCanvas canvas;
+            canvas.content = g.contentHash;
+            TexKeys::ReadTexels(vram, desc, state.texa, TexKeys::Rect{0, 0, static_cast<int>(FontHD::kCanvasSize) - 1, static_cast<int>(FontHD::kCanvasSize) - 1}, canvas.texels);
+            dumpCanvases.push_back(std::move(canvas));
+        }
+        if (setup.texelCoords && setup.count >= 3)
+        {
+            // the cell the quad shows: where its texels are (a quad covers 28 x 28 texels inside one 32 x 32 cell)
+            float u = 0.0f, v = 0.0f;
+            for (uint32_t i = 0; i < setup.count; ++i)
+            {
+                u += setup.v[i].u;
+                v += setup.v[i].v;
+            }
+            u /= static_cast<float>(setup.count);
+            v /= static_cast<float>(setup.count);
+            const int cx = std::min(15, std::max(0, static_cast<int>(u) / 32)), cy = std::min(15, std::max(0, static_cast<int>(v) / 32));
+            dumpCells.insert({static_cast<uint32_t>(index), static_cast<uint32_t>(cy * 16 + cx)});
+        }
+        return;
+    }
+    if (!keys || !dumpOne)
+        return;
+    if (!dumpSeen.insert(g.contentHash).second)
+        return;
+    TexRep tmp;
+    keyInto(tmp, g, state, setup, dumpOne.get());
+}
+
+void GSGpuBackend::Impl::finishDump()
+{
+    std::vector<TexDump::Tile> tiles = dumpOne->TakePictures();
+    const size_t textureTiles = tiles.size();
+    const uint32_t textureFiles = dumpOne->FilesWritten();
+    dumpOne.reset();
+    // glyphs
+    std::set<uint32_t> written;
+    uint32_t unknown = 0;
+    std::FILE *csv = nullptr;
+    std::error_code ec;
+    std::filesystem::create_directories(dumpDir + "/font", ec);
+    for (const auto &entry : dumpCells)
+    {
+        if (entry.first >= dumpCanvases.size())
+            continue;
+        const std::vector<uint8_t> &canvas = dumpCanvases[entry.first].texels;
+        if (canvas.size() != static_cast<size_t>(FontHD::kCanvasSize) * FontHD::kCanvasSize)
+            continue;
+        const uint32_t cx = entry.second % 16u, cy = entry.second / 16u;
+        uint8_t packed[512];
+        std::vector<uint8_t> grey(32u * 32u), rgba(32u * 32u * 4u);
+        bool blank = true;
+        for (uint32_t y = 0; y < 32u; ++y)
+            for (uint32_t x = 0; x < 32u; ++x)
+            {
+                const uint8_t v = canvas[(cy * 32u + y) * FontHD::kCanvasSize + cx * 32u + x] & 15u;
+                grey[y * 32u + x] = static_cast<uint8_t>(v * 17u);
+                if (x % 2u == 0u)
+                    packed[y * 16u + x / 2u] = v;
+                else
+                    packed[y * 16u + x / 2u] |= static_cast<uint8_t>(v << 4);
+                blank = blank && v == 0;
+            }
+        if (blank)
+            continue;
+        uint32_t id = 0;
+        if (!FontHD::Glyphs().Lookup(FontHD::BitmapHash(packed), id))
+        {
+            ++unknown;
+            continue;
+        }
+        if (!written.insert(id).second)
+            continue;
+        char name[48];
+        std::snprintf(name, sizeof(name), "c%x%s.png", FontHD::IdCode(id), FontHD::IdBold(id) ? ".bold" : "");
+        const std::vector<uint8_t> png = GSPng::Encode(32, 32, 0, grey);
+        if (std::FILE *f = std::fopen((dumpDir + "/font/" + name).c_str(), "wb"))
+        {
+            std::fwrite(png.data(), 1, png.size(), f);
+            std::fclose(f);
+        }
+        if (!csv)
+        {
+            csv = std::fopen((dumpDir + "/glyphs.csv").c_str(), "wb");
+            if (csv)
+                std::fprintf(csv, "file,code,unicode,char,outline\n");
+        }
+        if (csv)
+        {
+            const uint32_t cp = FontHD::UnicodeOfCode(FontHD::IdCode(id));
+            std::fprintf(csv, "font/%s,%04x,%s,%s,%d\n", name, FontHD::IdCode(id), cp ? ("U+" + std::to_string(cp)).c_str() : "", cp && cp != '"' && cp != ',' ? utf8Of(cp).c_str() : "",
+                         FontHD::IdBold(id) ? 1 : 0);
+        }
+        for (uint32_t i = 0; i < 32u * 32u; ++i)
+        {
+            rgba[i * 4u + 0] = rgba[i * 4u + 1] = rgba[i * 4u + 2] = 255;
+            rgba[i * 4u + 3] = grey[i];
+        }
+        TexDump::Tile tile;
+        tile.w = tile.h = 32;
+        tile.rgba = rgba;
+        tiles.push_back(std::move(tile));
+    }
+    if (csv)
+        std::fclose(csv);
+    uint32_t sheetCells = tiles.empty() ? 0u : 1u;
+    if (!tiles.empty())
+        TexDump::WriteContactSheet(dumpDir + "/contact-sheet.png", tiles, 96, 16);
+    char message[480];
+    std::snprintf(message, sizeof(message), "Dumped %u texture files and %zu glyphs%s to %s (copy textures/ and font/ into the dev-pack folder to edit them)", textureFiles,
+                  written.size(), unknown ? (" (" + std::to_string(unknown) + " glyph cells could not be named)").c_str() : "", dumpDir.c_str());
+    (void)textureTiles;
+    (void)sheetCells;
+    std::fprintf(stderr, "[tex:dump] %s\n", message);
+    dumpCanvases.clear();
+    dumpCells.clear();
+    dumpSeen.clear();
+    {
+        std::lock_guard<std::mutex> lock(dumpMutex);
+        dumpMessage = message;
+    }
+    dumpState.store(0);
 }
 
 void GSGpuBackend::Impl::lookupReplacement(GpuTexture &g, const GSDrawState &state)
@@ -1831,31 +2212,37 @@ RepGpu *GSGpuBackend::Impl::replacementGpu(const TexPack::Lookup &lookup)
         found->second.lastUsedFlush = flushIndex;
         return &found->second;
     }
+    return createRepGpu(id, img.width, img.height, lookup.scale, img.kind, img.pixels.data(), img.pixels.size());
+}
+
+// A replacement picture on the GPU: RGBA8, or R8 for an index picture and for a coverage ramp (the HD text atlas); its upload is staged.
+RepGpu *GSGpuBackend::Impl::createRepGpu(uint64_t id, uint32_t w, uint32_t h, int scale, TexPack::Kind kind, const uint8_t *pixels, size_t bytes)
+{
     SDL_GPUTextureCreateInfo ti = {};
     ti.type = SDL_GPU_TEXTURETYPE_2D;
-    ti.format = img.kind == TexPack::Kind::Rgba ? SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM : SDL_GPU_TEXTUREFORMAT_R8_UNORM;
+    ti.format = kind == TexPack::Kind::Rgba ? SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM : SDL_GPU_TEXTUREFORMAT_R8_UNORM;
     ti.usage = SDL_GPU_TEXTUREUSAGE_SAMPLER;
-    ti.width = img.width;
-    ti.height = img.height;
+    ti.width = w;
+    ti.height = h;
     ti.layer_count_or_depth = 1;
     ti.num_levels = 1;
     ti.sample_count = SDL_GPU_SAMPLECOUNT_1;
     SDL_GPUTexture *tex = SDL_CreateGPUTexture(dev, &ti);
     if (!tex)
     {
-        std::fprintf(stderr, "[tex:pack] cannot create a %ux%u replacement texture: %s\n", img.width, img.height, SDL_GetError());
+        std::fprintf(stderr, "[tex:pack] cannot create a %ux%u replacement texture: %s\n", w, h, SDL_GetError());
         return nullptr;
     }
-    const size_t offset = allocateStage(img.pixels.size());
-    std::memcpy(stage.data() + offset, img.pixels.data(), img.pixels.size());
-    pendingUploads.push_back({tex, img.width, img.height, offset, 0, 0});
+    const size_t offset = allocateStage(bytes);
+    std::memcpy(stage.data() + offset, pixels, bytes);
+    pendingUploads.push_back({tex, w, h, offset, 0, 0});
     RepGpu &g = repTextures[id];
     g.tex = tex;
-    g.w = img.width;
-    g.h = img.height;
-    g.scale = lookup.scale;
-    g.kind = img.kind;
-    g.bytes = img.pixels.size();
+    g.w = w;
+    g.h = h;
+    g.scale = scale;
+    g.kind = kind;
+    g.bytes = bytes;
     g.lastUsedFlush = flushIndex;
     repBytes += g.bytes;
     repGpuBytesShared.store(repBytes, std::memory_order_relaxed);
@@ -1876,9 +2263,9 @@ uint32_t GSGpuBackend::Impl::addRepDraw(const GpuTexture &g)
     d.tex = gpu.tex;
     d.info[0] = static_cast<uint32_t>(rect.x0) | (static_cast<uint32_t>(rect.y0) << 16);
     d.info[1] = static_cast<uint32_t>(rect.width()) | (static_cast<uint32_t>(rect.height()) << 16);
-    d.info[2] = static_cast<uint32_t>(gpu.scale) | ((gpu.kind == TexPack::Kind::Index ? 2u : 1u) << 8);
-    d.info[3] = gpu.kind == TexPack::Kind::Index ? g.rep.paletteCount - 1u : 0u;
-    if (gpu.kind == TexPack::Kind::Index)
+    d.info[2] = static_cast<uint32_t>(gpu.scale) | ((gpu.kind == TexPack::Kind::Index ? 2u : gpu.kind == TexPack::Kind::Ramp ? 3u : 1u) << 8);
+    d.info[3] = gpu.kind != TexPack::Kind::Rgba ? g.rep.paletteCount - 1u : 0u;
+    if (gpu.kind != TexPack::Kind::Rgba)
         d.palette = g.rep.palette;
     ++repDrawsNow;
     const uint64_t id = g.rep.repId;
@@ -1977,6 +2364,26 @@ GpuTexture *GSGpuBackend::Impl::resolveTexture(const GSDrawState &state)
 
 void GSGpuBackend::Impl::evictTextures()
 {
+    if (fontAtlas)
+    {
+        // HD text canvases (kind Ramp) are one per version of the game's glyph canvas, 4 MB or more each: release the ones nothing drew from for
+        // half a second instead of keeping them until the budget runs out. A canvas that comes back is composed again.
+        for (auto it = repTextures.begin(); it != repTextures.end();)
+        {
+            if (it->second.kind == TexPack::Kind::Ramp && it->second.lastUsedFlush + 30u < flushIndex)
+            {
+                repBytes -= it->second.bytes;
+                releaseTexture(it->second.tex);
+                it = repTextures.erase(it);
+                ++stats.repEvicted;
+                repGpuBytesShared.store(repBytes, std::memory_order_relaxed);
+            }
+            else
+            {
+                ++it;
+            }
+        }
+    }
     if (repBytes > repBudget)
     {
         // Replacement pictures, least recently used first, never what the list just submitted used. A texture that still points at an
@@ -2147,10 +2554,21 @@ void GSGpuBackend::Impl::submitSetup(const GSDrawState &state, const Setup &setu
         if (!texture)
             return;
         decodeTexels(*texture, state, setup);
-        if (keys)
+        const GSTex0Reg &tex0 = state.context.tex0;
+        const bool fontCanvas = tex0.tbp0 == FontHD::kCanvasTbp && tex0.tbw == FontHD::kCanvasTbw && tex0.psm == GS_PSM_T4 &&
+                                texture->w == FontHD::kCanvasSize && texture->h == FontHD::kCanvasSize;
+        if (fontCanvas && gFontHide)
+            return;
+        if (fontCanvas && fontAtlas)
+            prepareFont(*texture, state);
+        else if (keys)
             prepareReplacement(*texture, state, setup);
+        if (dumpState.load(std::memory_order_relaxed) == 2)
+            dumpDraw(*texture, state, setup, fontCanvas);
         if (census)
             censusDraw(*texture, state, setup);
+        if (gFontTrace && state.context.tex0.tbp0 == gFontTraceTbp)
+            traceFontDraw(state, setup);
         d.texture = texture->tex;
         if (texture->rep.state == TexRep::State::Attached)
         {
@@ -3067,6 +3485,62 @@ void GSGpuBackend::Impl::logMarkerRow(uint64_t markNs)
 
 // The census of missed textures (PS2X_GS_GPU_MISS_LOG): for each draw that used a texture the backend created, what part
 // of it the draw can sample (GSGpu::TextureReach, the same bound decodeTexels uses), accumulated over the draws.
+// PS2X_FONT_TRACE (task t2): one line per draw from the glyph canvas, vertices in GS pixels (x, y), texels (u, v) and the vertex colour.
+void GSGpuBackend::Impl::traceFontDraw(const GSDrawState &state, const Setup &setup)
+{
+    const GSContext &ctx = state.context;
+    const GSTex0Reg &t = ctx.tex0;
+    if (markerSeq != gFontTraceSceneMarker && markerSeq % 4u == 0u)
+    {
+        // <trace>.scene holds a scene name written by the test script; a change is logged as an S line
+        gFontTraceSceneMarker = markerSeq;
+        if (std::FILE *sf = std::fopen((gFontTracePath + ".scene").c_str(), "rb"))
+        {
+            char buf[128] = {};
+            const size_t n = std::fread(buf, 1, sizeof(buf) - 1, sf);
+            std::fclose(sf);
+            std::string scene(buf, n);
+            if (scene != gFontTraceScene)
+            {
+                gFontTraceScene = scene;
+                std::fprintf(gFontTrace, "S m=%llu %s\n", static_cast<unsigned long long>(markerSeq), scene.c_str());
+            }
+        }
+    }
+    // the first PS2X_FONT_TRACE_MAX draws of every PS2X_FONT_TRACE_EVERY-th marker (text is static from frame to frame)
+    if (markerSeq % gFontTraceEvery != 0u)
+        return;
+    if (markerSeq != gFontTraceDrawMarker)
+    {
+        gFontTraceDrawMarker = markerSeq;
+        gFontTraceDrawsInMarker = 0;
+    }
+    if (++gFontTraceDrawsInMarker > gFontTraceMaxPerMarker)
+        return;
+    const uint64_t ch = clutHash(state);
+    if (std::find(gFontTraceCluts.begin(), gFontTraceCluts.end(), ch) == gFontTraceCluts.end() && gFontTraceCluts.size() < 64)
+    {
+        gFontTraceCluts.push_back(ch);
+        const uint32_t count = isFourBitIndexedPsm(t.psm) ? 16u : 256u;
+        std::fprintf(gFontTrace, "C %016llx cpsm=%u csm=%u csa=%u cbp=%u", static_cast<unsigned long long>(ch), t.cpsm, t.csm, t.csa, t.cbp);
+        for (uint32_t i = 0; i < count && i < 16u; ++i)
+            std::fprintf(gFontTrace, " %08x", LookupClutEntry(clut.data(), state.texa, static_cast<uint8_t>(i), t.cpsm, t.csm, t.csa, t.psm));
+        std::fprintf(gFontTrace, "\n");
+    }
+    std::fprintf(gFontTrace,
+                 "D m=%llu prim=%d n=%u fst=%d abe=%d iip=%d tfx=%d tcc=%d psm=%u tbw=%u tw=%u th=%u clut=%016llx texa=%u/%u/%d lin=%d alpha=%llx test=%llx "
+                 "clamp=%llx zmsk=%d fbp=%u sc=%u,%u,%u,%u  ",
+                 static_cast<unsigned long long>(markerSeq), static_cast<int>(state.prim.type), setup.count, state.prim.fst, state.prim.abe,
+                 state.prim.iip, t.tfx, t.tcc, t.psm, t.tbw, t.tw, t.th, static_cast<unsigned long long>(ch), state.texa.ta0, state.texa.ta1,
+                 state.texa.aem ? 1 : 0, state.linearFilter ? 1 : 0, static_cast<unsigned long long>(ctx.alpha),
+                 static_cast<unsigned long long>(ctx.test), static_cast<unsigned long long>(ctx.clamp), ctx.zbuf.zmask ? 1 : 0, ctx.frame.fbp,
+                 ctx.scissor.x0, ctx.scissor.x1, ctx.scissor.y0, ctx.scissor.y1);
+    for (uint32_t i = 0; i < setup.count; ++i)
+        std::fprintf(gFontTrace, "(%.1f,%.1f,%.2f,%.2f,%08x,z%.0f) ", setup.v[i].x / static_cast<float>(scaleX) - static_cast<float>(padLeft),
+                     setup.v[i].y / static_cast<float>(scaleY), setup.v[i].u, setup.v[i].v, setup.v[i].rgba, setup.v[i].z * 16777216.0f);
+    std::fprintf(gFontTrace, "\n");
+}
+
 void GSGpuBackend::Impl::noteTextureUse(SDL_GPUTexture *tex, const GSDrawState &state, const Setup &setup)
 {
     const auto it = missIndex.find(tex);
@@ -3520,6 +3994,51 @@ GSGpuBackend::MarkResult GSGpuBackend::MarkPresentation(const GSPresentationRequ
             std::fprintf(stderr, "[tex:pack] reloaded on request: %u texture files\n", n);
         }
     }
+    if (gDevPack && s.markerSeq % 15u == 0u && gDevPack->changed())
+    {
+        // the author edited a file of the dev pack: read the pictures again (packs and glyphs); a texture asks again at its next draw
+        gDevPack->clearNotes();
+        const uint32_t n = packStore ? packStore->reload() : 0u;
+        const uint32_t f = fontAtlas ? fontAtlas->reload() : 0u;
+        std::fprintf(stderr, "[tex:pack] the dev pack changed: reloaded %u texture files and %u glyph files\n", n, f);
+    }
+    if (fontAtlas && gFontReload.exchange(false))
+        fontAtlas->reload();
+    if (!gDumpRequestFile.empty() && s.markerSeq % 15u == 0u && keys)
+    {
+        std::error_code ec;
+        if (std::filesystem::exists(gDumpRequestFile, ec))
+        {
+            std::string folder;
+            if (std::FILE *f = std::fopen(gDumpRequestFile.c_str(), "rb"))
+            {
+                char buf[1024] = {};
+                const size_t n = std::fread(buf, 1, sizeof(buf) - 1, f);
+                std::fclose(f);
+                folder.assign(buf, n);
+                while (!folder.empty() && (folder.back() == '\n' || folder.back() == '\r' || folder.back() == ' '))
+                    folder.pop_back();
+            }
+            std::filesystem::remove(gDumpRequestFile, ec);
+            if (!folder.empty() && s.dumpState.load() == 0)
+            {
+                s.dumpAsked = folder;
+                s.dumpState.store(1);
+            }
+        }
+    }
+    if (!gFontHideFile.empty() && s.markerSeq % 4u == 0u)
+    {
+        std::error_code ec;
+        gFontHide = std::filesystem::exists(gFontHideFile, ec);
+    }
+    {
+        const int dumpNow = s.dumpState.load(std::memory_order_relaxed);
+        if (dumpNow == 1)
+            s.startDump();
+        else if (dumpNow == 2 && s.dumpFramesLeft > 0 && --s.dumpFramesLeft == 0)
+            s.finishDump();
+    }
     if (packStore)
     {
         s.repDrawsFrame.store(s.repDrawsNow, std::memory_order_relaxed);
@@ -3757,6 +4276,8 @@ GSTransferSnapshot GSGpuBackend::GetTransferSnapshot() const
 
 uint32_t GSGpuBackend::ReloadTexturePacks()
 {
+    if (fontAtlas)
+        gFontReload.store(true); // the font pictures are read again by the GS thread at its next marker
     return packStore ? packStore->reload() : 0u;
 }
 
@@ -3765,6 +4286,19 @@ GSGpuBackend::ReplacementReport GSGpuBackend::Replacement() const
     ReplacementReport report;
     report.dumping = dumper != nullptr;
     report.dumpedFiles = dumper ? dumper->FilesWritten() : 0u;
+    report.authoring = TexPack::Authoring();
+    if (const auto devPack = TexPack::DevPack())
+        report.devPackFiles = devPack->fileCount();
+    if (fontAtlas)
+    {
+        const FontHD::AtlasStats fs = fontAtlas->stats();
+        report.fontActive = fs.files != 0u;
+        report.fontFiles = fs.files;
+        report.fontRefused = fs.refused;
+        report.fontScale = fs.scale;
+        report.fontHdCells = fs.lastHd;
+        report.fontOriginalCells = fs.lastFallback;
+    }
     if (packStore)
     {
         const TexPack::Stats stats = packStore->stats();

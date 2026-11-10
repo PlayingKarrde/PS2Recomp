@@ -54,11 +54,25 @@ namespace TexDump
         uint64_t marker = 0;
     };
 
+    // A picture for a contact sheet: RGBA8, straight alpha (PNG scale).
+    struct Tile
+    {
+        uint32_t w = 0, h = 0;
+        std::vector<uint8_t> rgba;
+    };
+    // A PNG of the tiles in a grid (`columns` per row, each fitted into a `cell` x `cell` square on a grey checkerboard). False if it cannot be written.
+    bool WriteContactSheet(const std::string &path, const std::vector<Tile> &tiles, uint32_t cell = 96, uint32_t columns = 16);
+
     class Dumper
     {
     public:
         // Reads the switches above; null when PS2X_TEX_DUMP is not set.
         static std::unique_ptr<Dumper> FromEnvironment();
+        // The one-off dump of the F1 panel's and the Mods tab's "Dump textures on this screen" button: the pictures go to `imageDir`, the
+        // two csv files to `csvDir`, and the pictures of the files written are kept for a contact sheet (TakePictures). Null if the folders
+        // cannot be made.
+        static std::unique_ptr<Dumper> Create(const std::string &imageDir, const std::string &csvDir, uint32_t maxFiles = 4000, uint32_t colourings = 0);
+        std::vector<Tile> TakePictures();
         ~Dumper();
         Dumper(const Dumper &) = delete;
         Dumper &operator=(const Dumper &) = delete;

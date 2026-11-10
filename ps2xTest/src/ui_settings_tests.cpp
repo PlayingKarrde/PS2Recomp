@@ -113,6 +113,15 @@ void register_ui_settings_tests()
             t.Equals(valueFromEnvironment("filter", "nearest").value_or(""), std::string("nearest"), "nearest");
             t.Equals(valueFromEnvironment("filter", "bilinear").value_or(""), std::string("linear"), "bilinear is linear");
             t.Equals(valueFromEnvironment("volume", "250").value_or(""), std::string("100"), "volume is clamped");
+
+            // the modder's tools (task t2): off is the default and sets nothing, on is PS2X_AUTHORING=1
+            t.IsFalse(environmentFromValue("texture_tools", "off").has_value(), "texture tools default");
+            t.Equals(environmentFromValue("texture_tools", "on").value_or(""), std::string("1"), "texture tools on");
+            t.IsFalse(environmentFromValue("texture_tools", "maybe").has_value(), "texture tools nonsense is refused");
+            t.Equals(valueFromEnvironment("texture_tools", "1").value_or(""), std::string("on"), "PS2X_AUTHORING=1 is on");
+            t.Equals(valueFromEnvironment("texture_tools", "0").value_or(""), std::string("off"), "PS2X_AUTHORING=0 is off");
+            const ps2x_settings::Definition *tools = ps2x_settings::find("texture_tools");
+            t.IsTrue(tools && std::string(tools->envName) == "PS2X_AUTHORING", "the setting is fixed by PS2X_AUTHORING");
         });
 
         tc.Run("the file's values reach the environment, an environment variable wins, and a save round-trips", [](TestCase &t)

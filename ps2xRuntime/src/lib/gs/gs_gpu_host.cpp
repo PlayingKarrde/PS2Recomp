@@ -8,10 +8,17 @@
 #include "runtime/gs/gs_cpu_backend.h"
 #include "runtime/gs/gs_gpu_backend.h"
 #include "runtime/gs/gs_gpu_present.h"
+#include "runtime/gs/gs_tex_pack.h"
 
 #include "ps2_host_gpu.h"
+#include "ps2_settings.h"
 
+#include <SDL3/SDL_misc.h>
+
+#include <chrono>
 #include <cstdio>
+#include <ctime>
+#include <filesystem>
 #include <cstdlib>
 #include <cstring>
 
@@ -219,12 +226,108 @@ namespace ps2x_gs
         return gpuInUse;
     }
 
+    namespace
+    {
+        namespace fs = std::filesystem;
+
+        fs::path prefFolder()
+        {
+            std::string settings = ps2x_settings::path();
+            if (settings.empty())
+                settings = ps2x_settings::defaultPath();
+            if (settings.empty())
+                return fs::path();
+            return fs::path(std::u8string(settings.begin(), settings.end())).parent_path();
+        }
+
+        std::string toUtf8(const fs::path &p)
+        {
+            const std::u8string text = p.u8string();
+            return std::string(text.begin(), text.end());
+        }
+    }
+
+    bool textureToolsOn()
+    {
+        return TexPack::Authoring();
+    }
+
+    std::string devPackFolder()
+    {
+        if (const auto pack = TexPack::DevPack())
+            return pack->folder();
+        const fs::path pref = prefFolder();
+        return pref.empty() ? std::string() : toUtf8(pref / "dev-pack");
+    }
+
+    std::vector<std::string> devPackNotes()
+    {
+        const auto pack = TexPack::DevPack();
+        return pack ? pack->notes() : std::vector<std::string>();
+    }
+
+    std::string dumpsFolder()
+    {
+        const fs::path pref = prefFolder();
+        return pref.empty() ? std::string() : toUtf8(pref / "dumps");
+    }
+
+    std::string requestTextureDump()
+    {
+        if (!g.backend)
+            return "Texture dumps need the GPU renderer.";
+        if (!TexPack::Authoring())
+            return "Turn Texture Tools on (Graphics tab) or set PS2X_AUTHORING=1, then restart: the dump needs them.";
+        const std::string root = dumpsFolder();
+        if (root.empty())
+            return "There is no preference folder to write the dump to.";
+        const std::time_t now = std::time(nullptr);
+        std::tm local{};
+#if defined(_WIN32)
+        localtime_s(&local, &now);
+#else
+        localtime_r(&now, &local);
+#endif
+        char stamp[32];
+        std::strftime(stamp, sizeof(stamp), "%Y-%m-%d_%H-%M-%S", &local);
+        const std::string folder = root + "/" + stamp;
+        if (!g.backend->RequestTextureDump(folder))
+            return g.backend->TextureDumpBusy() ? "A dump is already under way." : "The texture tools are not running (restart with Texture Tools on).";
+        return "Dumping the next frames to " + folder + " ...";
+    }
+
+    std::string textureDumpMessage(bool *busy)
+    {
+        if (busy)
+            *busy = g.backend && g.backend->TextureDumpBusy();
+        return g.backend ? g.backend->TextureDumpMessage() : std::string();
+    }
+
+    void openFolder(const std::string &path)
+    {
+        if (path.empty())
+            return;
+        std::error_code ec;
+        fs::create_directories(fs::path(std::u8string(path.begin(), path.end())), ec);
+        std::string url = "file:///";
+        for (char c : path)
+        {
+            if (c == '\\')
+                url += '/';
+            else if (c == ' ')
+                url += "%20";
+            else
+                url += c;
+        }
+        SDL_OpenURL(url.c_str());
+    }
+
     std::string debugPanelTextureLine()
     {
         if (!g.backend)
             return "";
         const GSGpuBackend::ReplacementReport r = g.backend->Replacement();
-        if (!r.active && !r.dumping)
+        if (!r.active && !r.dumping && !r.fontActive && !r.authoring)
             return "";
         char text[320];
         int n = 0;
@@ -232,6 +335,11 @@ namespace ps2x_gs
             n += std::snprintf(text + n, sizeof(text) - static_cast<size_t>(n),
                                "Texture packs: %u textures replaced this frame (%u draws), %u pictures loaded of %u files, %u refused, %u waiting, %.1f MB on the GPU",
                                r.texturesThisFrame, r.drawsThisFrame, r.decoded, r.packFiles, r.refused, r.pending, static_cast<double>(r.gpuBytes) / 1048576.0);
+        if (r.fontActive)
+            n += std::snprintf(text + n, sizeof(text) - static_cast<size_t>(n), "%sHD text: %u glyph files at %ux, %u cells HD and %u original in the last canvas%s", n ? "; " : "",
+                               r.fontFiles, r.fontScale, r.fontHdCells, r.fontOriginalCells, r.fontRefused ? " (some files refused)" : "");
+        if (r.authoring)
+            n += std::snprintf(text + n, sizeof(text) - static_cast<size_t>(n), "%sAuthor tools on, dev pack: %u files", n ? "; " : "", r.devPackFiles);
         if (r.dumping)
             n += std::snprintf(text + n, sizeof(text) - static_cast<size_t>(n), "%sTexture dump: %u files written", n ? "; " : "", r.dumpedFiles);
         return std::string(text, static_cast<size_t>(std::max(n, 0)));

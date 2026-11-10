@@ -153,6 +153,264 @@ std::shared_ptr<FileSource> MakeDirectorySource(const std::string &root)
     return std::make_shared<DirectorySource>(root);
 }
 
+// ------------------------------------------------------------------------------------------------
+// the dev pack
+
+namespace
+{
+    std::atomic<bool> gAuthoring{false};
+
+    fs::path pathFromUtf8(const std::string &text)
+    {
+        return fs::path(std::u8string(text.begin(), text.end()));
+    }
+
+    std::string utf8Name(const fs::path &path)
+    {
+        const std::u8string text = path.u8string();
+        return std::string(text.begin(), text.end());
+    }
+
+    constexpr uint32_t kDevOrder = 0xFFFFFFFEu;
+    constexpr const char *kFontPrefixDev = "assets/font/";
+
+    // The sub-folder of the dev pack that holds the files of a listing prefix, or "" for a prefix the dev pack does not serve.
+    const char *devSubfolder(const std::string &prefix)
+    {
+        if (prefix == kTexturePrefix)
+            return "textures";
+        if (prefix == kFontPrefixDev)
+            return "font";
+        return "";
+    }
+
+    // A change signature of a folder: file names, sizes and times combined without regard to the order the system lists them in.
+    uint64_t folderSignature(const fs::path &root)
+    {
+        uint64_t sum = 0, count = 0;
+        for (const char *sub : {"textures", "font"})
+        {
+            std::error_code ec;
+            for (const auto &e : fs::directory_iterator(root / sub, ec))
+            {
+                std::error_code fec;
+                if (!e.is_regular_file(fec))
+                    continue;
+                const std::string name = utf8Name(e.path().filename());
+                uint64_t h = 1469598103934665603ull;
+                for (char c : name)
+                    h = (h ^ static_cast<unsigned char>(c)) * 1099511628211ull;
+                h ^= static_cast<uint64_t>(e.file_size(fec)) * 0x9E3779B97F4A7C15ull;
+                h ^= static_cast<uint64_t>(e.last_write_time(fec).time_since_epoch().count()) * 0xC2B2AE3D27D4EB4Full;
+                h ^= static_cast<uint64_t>(sub[0]) << 56;
+                sum += h * (h | 1ull);
+                ++count;
+            }
+        }
+        return sum ^ (count * 0x165667B19E3779F9ull);
+    }
+}
+
+struct DevPackSource::Impl
+{
+    std::string folderText;
+    fs::path folder;
+    std::shared_ptr<FileSource> base;
+    int pollMillis = 400;
+    std::atomic<bool> changedFlag{false};
+    bool stop = false;
+    std::mutex m;
+    std::condition_variable cv;
+    std::thread worker;
+    mutable std::mutex notesMutex;
+    std::vector<std::string> notes;
+
+    void loop()
+    {
+        uint64_t reported = folderSignature(folder);
+        uint64_t observed = reported;
+        std::unique_lock<std::mutex> lock(m);
+        while (!stop)
+        {
+            cv.wait_for(lock, std::chrono::milliseconds(pollMillis), [&] { return stop; });
+            if (stop)
+                break;
+            lock.unlock();
+            const uint64_t sig = folderSignature(folder);
+            lock.lock();
+            if (sig != reported && sig == observed)
+            {
+                reported = sig;
+                changedFlag.store(true, std::memory_order_release);
+            }
+            observed = sig;
+        }
+    }
+};
+
+DevPackSource::DevPackSource(std::string folder, std::shared_ptr<FileSource> base, int pollMillis, bool watch) : m(new Impl)
+{
+    m->folderText = std::move(folder);
+    m->folder = pathFromUtf8(m->folderText);
+    m->base = std::move(base);
+    m->pollMillis = std::max(20, pollMillis);
+    std::error_code ec;
+    fs::create_directories(m->folder / "textures", ec);
+    fs::create_directories(m->folder / "font", ec);
+    if (watch)
+        m->worker = std::thread([this] { m->loop(); });
+}
+
+DevPackSource::~DevPackSource()
+{
+    {
+        std::lock_guard<std::mutex> lock(m->m);
+        m->stop = true;
+    }
+    m->cv.notify_all();
+    if (m->worker.joinable())
+        m->worker.join();
+}
+
+std::vector<FileSource::Entry> DevPackSource::list(const std::string &prefix)
+{
+    std::vector<Entry> out = m->base ? m->base->list(prefix) : std::vector<Entry>();
+    const char *sub = devSubfolder(prefix);
+    if (sub[0] == '\0')
+        return out;
+    std::vector<Entry> mine;
+    std::error_code ec;
+    for (const auto &e : fs::directory_iterator(m->folder / sub, ec))
+    {
+        std::error_code fec;
+        if (!e.is_regular_file(fec))
+            continue;
+        Entry entry;
+        entry.path = prefix + utf8Name(e.path().filename());
+        entry.provider = kProvider;
+        entry.order = kDevOrder;
+        mine.push_back(std::move(entry));
+    }
+    if (mine.empty())
+        return out;
+    out.erase(std::remove_if(out.begin(), out.end(), [&](const Entry &o)
+    {
+        for (const Entry &d : mine)
+            if (d.path == o.path)
+                return true;
+        return false;
+    }), out.end());
+    out.insert(out.end(), mine.begin(), mine.end());
+    return out;
+}
+
+bool DevPackSource::read(const std::string &path, std::vector<uint8_t> &out, std::string &error)
+{
+    for (const char *prefix : {kTexturePrefix, kFontPrefixDev})
+    {
+        const std::string p = prefix;
+        if (path.compare(0, p.size(), p) == 0 && path.find('/', p.size()) == std::string::npos)
+        {
+            const fs::path file = m->folder / devSubfolder(p) / pathFromUtf8(path.substr(p.size()));
+            std::error_code ec;
+            if (fs::is_regular_file(file, ec))
+            {
+                std::ifstream in(file, std::ios::binary);
+                if (!in)
+                {
+                    error = "cannot open " + path.substr(p.size());
+                    return false;
+                }
+                out.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+                return true;
+            }
+        }
+    }
+    if (m->base)
+        return m->base->read(path, out, error);
+    error = "no such file";
+    return false;
+}
+
+void DevPackSource::problem(const std::string &provider, const std::string &message)
+{
+    if (provider == kProvider)
+    {
+        std::lock_guard<std::mutex> lock(m->notesMutex);
+        if (std::find(m->notes.begin(), m->notes.end(), message) == m->notes.end() && m->notes.size() < 24)
+            m->notes.push_back(message);
+        return;
+    }
+    if (m->base)
+        m->base->problem(provider, message);
+}
+
+bool DevPackSource::changed()
+{
+    return m->changedFlag.exchange(false, std::memory_order_acq_rel);
+}
+
+const std::string &DevPackSource::folder() const
+{
+    return m->folderText;
+}
+
+uint32_t DevPackSource::fileCount() const
+{
+    uint32_t n = 0;
+    for (const char *sub : {"textures", "font"})
+    {
+        std::error_code ec;
+        for (const auto &e : fs::directory_iterator(m->folder / sub, ec))
+        {
+            std::error_code fec;
+            if (e.is_regular_file(fec))
+                ++n;
+        }
+    }
+    return n;
+}
+
+std::vector<std::string> DevPackSource::notes() const
+{
+    std::lock_guard<std::mutex> lock(m->notesMutex);
+    return m->notes;
+}
+
+void DevPackSource::clearNotes()
+{
+    std::lock_guard<std::mutex> lock(m->notesMutex);
+    m->notes.clear();
+}
+
+namespace
+{
+    std::mutex gDevPackMutex;
+    std::shared_ptr<DevPackSource> gDevPackSlot;
+}
+
+void SetDevPack(std::shared_ptr<DevPackSource> pack)
+{
+    std::lock_guard<std::mutex> lock(gDevPackMutex);
+    gDevPackSlot = std::move(pack);
+}
+
+std::shared_ptr<DevPackSource> DevPack()
+{
+    std::lock_guard<std::mutex> lock(gDevPackMutex);
+    return gDevPackSlot;
+}
+
+void SetAuthoring(bool on)
+{
+    gAuthoring.store(on, std::memory_order_relaxed);
+}
+
+bool Authoring()
+{
+    return gAuthoring.load(std::memory_order_relaxed);
+}
+
 namespace
 {
     std::mutex &defaultSourceMutex()

@@ -754,7 +754,22 @@ body
     color: #e7bc3d;
 }
 
-#mods-folder
+#mods-foot
+{
+    display: flex;
+    flex-direction: row;
+    justify-content: space-between;
+    align-items: center;
+}
+
+#mods-paths
+{
+    flex: 1 1 0;
+    overflow: hidden;
+}
+
+#mods-folder,
+#dev-folder
 {
     height: 20dp;
     overflow: hidden;
@@ -763,6 +778,23 @@ body
     font-weight: normal;
     letter-spacing: 0.3dp;
     color: #cfcbbb;
+}
+
+#mods-tools
+{
+    display: flex;
+    flex-direction: row;
+    margin-left: 12dp;
+}
+
+.mbtn.small
+{
+    width: 134dp;
+    height: 30dp;
+    padding-top: 3dp;
+    margin-right: 0;
+    margin-left: 6dp;
+    font-size: 15dp;
 }
 
 /* Scroll bars (a list or a details page longer than its box): a cream-framed trough with the blue thumb of the game's own lists. */

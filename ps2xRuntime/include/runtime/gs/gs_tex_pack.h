@@ -65,13 +65,60 @@ namespace TexPack
     // The files of a folder: <root>/assets/textures/*. Provider "folder", order 0. For tests and the replayer.
     std::shared_ptr<FileSource> MakeDirectorySource(const std::string &root);
 
+    // The DEV PACK (task t2; docs/modding-textures.md): a folder of loose files that acts like a mod loaded after every other one, so an author
+    // sees an edited picture at once, with no packing and no restart. Its layout is the mod's `assets/` folder without that name:
+    //     <folder>/textures/<key>.png, <key>.idx.png      texture pictures
+    //     <folder>/font/<glyph>.png                       HD glyphs
+    // Its files are listed under the same paths a mod's would have ("assets/textures/...", "assets/font/..."), with provider "dev-pack" and the
+    // highest order, and they replace a mod's file of the same path. Everything else comes from `base` (the enabled mods; may be null).
+    // A thread polls the folder (every 400 ms, and takes a change only once the files have stopped changing for a poll, since editors write
+    // in two steps); changed() tells the renderer, once per change, that it should read the packs again.
+    class DevPackSource final : public FileSource
+    {
+    public:
+        static constexpr const char *kProvider = "dev-pack";
+        // `watch`: start the polling thread (the author tools are on). Without it the folder is still read, once, at the start.
+        DevPackSource(std::string folder, std::shared_ptr<FileSource> base, int pollMillis = 400, bool watch = true);
+        ~DevPackSource() override;
+        DevPackSource(const DevPackSource &) = delete;
+        DevPackSource &operator=(const DevPackSource &) = delete;
+
+        std::vector<Entry> list(const std::string &prefix) override;
+        bool read(const std::string &path, std::vector<uint8_t> &out, std::string &error) override;
+        void problem(const std::string &provider, const std::string &message) override;
+
+        // True once after the folder's files changed (any thread). The first call after construction is false.
+        bool changed();
+        const std::string &folder() const;
+        // The number of files in the folder now (not cached: reads the folder).
+        uint32_t fileCount() const;
+        // Complaints about dev-pack files (refused pictures), at most 24, newest last.
+        std::vector<std::string> notes() const;
+        // Forget the notes (before a reload).
+        void clearNotes();
+
+    private:
+        struct Impl;
+        std::unique_ptr<Impl> m;
+    };
+
+    // Whether the author tools are on for this run: the texture tracker runs even with no pack, the dev pack is watched and the "Dump
+    // textures" button works. Set by the host from PS2X_AUTHORING=1, the overlay's Texture tools setting or a dev-pack folder that has files.
+    void SetAuthoring(bool on);
+    bool Authoring();
+    // The dev pack the host made (also the default source's outermost layer), so the renderer can ask it whether files changed.
+    void SetDevPack(std::shared_ptr<DevPackSource> pack);
+    std::shared_ptr<DevPackSource> DevPack();
+
     // The source the renderer uses. The game's host registers the mod manager's (ps2_host_mods.cpp) before the renderer is made;
     // PS2X_TEX_PACK_DIR=<folder> (a test aid, and how the replayer gets a pack) names a folder in its place. Null when neither is set.
     void SetDefaultSource(std::shared_ptr<FileSource> source);
     std::shared_ptr<FileSource> DefaultSource();
 
     // ---- the store ----
-    enum class Kind : uint8_t { Rgba, Index };
+    // Ramp: a coverage picture (R8, 0..255) that the renderer looks up on the texture's live palette as a ramp: 255 is the palette's last
+    // entry, 0 its first, in between the colours blend. The HD text atlas (gs_font.h) is one; it never comes from a file.
+    enum class Kind : uint8_t { Rgba, Index, Ramp };
 
     // A decoded replacement picture. Rgba pixels are 4 bytes each with the alpha already in the GS's scale (0x80 = opaque); Index
     // pixels are the raw palette indices.

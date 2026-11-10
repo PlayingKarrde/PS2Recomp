@@ -47,6 +47,10 @@
                  data-help="Sharp keeps pixels crisp, Linear smooths them.">
                 <span class="label">Picture Filter</span><span class="tag"></span><span class="value">[Sharp]</span>
             </div>
+            <div class="row" data-kind="toggle" data-key="texture_tools" data-value="off" data-restart="1"
+                 data-help="For modders: dump textures and see edits at once. Needs a restart.">
+                <span class="label">Texture Tools</span><span class="tag"></span><span class="value">[OFF]</span>
+            </div>
         </div>
 
         <div class="panel hidden" id="panel-audio">
@@ -71,7 +75,16 @@
                 <div id="mod-details"></div>
             </div>
             <div id="mods-status"></div>
-            <div id="mods-folder"></div>
+            <div id="mods-foot">
+                <div id="mods-paths">
+                    <div id="mods-folder"></div>
+                    <div id="dev-folder"></div>
+                </div>
+                <div id="mods-tools">
+                    <div class="mbtn small" id="dump-textures" data-help="For modders: save this screen's textures and text to a dumps folder.">Dump Textures</div>
+                    <div class="mbtn small" id="open-dumps" data-help="For modders: open the folder the texture dumps go to.">Dumps Folder</div>
+                </div>
+            </div>
         </div>
 
         <div id="notice"><span id="restart-note" class="hidden"></span></div>

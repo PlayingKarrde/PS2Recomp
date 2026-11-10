@@ -51,6 +51,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
 
 struct SDL_GPUDevice;
 struct SDL_GPUTexture;
@@ -150,11 +151,26 @@ public:
         uint64_t gpuBytes = 0;            // replacement pictures on the GPU
         uint64_t cacheBytes = 0;          // decoded pictures held in memory
         uint32_t dumpedFiles = 0;
+        // HD text (task t2); zero without a font pack
+        bool fontActive = false;          // glyph pictures are loaded
+        uint32_t fontFiles = 0;           // glyph files indexed
+        uint32_t fontRefused = 0;
+        uint32_t fontScale = 1;           // the atlas scale
+        uint32_t fontHdCells = 0;         // cells of the last HD canvas that show a mod's picture
+        uint32_t fontOriginalCells = 0;   // ... and those enlarged from the original glyph
+        bool authoring = false;           // the author tools are on (the key tracker runs; the dev pack is watched)
+        uint32_t devPackFiles = 0;
     };
     ReplacementReport Replacement() const;
     // Reads the texture pack files again (the F1 panel's button; any thread). Textures asked again at their next draw; pictures changed
     // on disk show up. The set of mods is the one the game started with. Returns the number of texture files, 0 without a pack.
     uint32_t ReloadTexturePacks();
+    // "Dump textures on this screen" (the F1 panel and the Mods tab; any thread): writes the textures the next two frames use, and the glyphs
+    // of the text they draw, into `folder` (textures/, font/, textures.csv, glyphs.csv, contact-sheet.png). False if the author tools are off or
+    // a dump is under way. The result is a line in TextureDumpMessage once TextureDumpBusy is false.
+    bool RequestTextureDump(const std::string &folder);
+    bool TextureDumpBusy() const;
+    std::string TextureDumpMessage() const;
 
     // One field published by the GS thread for the host (path B). A field uses one slot for the displayed
     // region, and up to two more for the frame buffers Compose falls back to when the displayed one is

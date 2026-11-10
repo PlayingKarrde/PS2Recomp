@@ -119,6 +119,22 @@ float4 tap(int hx, int hy, int texW, int texH, int S, uint kind, int2 rectO, int
         const float4 texel = RepTex.SampleLevel(RepSamp, uv, 0.0f);
         if (kind == 1u)
             return round(texel * 255.0f);
+        if (kind == 3u)
+        {
+            // A coverage ramp (the HD text atlas): the byte, 0..255, is a position on the palette, 0 its first entry and 255 its last
+            // (mask), and the colour is the blend of the two entries around it. The original's grey level n (0..15) is the byte 17 n, so
+            // it lands exactly on entry n; a finer value lands between two entries. Bilinear filtering of the picture's bytes then
+            // happens through this lookup, one tap at a time, like for an index picture.
+            const float pos = round(texel.r * 255.0f) * (float)mask / 255.0f;
+            const uint i0 = min((uint)floor(pos), mask);
+            const uint i1 = min(i0 + 1u, mask);
+            const float f = pos - (float)i0;
+            const uint p0 = Pal[i0 >> 2u][i0 & 3u];
+            const uint p1 = Pal[i1 >> 2u][i1 & 3u];
+            const float4 c0 = float4((float)(p0 & 255u), (float)((p0 >> 8u) & 255u), (float)((p0 >> 16u) & 255u), (float)(p0 >> 24u));
+            const float4 c1 = float4((float)(p1 & 255u), (float)((p1 >> 8u) & 255u), (float)((p1 >> 16u) & 255u), (float)(p1 >> 24u));
+            return lerp(c0, c1, f);
+        }
         const uint index = (uint)round(texel.r * 255.0f) & mask;
         const uint packed = Pal[index >> 2u][index & 3u];
         return float4((float)(packed & 255u), (float)((packed >> 8u) & 255u), (float)((packed >> 16u) & 255u), (float)(packed >> 24u));

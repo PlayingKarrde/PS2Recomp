@@ -28,6 +28,7 @@ namespace ps2x_settings
             {"vsync", "PS2X_GPU_PRESENT_MODE", "off"},
             {"filter", "PS2X_SCALE", "sharp"},
             {"volume", "PS2X_VOLUME", "100"},
+            {"texture_tools", "PS2X_AUTHORING", "off"},
         };
 
         std::string trim(const std::string &text)
@@ -71,7 +72,7 @@ namespace ps2x_settings
             }
             if (key == "aspect")
                 return (value == "4:3" || value == "16:9" || value == "21:9") ? std::optional<std::string>(value) : std::nullopt;
-            if (key == "fullscreen" || key == "vsync")
+            if (key == "fullscreen" || key == "vsync" || key == "texture_tools")
             {
                 if (value == "on" || value == "1" || value == "true" || value == "yes")
                     return std::string("on");
@@ -201,7 +202,7 @@ namespace ps2x_settings
                 return std::string("21:9");
             return text; // another shape (32:9): shown as it is
         }
-        if (key == "fullscreen")
+        if (key == "fullscreen" || key == "texture_tools")
         {
             if (text == "1" || text == "on" || text == "true" || text == "yes")
                 return std::string("on");
@@ -243,7 +244,7 @@ namespace ps2x_settings
         const Definition *def = find(key);
         if (!v || !def || *v == def->defaultValue)
             return std::nullopt;
-        if (key == "fullscreen")
+        if (key == "fullscreen" || key == "texture_tools")
             return std::string("1");
         if (key == "vsync")
             return std::string("vsync");
@@ -283,9 +284,9 @@ namespace ps2x_settings
         std::string out = "# Fire Pro Wrestling Returns (recomp) settings. Written by the settings overlay; edit when the game is closed.\n"
                           "# renderer = gpu | cpu          resolution = 1..4         aspect = 4:3 | 16:9 | 21:9\n"
                           "# fullscreen = on | off         vsync = on | off          filter = sharp | linear\n"
-                          "# volume = 0..100\n"
+                          "# volume = 0..100              texture_tools = on | off (the modder's tools, docs/modding-textures.md)\n"
                           "# An environment variable (PS2X_GS_BACKEND, PS2X_GS_SCALE, PS2X_GS_WIDE, PS2X_FULLSCREEN,\n"
-                          "# PS2X_GPU_PRESENT_MODE, PS2X_SCALE, PS2X_VOLUME) set before the game starts wins over this file.\n";
+                          "# PS2X_GPU_PRESENT_MODE, PS2X_SCALE, PS2X_VOLUME, PS2X_AUTHORING) set before the game starts wins over this file.\n";
         for (const Entry &entry : entries)
             out += entry.key + " = " + entry.value + "\n";
         return out;

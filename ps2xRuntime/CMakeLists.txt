@@ -453,6 +453,9 @@ if(NOT PS2X_IS_VITA)
     # Plain C++ with no SDL; nothing generated code includes refers to them. (The tracker, PNG codec and store are compiled for every
     # build that has the GPU renderer, whether or not mods are built: a pack can also come from a folder, PS2X_TEX_PACK_DIR.)
     target_sources(ps2_runtime PRIVATE src/lib/gs/gs_tex_keys.cpp src/lib/gs/gs_png.cpp src/lib/gs/gs_tex_dump.cpp src/lib/gs/gs_tex_pack.cpp)
+    # HD text (task t2): glyph codes and names, the registry of glyph bitmaps and the HD canvas. Plain C++ with no SDL; the game's override at
+    # 0x138210 reports glyphs through ps2x_gs::fontNoteGlyph (declared in the override, not in a header generated code includes).
+    target_sources(ps2_runtime PRIVATE src/lib/gs/gs_font.cpp)
     # M3: the main-thread presenter of the direct picture path (its compiled shaders) and the code that chooses and
     # wires up the GPU renderer for the game (it asks the host presenter for its device).
     target_sources(ps2_runtime PRIVATE src/lib/gs/gs_gpu_present.cpp src/lib/gs/gs_gpu_host.cpp)

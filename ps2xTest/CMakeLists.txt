@@ -41,6 +41,7 @@ add_library(ps2_test_lib STATIC
     src/gs_recording_tests.cpp
     src/gs_gpu_tests.cpp
     src/gs_tex_pack_tests.cpp
+    src/gs_font_tests.cpp
     src/ui_settings_tests.cpp
 )
 

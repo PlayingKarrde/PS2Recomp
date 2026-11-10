@@ -52,6 +52,18 @@ namespace ps2x::ui
         // Called after anything that may change which mods are loaded at the next start (the menu refreshes its "Restart needed" note).
         void setOnChange(std::function<void()> callback) { m_onChange = std::move(callback); }
 
+        // The modder's tools at the foot of the tab (#dev-folder, #dump-textures, #open-dumps; the page may lack them): the dev pack folder
+        // line and the buttons "Dump Textures" (arms a dump of the next frames; the game is paused while this menu is open, so the frames come
+        // after it closes) and "Dumps Folder". With no devPackLine the tools are hidden.
+        struct Tools
+        {
+            std::function<std::string()> devPackLine;
+            std::function<std::string()> dumpTextures;
+            std::function<void()> openDumpsFolder;
+            std::function<std::string()> lastDumpResult;
+        };
+        void setTools(Tools tools);
+
         // Builds the list and the details again from the manager, keeping the selected mod if it is still there.
         void refresh();
         // The line under the list.
@@ -86,5 +98,6 @@ namespace ps2x::ui
         bool m_confirming = false;
         std::string m_confirmKey; // the mod the question is about
         std::function<void()> m_onChange;
+        Tools m_tools;
     };
 }

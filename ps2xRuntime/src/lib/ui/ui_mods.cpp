@@ -144,6 +144,22 @@ namespace ps2x::ui
         return true;
     }
 
+    void ModsPage::setTools(Tools tools)
+    {
+        m_tools = std::move(tools);
+        const std::string line = m_tools.devPackLine ? m_tools.devPackLine() : std::string();
+        if (Rml::Element *dev = byId("dev-folder"))
+            dev->SetInnerRML(line.empty() ? std::string() : text(line));
+        if (Rml::Element *buttons = byId("mods-tools"))
+            buttons->SetProperty("display", line.empty() ? "none" : "flex");
+        if (m_tools.lastDumpResult)
+        {
+            const std::string last = m_tools.lastDumpResult();
+            if (!last.empty())
+                setStatus(last);
+        }
+    }
+
     void ModsPage::detach()
     {
         if (!m_document)
@@ -186,6 +202,9 @@ namespace ps2x::ui
     {
         if (!m_document || !m_manager)
             return;
+        if (m_tools.devPackLine)
+            if (Rml::Element *dev = byId("dev-folder"))
+                dev->SetInnerRML(text(m_tools.devPackLine())); // the line carries the newest complaint about a dev pack file
         const auto mods = m_manager->list();
         const bool there = std::any_of(mods.begin(), mods.end(), [&](const ModInfo &m) { return m.key == m_selected; });
         if (!there)
@@ -630,6 +649,21 @@ namespace ps2x::ui
         {
             for (Rml::Element *e = target; e; e = e->GetParentNode())
             {
+                if (e->GetId() == "dump-textures" && !m_confirming)
+                {
+                    const std::string said = m_tools.dumpTextures ? m_tools.dumpTextures() : std::string();
+                    // The instruction comes first: the status line does not wrap, and a long folder path would push it out of sight.
+                    const bool started = said.rfind("Dumping", 0) == 0;
+                    setStatus(said.empty() ? "The texture tools are not available." : (started ? "Close this menu so the game can draw it. " : std::string()) + said);
+                    return;
+                }
+                if (e->GetId() == "open-dumps" && !m_confirming)
+                {
+                    if (m_tools.openDumpsFolder)
+                        m_tools.openDumpsFolder();
+                    setStatus("Opened the dumps folder.");
+                    return;
+                }
                 if (e->GetId() == "mod-confirm-no")
                 {
                     leaveConfirm(true);
@@ -783,7 +817,17 @@ namespace ps2x::ui
                 {
                     if (key == Rml::Input::KI_DOWN && e->IsClassSet("tab"))
                     {
-                        focusSelectedRow();
+                        // With no mods installed (a modder's usual start) the modder's buttons are what the controller can reach.
+                        Rml::Element *list = byId("mods-list");
+                        Rml::ElementList rows;
+                        if (list)
+                            list->QuerySelectorAll(rows, ".mod");
+                        Rml::Element *dump = byId("dump-textures");
+                        const bool toolsShown = m_tools.devPackLine && !m_tools.devPackLine().empty();
+                        if (rows.empty() && dump && toolsShown)
+                            dump->Focus(true);
+                        else
+                            focusSelectedRow();
                         event.StopPropagation();
                         return;
                     }

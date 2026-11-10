@@ -129,7 +129,43 @@ namespace ps2x_host_mods
                     std::printf("[mods] %s is not usable: %s\n", mod.file.c_str(), mod.error.c_str());
             std::fflush(stdout);
             h.manager = std::move(manager);
-            TexPack::SetDefaultSource(std::make_shared<ModTextureSource>(h.manager.get()));
+            std::shared_ptr<TexPack::FileSource> source = std::make_shared<ModTextureSource>(h.manager.get());
+
+            // The dev pack (task t2, docs/modding-textures.md): a folder of loose pictures that acts like a mod loaded after every other one.
+            // The author tools (the key tracker without a pack, the dump button, watching the folder) are on when PS2X_AUTHORING=1, when the
+            // overlay's Texture Tools setting is on (it reaches this variable) or when the folder already holds files; PS2X_AUTHORING=0 turns
+            // them off whatever the folder holds.
+            fs::path devFolder;
+            if (const char *env = std::getenv("PS2X_DEV_PACK"); env && env[0] != '\0')
+                devFolder = fromUtf8(env);
+            else if (!prefFolder.empty())
+                devFolder = prefFolder / "dev-pack";
+            if (!devFolder.empty())
+            {
+                const char *flag = std::getenv("PS2X_AUTHORING");
+                bool authoring = flag && (flag[0] == '1' || flag[0] == 'o' || flag[0] == 'O');
+                const bool forcedOff = flag && flag[0] == '0';
+                std::error_code ec;
+                uint32_t looseFiles = 0;
+                for (const char *sub : {"textures", "font"})
+                    for (const auto &entry : fs::directory_iterator(devFolder / sub, ec))
+                    {
+                        std::error_code fec;
+                        if (entry.is_regular_file(fec))
+                            ++looseFiles;
+                    }
+                if (!authoring && !forcedOff && looseFiles > 0)
+                    authoring = true;
+                if (forcedOff)
+                    authoring = false;
+                auto pack = std::make_shared<TexPack::DevPackSource>(utf8(devFolder), source, 400, authoring);
+                TexPack::SetDevPack(pack);
+                TexPack::SetAuthoring(authoring);
+                source = pack;
+                std::printf("[mods] dev pack folder %s (%u files); author tools %s\n", utf8(devFolder).c_str(), looseFiles, authoring ? "on" : "off");
+                std::fflush(stdout);
+            }
+            TexPack::SetDefaultSource(source);
         });
     }
 

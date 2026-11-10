@@ -45,6 +45,7 @@
 #include "ps2_host_backend.h"
 #include "ps2_host_mods.h"
 #include "ps2_settings.h"
+#include "runtime/gs/gs_gpu_host.h"
 #include "runtime/gs/gs_gpu_threads.h"
 #include "runtime/ps2_card_activity.h"
 #include "runtime/ps2_pause.h"
@@ -294,6 +295,27 @@ namespace ps2x_host::ui
             std::string controllerName() override { return gamepadName(); }
 
             ps2x::mods::Manager *modManager() override { return ps2x_host_mods::manager(); }
+
+            // The modder's tools at the foot of the Mods tab (task t2).
+            std::string devPackLine() override
+            {
+                const std::string folder = ps2x_gs::devPackFolder();
+                if (folder.empty())
+                    return std::string();
+                // One line, no wrapping: the folder when all is well, the newest complaint about a file when there is one.
+                const auto notes = ps2x_gs::devPackNotes();
+                if (!notes.empty())
+                    return "Dev pack: " + notes.back();
+                return "Dev pack folder: " + folder + (ps2x_gs::textureToolsOn() ? std::string() : std::string("  (Texture Tools are off)"));
+            }
+            std::string dumpTextures() override { return ps2x_gs::requestTextureDump(); }
+            void openDumpsFolder() override { ps2x_gs::openFolder(ps2x_gs::dumpsFolder()); }
+            std::string lastDumpResult() override
+            {
+                bool busy = false;
+                const std::string message = ps2x_gs::textureDumpMessage(&busy);
+                return busy ? std::string() : message;
+            }
         };
 
         GameHost &gameHost()

@@ -2326,6 +2326,24 @@ void PS2DebugPanel::draw(PS2Runtime &runtime)
                 ImGui::SameLine();
                 if (ImGui::SmallButton("Reload texture packs"))
                     std::printf("[tex:pack] %s\n", ps2x_gs::reloadTexturePacks().c_str());
+                if (ps2x_gs::textureToolsOn())
+                {
+                    // The modder's tools (task t2, docs/modding-textures.md): dump what the screen draws, ready for the dev pack folder.
+                    static std::string dumpAsked;
+                    if (ImGui::SmallButton("Dump textures on this screen"))
+                        dumpAsked = ps2x_gs::requestTextureDump();
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("Open dumps folder"))
+                        ps2x_gs::openFolder(ps2x_gs::dumpsFolder());
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("Open dev pack folder"))
+                        ps2x_gs::openFolder(ps2x_gs::devPackFolder());
+                    bool dumpBusy = false;
+                    const std::string dumpDone = ps2x_gs::textureDumpMessage(&dumpBusy);
+                    const std::string &shown = (!dumpBusy && !dumpDone.empty()) ? dumpDone : dumpAsked;
+                    if (!shown.empty())
+                        ImGui::TextColored(ImVec4(0.7f, 1.0f, 0.7f, 1.0f), "%s", shown.c_str());
+                }
             }
         }
 

@@ -60,6 +60,8 @@ struct Dumper::Impl
     std::string dir;
     uint32_t maxFiles = 40000, files = 0, colouringsMax = 4;
     std::FILE *csv = nullptr, *slotsCsv = nullptr;
+    bool keepPictures = false;
+    std::vector<Tile> pictures;
 
     struct KeyState
     {
@@ -180,6 +182,14 @@ struct Dumper::Impl
             toRgbaPng(s.desc, *texels, s.palette, rgba);
             if (writeFile(path(file), GSPng::Encode(w, h, 6, rgba)))
                 ++files;
+            if (keepPictures && pictures.size() < 4096)
+            {
+                Tile tile;
+                tile.w = w;
+                tile.h = h;
+                tile.rgba = rgba;
+                pictures.push_back(std::move(tile));
+            }
             if (indexed && s.palette)
             {
                 std::vector<uint8_t> plte, trns;
@@ -249,6 +259,93 @@ std::unique_ptr<Dumper> Dumper::FromEnvironment()
     }
     std::fprintf(stderr, "[tex:dump] on: writing the replaced rectangle of each texture to %s (named by k3_i)\n", m.dir.c_str());
     return d;
+}
+
+std::unique_ptr<Dumper> Dumper::Create(const std::string &imageDir, const std::string &csvDir, uint32_t maxFiles, uint32_t colourings)
+{
+    std::unique_ptr<Dumper> d(new Dumper());
+    Impl &m = *d->m;
+    m.dir = imageDir;
+    while (!m.dir.empty() && (m.dir.back() == '/' || m.dir.back() == '\\'))
+        m.dir.pop_back();
+    m.maxFiles = maxFiles;
+    m.colouringsMax = colourings;
+    m.keepPictures = true;
+    std::error_code ec;
+    fs::create_directories(m.dir, ec);
+    fs::create_directories(csvDir, ec);
+    m.csv = std::fopen((csvDir + "/textures.csv").c_str(), "w");
+    if (!m.csv)
+        return nullptr;
+    std::fprintf(m.csv, "file,key,keytype,k1,tbp,tbw,psm,w,h,indexed,x,y,rw,rh,writers,exact,status,class,clut_hash,k3_c,existed,marker\n");
+    return d;
+}
+
+std::vector<Tile> Dumper::TakePictures()
+{
+    return std::move(m->pictures);
+}
+
+bool WriteContactSheet(const std::string &path, const std::vector<Tile> &tiles, uint32_t cell, uint32_t columns)
+{
+    if (tiles.empty() || cell < 8 || columns == 0)
+        return false;
+    const uint32_t rows = static_cast<uint32_t>((tiles.size() + columns - 1) / columns);
+    const uint32_t pitch = cell + 2;
+    const uint32_t W = columns * pitch + 2, H = rows * pitch + 2;
+    std::vector<uint8_t> sheet(static_cast<size_t>(W) * H * 4, 0);
+    for (size_t i = 0; i < sheet.size(); i += 4)
+    {
+        sheet[i] = sheet[i + 1] = sheet[i + 2] = 24;
+        sheet[i + 3] = 255;
+    }
+    for (size_t t = 0; t < tiles.size(); ++t)
+    {
+        const Tile &tile = tiles[t];
+        if (tile.w == 0 || tile.h == 0 || tile.rgba.size() < static_cast<size_t>(tile.w) * tile.h * 4u)
+            continue;
+        const uint32_t ox = 2 + static_cast<uint32_t>(t % columns) * pitch, oy = 2 + static_cast<uint32_t>(t / columns) * pitch;
+        const float scale = std::min(static_cast<float>(cell) / static_cast<float>(tile.w), static_cast<float>(cell) / static_cast<float>(tile.h));
+        const uint32_t dw = std::max(1u, static_cast<uint32_t>(static_cast<float>(tile.w) * scale)), dh = std::max(1u, static_cast<uint32_t>(static_cast<float>(tile.h) * scale));
+        for (uint32_t y = 0; y < cell; ++y)
+            for (uint32_t x = 0; x < cell; ++x)
+            {
+                uint8_t *px = &sheet[(static_cast<size_t>(oy + y) * W + ox + x) * 4u];
+                const uint8_t checker = (((x >> 3) + (y >> 3)) & 1u) ? 70 : 52;
+                float r = checker, g = checker, b = checker;
+                if (x < dw && y < dh)
+                {
+                    // the box of source pixels under this thumbnail pixel
+                    const uint32_t sx0 = static_cast<uint32_t>(static_cast<float>(x) / scale), sy0 = static_cast<uint32_t>(static_cast<float>(y) / scale);
+                    const uint32_t sx1 = std::min(tile.w, std::max(sx0 + 1, static_cast<uint32_t>(static_cast<float>(x + 1) / scale)));
+                    const uint32_t sy1 = std::min(tile.h, std::max(sy0 + 1, static_cast<uint32_t>(static_cast<float>(y + 1) / scale)));
+                    float cr = 0, cg = 0, cb = 0, ca = 0;
+                    uint32_t n = 0;
+                    for (uint32_t sy = sy0; sy < sy1; ++sy)
+                        for (uint32_t sx = sx0; sx < sx1; ++sx)
+                        {
+                            const uint8_t *sp = &tile.rgba[(static_cast<size_t>(sy) * tile.w + sx) * 4u];
+                            cr += sp[0] * sp[3];
+                            cg += sp[1] * sp[3];
+                            cb += sp[2] * sp[3];
+                            ca += sp[3];
+                            ++n;
+                        }
+                    if (n > 0 && ca > 0)
+                    {
+                        const float a = ca / (255.0f * static_cast<float>(n));
+                        r = (cr / ca) * a + r * (1.0f - a);
+                        g = (cg / ca) * a + g * (1.0f - a);
+                        b = (cb / ca) * a + b * (1.0f - a);
+                    }
+                }
+                px[0] = static_cast<uint8_t>(r + 0.5f);
+                px[1] = static_cast<uint8_t>(g + 0.5f);
+                px[2] = static_cast<uint8_t>(b + 0.5f);
+                px[3] = 255;
+            }
+    }
+    return writeFile(path, GSPng::Encode(W, H, 6, sheet));
 }
 
 void Dumper::Seen(const Sighting &sighting)

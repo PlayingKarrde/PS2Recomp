@@ -55,6 +55,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace ps2x_gs
 {
@@ -94,4 +95,21 @@ namespace ps2x_gs
     std::string debugPanelTextureLine();
     // Reads the texture pack files again (the debug panel's button). Returns one line saying what was found, or "" with no pack.
     std::string reloadTexturePacks();
+
+    // ---- texture authoring (task t2; docs/modding-textures.md) ----
+    // True when the author tools are on for this run: the key tracker runs without a pack, the dev pack folder is watched and the dump
+    // button works. (PS2X_AUTHORING=1, the overlay's Texture Tools setting, or a dev pack folder that already holds files at the start.)
+    bool textureToolsOn();
+    // The dev pack folder (loose pictures that take effect at once) and the folder the dumps go to, as text; "" when there is no preference folder.
+    std::string devPackFolder();
+    std::string dumpsFolder();
+    // Complaints about dev pack files the renderer could not use (a picture of the wrong size...), at most 24.
+    std::vector<std::string> devPackNotes();
+    // "Dump textures on this screen": the textures the next two frames draw, and the glyphs of their text, go to <dumps folder>/<date-time>/ (textures/,
+    // font/, textures.csv, glyphs.csv, contact-sheet.png). Returns one line for the panel: that it started, or why it cannot.
+    std::string requestTextureDump();
+    // The result of the last dump ("" until it is done); *busy tells whether one is under way. Any thread.
+    std::string textureDumpMessage(bool *busy = nullptr);
+    // Opens a folder in the system's file manager (creates it first).
+    void openFolder(const std::string &path);
 }
