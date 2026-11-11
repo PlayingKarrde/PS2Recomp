@@ -48,6 +48,14 @@ namespace ps2x::mods::fpr
     constexpr uint32_t kOffAppearance = kRoster + 0x92A6;
     constexpr uint32_t kAppearanceStride = 448;
 
+    // ---- the created wrestlers ("edit slots", docs/formats/edit-save.md "Edit slots") ----------------------------------------------
+    constexpr uint32_t kRosterBlobSize = 0x2E1B8;
+    constexpr int kEditSlotCount = 500;
+    constexpr uint32_t kEditSlotSize = 0x44C;
+    constexpr uint32_t kOffEditArea = kRoster + kRosterBlobSize; // 0x3F398: slot k is at kOffEditArea + kEditSlotSize * k
+    // A slot is used when its first u16 is not zero; an empty slot is all zero bytes in a save the game wrote.
+    inline uint32_t editSlotOffset(int slot) { return kOffEditArea + kEditSlotSize * static_cast<uint32_t>(slot); }
+
     // Text field widths in bytes, and the most characters each takes (the game's own limits for wrestlers; one short of the field
     // for organisations and groups, which no save has ever filled).
     constexpr uint32_t kWidthFirst = 14, kWidthLast = 18, kWidthNickname = 24, kWidthOrgLong = 26, kWidthOrgShort = 14;
@@ -111,6 +119,7 @@ namespace ps2x::mods::fpr
     //   g<i>.live | .name | .short | .org | .kind    a group's record
     //   o.order | g.order                the list order arrays
     //   a<slot>                          a wrestler's appearance record
+    //   e<slot>                          a created wrestler's whole edit slot (0x44C bytes: used flag, record, budget, finisher name, look)
     struct FieldRange
     {
         uint32_t offset = 0;

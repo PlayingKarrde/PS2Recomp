@@ -36,6 +36,21 @@
 // The state is read once, when the guest has really stopped (guestBlocked()), not when the menu opens: the guest runs on
 // until its next vertical blank. Until then the button is dimmed with "Waiting for the game to pause.".
 //
+// ---- Load Now and Restart Now (task h1) ----
+//
+// Load Now (the Mods tab; ps2_host_mods.h "Load Now", mods/hot_load.h) applies data-pack changes to the running game. The menu asks first.
+// On Yes the host records the request and closes the menu, so the guest runs again; the game's own load (a wrapper in the game override)
+// starts at its next pass through the title screen's PRESS START or the main menu. A refusal while the menu was closed (a card file open for
+// writing, a profile that does not pass the game's checks, a request no safe point took in 4 s) opens the menu on the Mods tab with the reason.
+// The Load Now button is decided once per opening, when the guest has really stopped (checkQuit, the Quit Game moment): it is enabled only if
+// the game passed a safe point in the last quarter second.
+//
+// Restart Now (next to the restart note) is Quit Game followed by starting the same executable again with the same command line and
+// environment: the host sets a flag, runs the Quit Game path (same card rule, same dimming), and at the end of the shutdown (destroy(), after
+// the settings are saved) starts the new process. The environment is the current one minus the variables the settings file put there (they
+// are read from the file again, and a changed setting must win), so a variable the player set stays. Windows and Linux (and macOS,
+// untested) only.
+//
 // Test hook: PS2X_TEST_PAD=<file> makes the host attach an SDL virtual gamepad and apply the lines a script appends to
 // the file ("down south", "up south", "axis leftx 20000"...). Real controllers are untouched; scripted runs set
 // SDL_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT so only this one is seen (tools/drive_game.py does).
@@ -52,6 +67,25 @@
 #include "runtime/ps2_pause.h"
 
 #include <SDL3/SDL.h>
+
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <cwchar>
+#elif defined(__linux__) || defined(__APPLE__)
+#include <spawn.h>
+#include <unistd.h>
+#if defined(__APPLE__)
+#include <crt_externs.h>
+#include <mach-o/dyld.h>
+#endif
+extern char **environ;
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -106,6 +140,10 @@ namespace ps2x_host::ui
             uint64_t blockEntriesAtOpen = 0; // guestBlockEntries() when the menu opened: only a later pause counts
             std::string quitBlock;      // why Quit Game is dimmed ("" = it is not)
             bool testOpenOnCardWrite = false; // PS2X_TEST_OPEN_ON_CARD_WRITE=1
+            // Task h1
+            const char *closeHow = "Back"; // what the log says closed the menu
+            bool restartAsked = false;     // Restart Now was confirmed; update() carries it out like Quit Game
+            bool relaunchAtExit = false;   // destroy() starts the game again
         } g;
 
         // ---- test pad -------------------------------------------------------------------------------------------
@@ -209,6 +247,192 @@ namespace ps2x_host::ui
 
         std::string startImportDialog();
         void importAndShow(const std::string &path, const std::string &folder);
+
+        // ---- Restart Now (task h1) ----------------------------------------------------------------------------------
+
+#if defined(_WIN32) || defined(__linux__) || defined(__APPLE__)
+        constexpr bool kRestartSupported = true;
+#else
+        constexpr bool kRestartSupported = false;
+#endif
+
+        // The environment the restarted game gets: this process's, without the variables the settings file put there (the file is read
+        // again and must win). A variable the player set before starting the game stays (ps2x_settings::fixedByEnvironment).
+        std::vector<std::string> settingsVariables()
+        {
+            std::vector<std::string> names;
+            for (const ps2x_settings::Definition &definition : ps2x_settings::definitions())
+                if (definition.envName && definition.envName[0] && !ps2x_settings::fixedByEnvironment(definition.key))
+                    names.emplace_back(definition.envName);
+            return names;
+        }
+
+        // Starts the game again with the command line it was started with. False with `why` when it could not.
+        bool spawnSelf(std::string &why)
+        {
+            const std::vector<std::string> drop = settingsVariables();
+#if defined(_WIN32)
+            auto narrow = [](const wchar_t *wide, size_t length) {
+                if (length == 0)
+                    return std::string();
+                const int bytes = WideCharToMultiByte(CP_UTF8, 0, wide, static_cast<int>(length), nullptr, 0, nullptr, nullptr);
+                std::string out(static_cast<size_t>(bytes), '\0');
+                WideCharToMultiByte(CP_UTF8, 0, wide, static_cast<int>(length), out.data(), bytes, nullptr, nullptr);
+                return out;
+            };
+            // The environment block: "NAME=value\0" ... "\0". Entries that start with '=' are the per-drive working directories; kept.
+            std::vector<wchar_t> block;
+            if (LPWCH env = GetEnvironmentStringsW())
+            {
+                for (const wchar_t *entry = env; *entry; entry += wcslen(entry) + 1)
+                {
+                    const size_t length = wcslen(entry);
+                    const wchar_t *equals = wcschr(entry + (entry[0] == L'=' ? 1 : 0), L'=');
+                    const std::string name = equals ? narrow(entry, static_cast<size_t>(equals - entry)) : std::string();
+                    bool removed = false;
+                    for (const std::string &candidate : drop)
+                        if (_stricmp(candidate.c_str(), name.c_str()) == 0)
+                            removed = true;
+                    if (!removed)
+                        block.insert(block.end(), entry, entry + length + 1);
+                }
+                FreeEnvironmentStringsW(env);
+            }
+            block.push_back(L'\0');
+            if (block.size() < 2)
+                block.push_back(L'\0');
+            std::wstring command = GetCommandLineW();
+            command.push_back(L'\0');
+            PROCESS_INFORMATION process{};
+            // The same standard handles, so a log file or a pipe the game was started with keeps getting its output, and no other handle
+            // (a C file handle is inheritable by default and would leak into the new game): an explicit handle list. If the system refuses
+            // that (a standard handle that cannot be inherited), the new game starts without them.
+            HANDLE standard[3] = {GetStdHandle(STD_INPUT_HANDLE), GetStdHandle(STD_OUTPUT_HANDLE), GetStdHandle(STD_ERROR_HANDLE)};
+            HANDLE inherit[3];
+            DWORD inheritCount = 0;
+            for (HANDLE h : standard)
+            {
+                bool seen = false;
+                for (DWORD i = 0; i < inheritCount; ++i)
+                    seen = seen || inherit[i] == h;
+                if (h && h != INVALID_HANDLE_VALUE && !seen)
+                    inherit[inheritCount++] = h;
+            }
+            BOOL ok = FALSE;
+            if (inheritCount > 0)
+            {
+                SIZE_T listBytes = 0;
+                InitializeProcThreadAttributeList(nullptr, 1, 0, &listBytes);
+                std::vector<char> listStorage(listBytes);
+                LPPROC_THREAD_ATTRIBUTE_LIST list = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(listStorage.data());
+                if (InitializeProcThreadAttributeList(list, 1, 0, &listBytes))
+                {
+                    if (UpdateProcThreadAttribute(list, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherit, inheritCount * sizeof(HANDLE), nullptr, nullptr))
+                    {
+                        STARTUPINFOEXW startup{};
+                        startup.StartupInfo.cb = sizeof(startup);
+                        startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+                        startup.StartupInfo.hStdInput = standard[0];
+                        startup.StartupInfo.hStdOutput = standard[1];
+                        startup.StartupInfo.hStdError = standard[2];
+                        startup.lpAttributeList = list;
+                        ok = CreateProcessW(nullptr, command.data(), nullptr, nullptr, TRUE, CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT, block.data(), nullptr,
+                                            &startup.StartupInfo, &process);
+                    }
+                    DeleteProcThreadAttributeList(list);
+                }
+            }
+            if (!ok)
+            {
+                STARTUPINFOW plain{};
+                plain.cb = sizeof(plain);
+                ok = CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE, CREATE_UNICODE_ENVIRONMENT, block.data(), nullptr, &plain, &process);
+            }
+            if (!ok)
+            {
+                why = "CreateProcess failed with error " + std::to_string(GetLastError());
+                return false;
+            }
+            CloseHandle(process.hThread);
+            CloseHandle(process.hProcess);
+            std::printf("[ui] Restart Now: started the game again (process %lu), without %zu settings variables\n", static_cast<unsigned long>(process.dwProcessId), drop.size());
+            return true;
+#elif defined(__linux__) || defined(__APPLE__)
+            std::vector<std::string> arguments;
+            std::string executable;
+#if defined(__APPLE__)
+            {
+                char path[4096];
+                uint32_t size = sizeof(path);
+                if (_NSGetExecutablePath(path, &size) == 0)
+                    executable = path;
+                const int count = *_NSGetArgc();
+                char **values = *_NSGetArgv();
+                for (int i = 0; i < count; ++i)
+                    arguments.emplace_back(values[i]);
+            }
+#else
+            {
+                char path[4096];
+                const ssize_t length = readlink("/proc/self/exe", path, sizeof(path) - 1);
+                if (length > 0)
+                    executable.assign(path, static_cast<size_t>(length));
+                std::FILE *file = std::fopen("/proc/self/cmdline", "rb");
+                if (file)
+                {
+                    std::string raw;
+                    char chunk[1024];
+                    size_t got;
+                    while ((got = std::fread(chunk, 1, sizeof(chunk), file)) > 0)
+                        raw.append(chunk, got);
+                    std::fclose(file);
+                    size_t start = 0;
+                    while (start < raw.size())
+                    {
+                        const size_t end = raw.find('\0', start);
+                        arguments.push_back(raw.substr(start, end == std::string::npos ? std::string::npos : end - start));
+                        if (end == std::string::npos)
+                            break;
+                        start = end + 1;
+                    }
+                }
+            }
+#endif
+            if (executable.empty() || arguments.empty())
+            {
+                why = "the program's own path or command line could not be read";
+                return false;
+            }
+            std::vector<std::string> environment;
+            for (char **entry = environ; entry && *entry; ++entry)
+            {
+                const std::string text = *entry;
+                const std::string name = text.substr(0, text.find('='));
+                if (std::find(drop.begin(), drop.end(), name) == drop.end())
+                    environment.push_back(text);
+            }
+            std::vector<char *> argv, envp;
+            for (std::string &a : arguments)
+                argv.push_back(a.data());
+            argv.push_back(nullptr);
+            for (std::string &e : environment)
+                envp.push_back(e.data());
+            envp.push_back(nullptr);
+            pid_t pid = 0;
+            const int error = posix_spawn(&pid, executable.c_str(), nullptr, nullptr, argv.data(), envp.data());
+            if (error != 0)
+            {
+                why = "posix_spawn failed with error " + std::to_string(error);
+                return false;
+            }
+            std::printf("[ui] Restart Now: started the game again (process %d), without %zu settings variables\n", static_cast<int>(pid), drop.size());
+            return true;
+#else
+            (void)drop;
+            why = "this platform cannot start the game again from inside";
+            return false;
+#endif
+        }
 
         // ---- what the controls page shows (ps2_pad.cpp has the real map) ----------------------------------------
 
@@ -340,6 +564,37 @@ namespace ps2x_host::ui
             // Task s4b: "Import a Save...".
             bool canImportSave() override { return ps2x_host_mods::canImportSave(); }
             std::string importSave() override { return startImportDialog(); }
+            // Task h1: Load Now and Restart Now.
+            ps2x::ui::LoadOffer loadOffer() override
+            {
+                const ps2x_host_mods::LoadOffer offer = ps2x_host_mods::loadOffer();
+                ps2x::ui::LoadOffer out;
+                out.shown = offer.shown;
+                out.enabled = offer.enabled;
+                out.unsaved = offer.unsaved;
+                out.note = offer.note;
+                out.help = offer.help;
+                out.question = offer.question;
+                return out;
+            }
+            std::string loadNow() override
+            {
+                bool accepted = false;
+                const std::string said = ps2x_host_mods::requestLoad(&accepted);
+                if (accepted)
+                {
+                    // The menu closes so the game runs; it takes the request at its next safe point.
+                    g.closeHow = "Load Now";
+                    g.closeRequested = true;
+                }
+                return said;
+            }
+            bool canRestart() override { return kRestartSupported; }
+            std::string restartBlockedReason() override { return quitBlockedReason(); }
+            void restartNow() override
+            {
+                g.restartAsked = true;
+            }
             std::string dumpTextures() override { return ps2x_gs::requestTextureDump(); }
             void openDumpsFolder() override { ps2x_gs::openFolder(ps2x_gs::dumpsFolder()); }
             std::string lastDumpResult() override
@@ -373,6 +628,7 @@ namespace ps2x_host::ui
             const CardWriteStatus card = cardWriteStatus();
             g.quitBlock = cardQuitBlockReason(card);
             g.quitChecked = true;
+            ps2x_host_mods::hotLoadGuestStopped(); // Load Now: is the game at a safe point? Decided here, once per opening
             std::printf("[ui] Quit Game %s (card files open for writing: %u, ms since the last card write: %lld)\n",
                         g.quitBlock.empty() ? "is available" : "is dimmed", card.writeHandlesOpen,
                         card.anyWriteYet ? static_cast<long long>(card.msSinceLastWrite) : -1ll);
@@ -391,6 +647,7 @@ namespace ps2x_host::ui
             g.quitChecked = false;
             g.quitBlock.clear();
             g.quitAsked = false;
+            g.restartAsked = false;
             g.blockEntriesAtOpen = guestBlockEntries();
             menu().open();
             if (!menu().visible())
@@ -416,6 +673,7 @@ namespace ps2x_host::ui
                 return;
             menu().close();
             g.visible.store(false);
+            ps2x_host_mods::hotLoadGuestResumed();
             ps2x_settings::save(); // Back saves
             // The input comes back first, then the game: the first frame it runs reads the real state.
             setInputCapturedByOverlay(false);
@@ -586,6 +844,25 @@ namespace ps2x_host::ui
                     std::lock_guard<std::mutex> lock(imports.mutex);
                     imports.picked = line.substr(7);
                 }
+                else if (line == "load" || line == "restart")
+                {
+                    // Task h1: the answer Yes to "Load now?" / "Restart the game?" without driving the buttons and the question (the overlay is
+                    // open, as when the player answers). The real button flow is checked separately.
+#if defined(PS2X_HAS_UI)
+                    std::printf("[ui] PS2X_TEST_DROP: %s confirmed\n", line.c_str());
+                    std::fflush(stdout);
+                    if (line == "load")
+                    {
+                        const std::string said = gameHost().loadNow();
+                        std::printf("[ui] PS2X_TEST_DROP: %s\n", said.c_str());
+                        std::fflush(stdout);
+                    }
+                    else
+                    {
+                        gameHost().restartNow();
+                    }
+#endif
+                }
                 else if (line.compare(0, 7, "choose ") == 0)
                 {
                     // The answer to "Which save?": the folder name of the save chosen.
@@ -692,6 +969,18 @@ namespace ps2x_host::ui
             g.testPad.joystick = nullptr;
         }
         g.created = false;
+        if (g.relaunchAtExit)
+        {
+            // Restart Now: the settings are saved and the game thread has finished; the new process starts last.
+            g.relaunchAtExit = false;
+            std::string why;
+            if (!spawnSelf(why))
+            {
+                std::fprintf(stderr, "[ui] Restart Now could not start the game again: %s\n", why.c_str());
+                std::fflush(stderr);
+            }
+            std::fflush(stdout);
+        }
     }
 
     bool active()
@@ -760,7 +1049,20 @@ namespace ps2x_host::ui
         if (g.closeRequested)
         {
             g.closeRequested = false;
-            closeOverlay("Back");
+            const char *how = g.closeHow;
+            g.closeHow = "Back";
+            closeOverlay(how);
+        }
+        // Load Now (task h1): a request the game never took expires; a refusal or failure comes back as a message on the Mods tab.
+        ps2x_host_mods::hotLoadTick();
+        if (std::string loadMessage; ps2x_host_mods::takeLoadResult(loadMessage))
+        {
+            std::printf("[ui] Load Now result shown on the Mods tab: %s\n", loadMessage.c_str());
+            std::fflush(stdout);
+            ps2x_host_mods::DropOutcome outcome;
+            outcome.handled = true;
+            outcome.message = loadMessage;
+            showModsOutcome(std::string(), outcome, "Load Now result");
         }
         pumpPickedImport(); // a save picked in the file window (Mods tab > Import a Save...)
         // Test hook (tests only): open the menu the moment the game has a file open for writing on the card. With
@@ -781,6 +1083,18 @@ namespace ps2x_host::ui
                     // Save changed settings first; the shutdown path saves them again if anything is still unsaved.
                     ps2x_settings::save();
                     std::printf("[ui] Quit Game confirmed: stopping the game\n");
+                    std::fflush(stdout);
+                    requestQuit();
+                }
+            }
+            if (g.restartAsked)
+            {
+                g.restartAsked = false;
+                if (g.quitChecked && g.quitBlock.empty())
+                {
+                    ps2x_settings::save();
+                    g.relaunchAtExit = true;
+                    std::printf("[ui] Restart Now confirmed: stopping the game, then starting it again\n");
                     std::fflush(stdout);
                     requestQuit();
                 }

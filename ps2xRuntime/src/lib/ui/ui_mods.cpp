@@ -138,6 +138,8 @@ namespace ps2x::ui
         document->AddEventListener("keydown", this, true);
         listenToFocus(byId("mod-confirm"));
         listenToFocus(byId("mods-tools")); // the Keep Card, Dump Textures and Dumps Folder buttons show their help line too
+        listenToFocus(byId("mods-apply")); // and Load Now
+        listenToFocus(byId("notice"));     // and Restart Now
         if (Rml::Element *folder = byId("mods-folder"))
         {
             const auto folderText = m_manager->modsDir().u8string();
@@ -504,6 +506,7 @@ namespace ps2x::ui
 
     void ModsPage::changed()
     {
+        updateApplyRow(m_restartNeeded); // a toggle, a move or an uninstall can add or remove the data-pack changes Load Now applies
         if (m_onChange)
             m_onChange();
     }
@@ -683,6 +686,66 @@ namespace ps2x::ui
             button->SetProperty("display", m_tools.canBackToOwnCard && m_tools.backToOwnCard && m_tools.canBackToOwnCard() ? "block" : "none");
         if (Rml::Element *button = byId("import-save"))
             button->SetProperty("display", m_tools.canImportSave && m_tools.importSave && m_tools.canImportSave() ? "block" : "none");
+        updateApplyRow(m_restartNeeded);
+    }
+
+    // Load Now and Restart Now (task h1). Load Now shows while data-pack changes wait, and is dimmed (with the reason in the help line) when the
+    // game is not at the title screen or the main menu; the line beside it says what is going on. Restart Now shows with the restart note.
+    void ModsPage::updateApplyRow(bool restartNeeded)
+    {
+        m_restartNeeded = restartNeeded;
+        const LoadOffer offer = m_tools.loadOffer ? m_tools.loadOffer() : LoadOffer();
+        m_loadNowShown = offer.shown;
+        Rml::Element *row = byId("mods-apply");
+        Rml::Element *button = byId("load-now");
+        if (row)
+            row->SetProperty("display", offer.shown || !offer.note.empty() ? "flex" : "none");
+        if (Rml::Element *note = byId("mods-load-note"))
+            note->SetInnerRML(text(offer.note));
+        if (button)
+        {
+            button->SetProperty("display", offer.shown ? "block" : "none");
+            button->SetClass("locked", !offer.enabled);
+            button->SetAttribute("data-help", attr(offer.help));
+            button->SetAttribute("data-locked", offer.enabled ? "" : "1");
+        }
+        if (Rml::Element *restart = byId("restart-now"))
+        {
+            const bool shown = restartNeeded && m_tools.canRestart && m_tools.restartNow && m_tools.canRestart();
+            restart->SetProperty("display", shown ? "block" : "none");
+            const std::string blocked = shown && m_tools.restartBlockedReason ? m_tools.restartBlockedReason() : std::string();
+            restart->SetClass("locked", !blocked.empty());
+            restart->SetAttribute("data-locked", blocked.empty() ? "" : "1");
+            restart->SetAttribute("data-help", attr(blocked.empty() ? std::string("Close the game and start it again to apply the changes (asks first).") : blocked));
+        }
+    }
+
+    void ModsPage::openLoadConfirm()
+    {
+        const LoadOffer offer = m_tools.loadOffer ? m_tools.loadOffer() : LoadOffer();
+        if (!offer.shown)
+            return;
+        if (!offer.enabled)
+        {
+            setStatus(offer.help);
+            showHelp(offer.help);
+            return;
+        }
+        openCardConfirm(Ask::LoadNow, "Load now?", text(offer.question).c_str(), "Load Now",
+                        "Load the memory card again now, with the data packs as they are.");
+    }
+
+    void ModsPage::openRestartConfirm()
+    {
+        const std::string blocked = m_tools.restartBlockedReason ? m_tools.restartBlockedReason() : std::string();
+        if (!blocked.empty())
+        {
+            setStatus(blocked);
+            showHelp(blocked);
+            return;
+        }
+        openCardConfirm(Ask::Restart, "Restart the game?", "The game closes and starts again, so the changes apply. Anything not saved to the memory card is lost.",
+                        "Restart", "Close the game and start it again.");
     }
 
     // "Which save?": the layer of the other questions with one button per save. The buttons are #mod-confirm-yes, #mod-confirm-alt1 and
@@ -750,9 +813,10 @@ namespace ps2x::ui
         }
         else if (refocus)
         {
-            if (was == Ask::KeepCard || was == Ask::BackToOwnCard)
+            if (was == Ask::KeepCard || was == Ask::BackToOwnCard || was == Ask::LoadNow || was == Ask::Restart)
             {
-                if (Rml::Element *button = byId(was == Ask::KeepCard ? "keep-card" : "back-card"))
+                const char *id = was == Ask::KeepCard ? "keep-card" : (was == Ask::BackToOwnCard ? "back-card" : (was == Ask::LoadNow ? "load-now" : "restart-now"));
+                if (Rml::Element *button = byId(id))
                     button->Focus(true);
             }
             else
@@ -837,6 +901,16 @@ namespace ps2x::ui
                     openKeepConfirm();
                     return;
                 }
+                if (e->GetId() == "load-now" && !m_confirming)
+                {
+                    openLoadConfirm();
+                    return;
+                }
+                if (e->GetId() == "restart-now" && !m_confirming)
+                {
+                    openRestartConfirm();
+                    return;
+                }
                 if ((e->GetId() == "mod-confirm-alt1" || e->GetId() == "mod-confirm-alt2") && m_confirming && m_ask == Ask::PickSave)
                 {
                     leavePick(e->GetId() == "mod-confirm-alt1" ? 1 : 2);
@@ -873,6 +947,23 @@ namespace ps2x::ui
                         m_document->UpdateDocument();
                         // The button is gone once the choice is made: the focus goes back to the list.
                         focusSelectedRow();
+                        return;
+                    }
+                    if (m_ask == Ask::LoadNow)
+                    {
+                        // The host takes the request and closes the menu so that the game runs; this page only says what happened.
+                        leaveConfirm(false);
+                        setStatus(m_tools.loadNow ? m_tools.loadNow() : std::string());
+                        updateCardRow();
+                        if (Rml::Element *button = byId("load-now"))
+                            button->Focus(true);
+                        return;
+                    }
+                    if (m_ask == Ask::Restart)
+                    {
+                        leaveConfirm(false);
+                        if (m_tools.restartNow)
+                            m_tools.restartNow();
                         return;
                     }
                     const std::string key = m_confirmKey;
@@ -1007,6 +1098,27 @@ namespace ps2x::ui
                             event.StopPropagation();
                             return;
                         }
+                        // Down from the mod's own buttons goes to Load Now when it is on the tab (the nearest element by position would be
+                        // Import a Save... or Load Now depending on the window's shape); from there Down is the focus navigation's again.
+                        if (onButton && m_loadNowShown && e->GetParentNode() && e->GetParentNode()->GetId() == "mod-actions")
+                        {
+                            if (Rml::Element *load = byId("load-now"))
+                            {
+                                load->Focus(true);
+                                event.StopPropagation();
+                                return;
+                            }
+                        }
+                        // Down from Load Now: the first of the small buttons at the foot (by position the nearest element below it would be Quit Game).
+                        if (onButton && e->GetId() == "load-now" && m_tools.canImportSave && m_tools.canImportSave())
+                        {
+                            if (Rml::Element *first = byId("import-save"))
+                            {
+                                first->Focus(true);
+                                event.StopPropagation();
+                                return;
+                            }
+                        }
                         break; // Down from a button: the focus navigation decides
                     }
                 }
@@ -1031,6 +1143,21 @@ namespace ps2x::ui
                         else
                             focusSelectedRow();
                         event.StopPropagation();
+                        return;
+                    }
+                    if (key == Rml::Input::KI_DOWN && e->IsClassSet("mod") && m_loadNowShown)
+                    {
+                        // Down from the last mod of the list: Load Now, which sits under the list.
+                        Rml::Element *list = byId("mods-list");
+                        Rml::ElementList rows;
+                        if (list)
+                            list->QuerySelectorAll(rows, ".mod");
+                        if (!rows.empty() && rows.back() == e)
+                            if (Rml::Element *load = byId("load-now"))
+                            {
+                                load->Focus(true);
+                                event.StopPropagation();
+                            }
                         return;
                     }
                     if (key == Rml::Input::KI_UP && e->IsClassSet("mod"))

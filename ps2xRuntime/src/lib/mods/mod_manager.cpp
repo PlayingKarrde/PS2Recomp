@@ -112,13 +112,17 @@ namespace ps2x::mods
         {
             std::string id;
             std::string version;
+            Kind kind = Kind::Assets;
             fs::path path;
             std::map<std::string, PackageEntry> entries; // the content files, as readPackage found them (for readPackageEntryAt)
         };
         std::vector<Mod> mods; // active mods in load order
         std::map<std::string, std::vector<size_t>> providers; // content path -> indices into `mods`, ascending
         std::vector<std::string> stylesheets;
-        std::string signature;
+        // The active mods as "id@version;" in load order, for the data packs and for every other kind apart (task h1): a hot load moves
+        // the first, a restart both.
+        std::string dataSignature;
+        std::string otherSignature;
     };
 
     Manager::Manager() : m_state(std::make_unique<State>()), m_session(std::make_unique<Session>()) {}
@@ -854,11 +858,11 @@ namespace ps2x::mods
 
     // ---- the session ----------------------------------------------------------------------------------------------
 
-    std::string Manager::signatureLocked() const
+    std::string Manager::signatureLocked(bool data) const
     {
         std::string signature;
         for (const auto &slot : m_slots)
-            if (slot->active)
+            if (slot->active && (slot->manifest.kind == Kind::Data) == data)
                 signature += slot->info.id + "@" + slot->info.version + ";";
         return signature;
     }
@@ -873,6 +877,7 @@ namespace ps2x::mods
             Session::Mod mod;
             mod.id = slot->info.id;
             mod.version = slot->info.version;
+            mod.kind = slot->manifest.kind;
             mod.path = slot->info.path;
             const size_t index = session->mods.size();
             session->mods.push_back(std::move(mod));
@@ -886,7 +891,8 @@ namespace ps2x::mods
                 for (const std::string &sheet : slot->manifest.stylesheets)
                     session->stylesheets.push_back(virtualName(slot->info.id, sheet));
         }
-        session->signature = signatureLocked();
+        session->dataSignature = signatureLocked(true);
+        session->otherSignature = signatureLocked(false);
         m_session = std::move(session);
     }
 
@@ -899,7 +905,77 @@ namespace ps2x::mods
     bool Manager::restartNeeded() const
     {
         std::lock_guard<std::mutex> lock(m_mutex);
-        return signatureLocked() != m_session->signature;
+        return signatureLocked(true) != m_session->dataSignature || signatureLocked(false) != m_session->otherSignature;
+    }
+
+    bool Manager::dataChangesPending() const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return signatureLocked(true) != m_session->dataSignature;
+    }
+
+    bool Manager::otherChangesPending() const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return signatureLocked(false) != m_session->otherSignature;
+    }
+
+    Manager::DataLoad Manager::liveDataPacks() const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        DataLoad load;
+        for (const auto &slot : m_slots)
+            if (slot->active && slot->manifest.kind == Kind::Data)
+                load.ids.push_back(slot->info.id);
+        load.signature = signatureLocked(true);
+        return load;
+    }
+
+    void Manager::commitDataSession(const DataLoad &loaded)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        auto session = std::make_unique<Session>();
+        auto add = [&](Session::Mod mod) {
+            const size_t index = session->mods.size();
+            for (const auto &entry : mod.entries)
+                session->providers[entry.first].push_back(index);
+            session->mods.push_back(std::move(mod));
+        };
+        // Load order, as a full commit would have it: the slots in order, the data packs the game has now loaded and, in their old
+        // places, the other mods the session already had. A session mod whose slot is gone (uninstalled after it was turned off)
+        // keeps serving its files until the restart, at the end.
+        std::vector<bool> kept(m_session->mods.size(), false);
+        for (const auto &slot : m_slots)
+        {
+            if (slot->manifest.kind == Kind::Data)
+            {
+                if (std::find(loaded.ids.begin(), loaded.ids.end(), slot->info.id) == loaded.ids.end())
+                    continue;
+                Session::Mod mod;
+                mod.id = slot->info.id;
+                mod.version = slot->info.version;
+                mod.kind = Kind::Data;
+                mod.path = slot->info.path;
+                for (const PackageEntry &entry : slot->entries)
+                    if (!entry.isDirectory && isContentPath(entry.name))
+                        mod.entries.emplace(entry.name, entry);
+                add(std::move(mod));
+                continue;
+            }
+            for (size_t i = 0; i < m_session->mods.size(); ++i)
+                if (!kept[i] && m_session->mods[i].kind != Kind::Data && m_session->mods[i].id == slot->info.id)
+                {
+                    kept[i] = true;
+                    add(m_session->mods[i]);
+                }
+        }
+        for (size_t i = 0; i < m_session->mods.size(); ++i)
+            if (!kept[i] && m_session->mods[i].kind != Kind::Data)
+                add(m_session->mods[i]);
+        session->stylesheets = m_session->stylesheets;
+        session->otherSignature = m_session->otherSignature;
+        session->dataSignature = loaded.signature;
+        m_session = std::move(session);
     }
 
     std::vector<std::string> Manager::sessionActive() const
@@ -1006,6 +1082,13 @@ namespace ps2x::mods
         std::lock_guard<std::mutex> lock(m_mutex);
         const auto found = m_runtimeNotes.find(modId);
         return found == m_runtimeNotes.end() ? std::vector<std::string>() : found->second;
+    }
+
+    void Manager::clearNotes(const std::string &modId)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_runtimeNotes.erase(modId);
+        m_infoNotes.erase(modId);
     }
 
     void Manager::addInfoNote(const std::string &modId, const std::string &note)

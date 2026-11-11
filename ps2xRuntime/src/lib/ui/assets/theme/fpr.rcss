@@ -287,6 +287,10 @@ body
 
 #notice
 {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
     flex: none;
     height: 24dp;
     margin-top: 6dp;
@@ -384,6 +388,17 @@ body
     color: #ffffff;
     decorator: linear-gradient(180deg, #3673b0, #2c68a3);
     border-color: #e7bc3d;
+}
+
+/* The small button beside the restart note (Restart Now). Hidden by the code when the note is. */
+.button.compact
+{
+    display: none;
+    height: 24dp;
+    min-width: 0;
+    padding: 0 14dp;
+    line-height: 22dp;
+    font-size: 14dp;
 }
 
 /* A button that cannot be used now (Quit Game while the game is writing to the memory card). It stays focusable, so the
@@ -867,6 +882,35 @@ body
     overflow: hidden;
     font-size: 13dp;
     color: #c4c0ae;
+}
+
+/* Load Now and the line beside it: shown by the code only while there is something to say or do. */
+#mods-apply
+{
+    display: none;
+    flex-direction: row;
+    align-items: center;
+    margin-top: 4dp;
+}
+
+/* The button first, at the left edge under the list: the controller reaches it with Down from the list or the mod's buttons. */
+#mods-apply .mbtn.small
+{
+    flex: none;
+    margin-left: 0;
+}
+
+#mods-load-note
+{
+    flex: 1 1 0;
+    min-width: 0;
+    margin-left: 12dp;
+    height: 20dp;
+    line-height: 20dp;
+    overflow: hidden;
+    white-space: nowrap;
+    font-size: 14dp;
+    color: #e7bc3d;
 }
 
 #mods-lower

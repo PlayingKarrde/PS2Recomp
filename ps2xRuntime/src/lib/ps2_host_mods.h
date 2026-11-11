@@ -98,4 +98,41 @@ namespace ps2x_host_mods
     DropOutcome importSave(const std::string &utf8Path, const std::string &folder = std::string());
     // What a file dropped on the window gets: a .fprmod is installed (installDropped), anything else is tried as a save (importSave).
     DropOutcome handleDropped(const std::string &utf8Path);
+
+    // ---- Load Now: data-pack changes without a restart (task h1; mods/hot_load.h has the rules, docs/mod-layer.md "Hot load") ----
+    // The Mods tab's "Load Now": whether to show it, whether it can be used now, the words.
+    struct LoadOffer
+    {
+        bool shown = false;   // there are changes a load can apply (data packs, or "Back to my card"), and this game can do it
+        bool enabled = false; // the game stood at a safe point when it paused for the overlay
+        bool unsaved = false; // the game reported changes not yet saved
+        std::string note;     // the line beside the buttons ("" for none)
+        std::string help;     // the button's help line: what it does, or why it cannot be used now
+        std::string question; // the body of "Load now?"
+    };
+    // Main thread (the overlay). Asked on open and after every refresh.
+    LoadOffer loadOffer();
+    // The player confirmed "Load now?". Records the request; the game takes it at its next safe point. `*accepted` says whether it was
+    // recorded (the caller then closes the overlay so the game runs). One sentence for the status line.
+    std::string requestLoad(bool *accepted);
+    // The game has stopped for the overlay: decides whether it is at a safe point (the Load Now button follows). Main thread, once per
+    // opening. hotLoadGuestResumed() when the overlay closes.
+    void hotLoadGuestStopped();
+    void hotLoadGuestResumed();
+    // Main thread, every update: expires a request the game never took. A refusal or failure the player has not seen yet comes back
+    // once from takeLoadResult (the caller opens the Mods tab with it).
+    void hotLoadTick();
+    bool takeLoadResult(std::string &message);
+
+    // The game's side (called on the game thread by the game override, src/overrides/fpwr_overrides.cpp). `where` is 1 for the title
+    // screen's PRESS START and 2 for the main menu waiting for a choice.
+    void hotLoadInstalled();                              // the override found the places it needs; Load Now is offered only then
+    void hotLoadSafePoint(int where, bool unsaved);       // a pass through a safe point (stores only)
+    bool hotLoadRequested();                              // a confirmed request is waiting (one atomic load)
+    // At a safe point with a request waiting: rebuilds the profile card, checks it and the card, switches the card root. True: the
+    // game's own loader is to be started right now. False: nothing to do, or the request was refused (the reason is kept for the player).
+    bool hotLoadBegin(int where);
+    // The loader returned: compares the game's memory with the save it was given and, if it matches, moves the session forward.
+    // The pointers are the game's roster data and edit slots in its RAM (null if not found); unused edit slots with leftovers are zeroed.
+    void hotLoadEnd(uint8_t *roster, size_t rosterSize, uint8_t *slots, size_t slotsSize);
 }

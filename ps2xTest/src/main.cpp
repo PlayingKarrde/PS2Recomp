@@ -29,6 +29,8 @@ void register_mod_manager_tests();
 void register_data_pack_tests();
 void register_save_container_tests();
 void register_save_import_tests();
+void register_edit_text_tests();
+void register_edit_pack_tests();
 #endif
 void reset_ps2_test_function_table();
 
@@ -71,6 +73,8 @@ int main()
     register_data_pack_tests();
     register_save_container_tests();
     register_save_import_tests();
+    register_edit_text_tests();
+    register_edit_pack_tests();
 #endif
     int res = MiniTest::Run();
     std::cout.flush();

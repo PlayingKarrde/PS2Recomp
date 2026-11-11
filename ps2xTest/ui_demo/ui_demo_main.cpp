@@ -53,6 +53,13 @@
 //                 Task s4b: --card-buttons import shows the Import a Save... button (--expect import-save=shown, import-asked=1 once it
 //                 was pressed); the script step `pick:LABEL|LABEL|LABEL` shows the "Which save?" question with those buttons, and
 //                 --expect picked=N says which one was answered (-1 before an answer).
+//                 Task h1: --load-now none|waiting|pending|pending-unsaved|pending-wrongplace|note:TEXT sets what the stand-in host offers on
+//                 the Mods tab's Load Now button (waiting: the game has not paused yet; pending: enabled; pending-unsaved: enabled and the
+//                 game holds unsaved changes; pending-wrongplace: dimmed, "Go to the title screen or the main menu."; note:TEXT only the line),
+//                 --restart-blocked TEXT dims Restart Now, --no-restart removes the button (a platform that cannot start the game again).
+//                 --expect understands load-now and restart-now (shown or hidden), load-now-locked and restart-now-locked (1 or empty),
+//                 mods-apply (shown or hidden), mods-load-note (its text), load-asked and restart-asked (how many times the host was asked),
+//                 mod-confirm-title and mod-confirm-text (the Mods tab's question).
 //   --window      with --script or --png: open a window anyway, so the frames go through the swapchain. The PNG is
 //                 then taken from a second, offscreen draw of the same frame.
 //
@@ -115,7 +122,8 @@ namespace
         bool breakScissor = false; // --validation-selftest
         bool virtualPad = false;   // --virtual-pad
         bool menu = false;         // --menu
-        std::string menuSet, menuStartup, menuEnvLock, quitBlocked, cardLine, cardButtons, devLine;
+        std::string menuSet, menuStartup, menuEnvLock, quitBlocked, cardLine, cardButtons, devLine, loadNow, restartBlocked;
+        bool noRestart = false;
         std::string modsDir, modsState;
         std::string page = "pages/settings.rml";
         int frames = 0;
@@ -492,6 +500,28 @@ namespace
             importAsked = true;
             std::printf("import a save\n");
             return "Choose the save file in the window that opened.";
+        }
+        // Task h1: Load Now and Restart Now (--load-now, --restart-blocked, --no-restart).
+        LoadOffer loadOfferValue;
+        int loadAsked = 0, restartAsked = 0;
+        bool restartOk = true;
+        std::string restartBlockedText;
+        LoadOffer loadOffer() override { return loadOfferValue; }
+        std::string loadNow() override
+        {
+            ++loadAsked;
+            std::printf("load now\n");
+            loadOfferValue = LoadOffer();
+            loadOfferValue.note = "Waiting for the game to load the memory card...";
+            closeAsked = true; // the real host closes the menu so the game can run
+            return "Loading the memory card. The game shows its own \"Load Completed.\" when it is done.";
+        }
+        bool canRestart() override { return restartOk; }
+        std::string restartBlockedReason() override { return restartBlockedText; }
+        void restartNow() override
+        {
+            ++restartAsked;
+            std::printf("restart now\n");
         }
         std::vector<ControlLine> controls() override
         {
@@ -966,6 +996,33 @@ namespace
         }
         if (key == "back-asked")
             return d.fake.backDone ? "1" : "0";
+        if (key == "load-now" || key == "restart-now" || key == "mods-apply")
+        {
+            Rml::Element *element = document->GetElementById(key);
+            if (!element)
+                return std::string("(no element)");
+            const Rml::Property *display = element->GetProperty("display");
+            return display && display->ToString() == "none" ? "hidden" : "shown";
+        }
+        if (key == "load-now-locked" || key == "restart-now-locked")
+        {
+            Rml::Element *element = document->GetElementById(key == "load-now-locked" ? "load-now" : "restart-now");
+            return element ? element->GetAttribute<Rml::String>("data-locked", "") : std::string("(no element)");
+        }
+        if (key == "mods-load-note")
+        {
+            Rml::Element *element = document->GetElementById("mods-load-note");
+            return element ? element->GetInnerRML() : std::string("(no element)");
+        }
+        if (key == "mod-confirm-title" || key == "mod-confirm-text")
+        {
+            Rml::Element *element = document->GetElementById(key);
+            return element ? element->GetInnerRML() : std::string("(no element)");
+        }
+        if (key == "load-asked")
+            return std::to_string(d.fake.loadAsked);
+        if (key == "restart-asked")
+            return std::to_string(d.fake.restartAsked);
         if (key == "mods-status" || key == "mod-title" || key == "mod-problem" || key == "restart-note")
         {
             const char *id = key == "mods-status" ? "mods-status" : (key == "mod-title" ? "mod-title" : (key == "mod-problem" ? "mod-problem" : "restart-note"));
@@ -1063,6 +1120,12 @@ int main(int argc, char **argv)
             opt.cardButtons = next();
         else if (a == "--dev-line" && i + 1 < argc)
             opt.devLine = next();
+        else if (a == "--load-now" && i + 1 < argc)
+            opt.loadNow = next();
+        else if (a == "--restart-blocked" && i + 1 < argc)
+            opt.restartBlocked = next();
+        else if (a == "--no-restart")
+            opt.noRestart = true;
         else if (a == "--mods-dir" && i + 1 < argc)
             opt.modsDir = next();
         else if (a == "--mods-state" && i + 1 < argc)
@@ -1152,6 +1215,25 @@ int main(int argc, char **argv)
         d.fake.keepShown = opt.cardButtons.find("keep") != std::string::npos;
         d.fake.backShown = opt.cardButtons.find("back") != std::string::npos;
         d.fake.importShown = opt.cardButtons.find("import") != std::string::npos;
+        d.fake.restartOk = !opt.noRestart;
+        d.fake.restartBlockedText = opt.restartBlocked;
+        if (opt.loadNow == "waiting" || opt.loadNow.compare(0, 7, "pending") == 0)
+        {
+            LoadOffer &offer = d.fake.loadOfferValue;
+            offer.shown = true;
+            offer.note = "Data pack changes are waiting. Load Now applies them in the running game, or restart.";
+            offer.enabled = opt.loadNow == "pending" || opt.loadNow == "pending-unsaved";
+            offer.unsaved = opt.loadNow == "pending-unsaved";
+            offer.help = opt.loadNow == "waiting"           ? "Waiting for the game to pause."
+                         : opt.loadNow == "pending-wrongplace" ? "Go to the title screen or the main menu."
+                                                               : "Load the memory card again now, with the data packs as they are. Asks first.";
+            offer.question = offer.unsaved ? "The game has changes you have not saved yet, and they will be lost. The memory card is loaded again, as if you had restarted."
+                                           : "Anything you changed since you last saved in the game will be lost.";
+        }
+        else if (opt.loadNow.compare(0, 5, "note:") == 0)
+        {
+            d.fake.loadOfferValue.note = opt.loadNow.substr(5);
+        }
 #if defined(PS2X_DEMO_MODS)
         if (!opt.modsDir.empty())
         {
@@ -1293,7 +1375,9 @@ int main(int argc, char **argv)
                 if (opt.menu && (key.compare(0, 5, "rect:") == 0 || key == "scale" || key == "focus" || key == "confirm" || key == "quit-locked" || key == "help" || key == "tab" ||
                                  key == "mod-confirm" || key == "selected-mod" || key == "mods-status" || key == "mod-title" ||
                                  key == "mod-problem" || key == "restart-note" || key == "mods-card" || key == "back-card" || key == "keep-card" ||
-                                 key == "back-asked" || key == "import-save" || key == "import-asked" || key == "picked"))
+                                 key == "back-asked" || key == "import-save" || key == "import-asked" || key == "picked" || key == "load-now" ||
+                                 key == "restart-now" || key == "mods-apply" || key == "load-now-locked" || key == "restart-now-locked" ||
+                                 key == "mods-load-note" || key == "load-asked" || key == "restart-asked" || key == "mod-confirm-title" || key == "mod-confirm-text"))
                     got = menuState(d, key);
 #if defined(PS2X_DEMO_MODS)
                 if (opt.menu && d.fake.manager && (key == "mods-on" || key == "mods-active" || key == "mods-order" || key == "mods-restart" || key == "mods-count"))

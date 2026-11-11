@@ -418,21 +418,43 @@ constexpr uint32_t kAsyncCallbackStackTop = 0x00100000u;
         return absolute.lexically_normal();
     }
 
-    PS2Runtime::IoPaths &runtimeIoPaths()
-    {
-        static PS2Runtime::IoPaths paths = []()
-        {
-            PS2Runtime::IoPaths defaults;
-            std::error_code ec;
-            const std::filesystem::path cwd = std::filesystem::current_path(ec);
-            defaults.elfDirectory = ec ? std::filesystem::path(".") : cwd.lexically_normal();
-            defaults.hostRoot = defaults.elfDirectory;
-            defaults.cdRoot = defaults.elfDirectory;
-            defaults.mcRoot = defaults.elfDirectory / "mc0";
-            return defaults;
-        }();
+    // The folders the guest's file and memory-card calls resolve against. Published as immutable snapshots (task h1): getIoPaths() hands
+    // out a reference, and Load Now switches the memory card root while the game runs, so a thread that still holds the reference
+    // (the F1 debug panel reads it on the UI thread) must never see the object change or go away under it. setIoPaths() builds a new
+    // snapshot and swaps the pointer; the old ones are kept for the life of the process (a few hundred bytes each, and a new one is
+    // made only when the paths are set: at start-up, in tests, and when the player loads a data pack).
+    std::atomic<const PS2Runtime::IoPaths *> g_ioPathsCurrent{nullptr};
+    std::mutex g_ioPathsMutex;
+    std::vector<std::unique_ptr<PS2Runtime::IoPaths>> g_ioPathsSnapshots;
 
-        return paths;
+    const PS2Runtime::IoPaths &runtimeIoPaths()
+    {
+        if (const PS2Runtime::IoPaths *current = g_ioPathsCurrent.load(std::memory_order_acquire))
+            return *current;
+        std::lock_guard<std::mutex> lock(g_ioPathsMutex);
+        if (const PS2Runtime::IoPaths *current = g_ioPathsCurrent.load(std::memory_order_acquire))
+            return *current;
+        auto defaults = std::make_unique<PS2Runtime::IoPaths>();
+        std::error_code ec;
+        const std::filesystem::path cwd = std::filesystem::current_path(ec);
+        defaults->elfDirectory = ec ? std::filesystem::path(".") : cwd.lexically_normal();
+        defaults->hostRoot = defaults->elfDirectory;
+        defaults->cdRoot = defaults->elfDirectory;
+        defaults->mcRoot = defaults->elfDirectory / "mc0";
+        const PS2Runtime::IoPaths *published = defaults.get();
+        g_ioPathsSnapshots.push_back(std::move(defaults));
+        g_ioPathsCurrent.store(published, std::memory_order_release);
+        return *published;
+    }
+
+    void publishIoPaths(const PS2Runtime::IoPaths &paths)
+    {
+        runtimeIoPaths(); // the defaults first, so a first call here does not race the lazy creation
+        std::lock_guard<std::mutex> lock(g_ioPathsMutex);
+        auto snapshot = std::make_unique<PS2Runtime::IoPaths>(paths);
+        const PS2Runtime::IoPaths *published = snapshot.get();
+        g_ioPathsSnapshots.push_back(std::move(snapshot));
+        g_ioPathsCurrent.store(published, std::memory_order_release);
     }
 
     std::string readGuestPrintableString(const uint8_t *rdram, uint32_t addr, size_t maxLen)
@@ -1289,7 +1311,7 @@ void PS2Runtime::setIoPaths(const IoPaths &paths)
         normalized.mcRoot = normalized.elfDirectory / "mc0";
     }
 
-    runtimeIoPaths() = normalized;
+    publishIoPaths(normalized);
 }
 
 void PS2Runtime::configureIoPathsFromElf(const std::string &elfPath)

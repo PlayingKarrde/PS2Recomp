@@ -42,6 +42,19 @@ namespace ps2x::ui
         std::string controller; // "A"
     };
 
+    // The Mods tab's Load Now button (task h1): data-pack changes applied to the running game without a restart. `shown`: there is something
+    // for it to apply; `enabled`: the game is at a place where it can; `note` is the line beside the buttons, `help` the button's help line
+    // (what it does, or why it cannot be used now), `question` the body of "Load now?" (stronger when the game holds unsaved changes).
+    struct LoadOffer
+    {
+        bool shown = false;
+        bool enabled = false;
+        bool unsaved = false;
+        std::string note;
+        std::string help;
+        std::string question;
+    };
+
     // What the menu asks of the game side.
     class MenuHost
     {
@@ -90,6 +103,16 @@ namespace ps2x::ui
         // status line.
         virtual bool canImportSave() { return false; }
         virtual std::string importSave() { return std::string(); }
+        // Task h1: Load Now. loadOffer() is asked on open and after every refresh(); loadNow() is called once the player answered Yes to
+        // "Load now?" and returns one sentence for the status line (the host closes the menu so the game can run when it took the request).
+        virtual LoadOffer loadOffer() { return LoadOffer(); }
+        virtual std::string loadNow() { return std::string(); }
+        // Task h1: Restart Now, offered whenever the menu's restart note is showing. restartBlockedReason() is "" when the game can be
+        // closed now (the rule of Quit Game: no memory card write under way), else one sentence; restartNow() is called after the player
+        // answered Yes to "Restart the game?" and quits and starts the game again with the same arguments and environment.
+        virtual bool canRestart() { return false; }
+        virtual std::string restartBlockedReason() { return std::string(); }
+        virtual void restartNow() {}
     };
 
     class GameMenu

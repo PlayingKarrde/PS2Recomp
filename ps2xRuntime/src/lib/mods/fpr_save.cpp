@@ -548,7 +548,7 @@ namespace ps2x::mods::fpr
         if (key.empty())
             return false;
         const char kind = key[0];
-        if (kind != 'w' && kind != 'o' && kind != 'g' && kind != 'a')
+        if (kind != 'w' && kind != 'o' && kind != 'g' && kind != 'a' && kind != 'e')
             return false;
         const size_t dot = key.find('.');
         int index = 0;
@@ -560,6 +560,13 @@ namespace ps2x::mods::fpr
             if (!part.empty() || index >= kWrestlers)
                 return false;
             out = FieldRange{kOffAppearance + static_cast<uint32_t>(index) * kAppearanceStride, kAppearanceStride, 0xFF};
+            return true;
+        }
+        if (kind == 'e')
+        {
+            if (!part.empty() || index >= kEditSlotCount)
+                return false;
+            out = FieldRange{editSlotOffset(index), kEditSlotSize, 0xFF};
             return true;
         }
         if (kind == 'w')
@@ -604,6 +611,7 @@ namespace ps2x::mods::fpr
         switch (key[0])
         {
         case 'a': return "wrestler " + number + "'s appearance";
+        case 'e': return "the created wrestler in edit slot " + number;
         case 'w':
         {
             const std::string who = "wrestler " + number + "'s ";

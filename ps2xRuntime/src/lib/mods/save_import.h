@@ -21,6 +21,7 @@
 // checksum table and a temporary folder.
 #pragma once
 
+#include "edit_text.h"
 #include "fpr_save.h"
 #include "save_container.h"
 
@@ -51,13 +52,23 @@ namespace ps2x::mods::import
     struct Counts
     {
         size_t wrestlers = 0, organisations = 0, groups = 0, appearance = 0;
+        size_t edits = 0;        // created wrestlers (edit slots) carried as edit files (task e2)
         bool orderLists = false; // organisation_order / group_order are in the file
-        size_t total() const { return wrestlers + organisations + groups + appearance; }
+        size_t renames() const { return wrestlers + organisations + groups + appearance; }
+        size_t total() const { return renames() + edits; }
+    };
+
+    // One edit file of a pack: data/edits/<file> (docs/formats/edit-text.md).
+    struct EditPack
+    {
+        std::string file;  // "000-karl-gotch.edit.toml"
+        std::string text;
     };
 
     struct Extracted
     {
         std::string json;                  // data/renames.json
+        std::vector<EditPack> edits;       // data/edits/*.edit.toml (extractEdits)
         Counts counts;
         std::vector<std::string> leftOut;  // changes a rename file cannot say (tools/fprsave.py prints these as "left out: ...")
         bool empty() const { return counts.total() == 0; }
@@ -67,6 +78,11 @@ namespace ps2x::mods::import
     // `withAppearance`): the very same bytes, with "source" naming `sourceFile` and `sourceBase`. Both images must be kSaveSize bytes.
     bool extractRenames(const Bytes &save, const Bytes &base, bool withAppearance, const std::string &sourceFile, const std::string &sourceBase,
                         Extracted &out, std::string *error);
+
+    // The created wrestlers `save` has that `base` does not (tools/fprsave.py extract_edits): every used edit slot of the save whose bytes no
+    // used slot of the base has (each base slot matches one save slot at most), as an edit file named editFileName(slot). A slot the text cannot
+    // say is left out with a line in out.leftOut. Appends to out.edits and sets out.counts.edits. `names` is optional (move names in the text).
+    bool extractEdits(const Bytes &save, const Bytes &base, const edit::MoveNames *names, Extracted &out, std::string *error);
 
     // Differences between `save` and what the pack in `renamesJson` makes of `base`, in the parts of the save that matter: the data a pack
     // cannot carry. The header, the saved screen state and options (bytes 0 to 0x111E0), the text after a name's terminator, deleted
@@ -78,6 +94,10 @@ namespace ps2x::mods::import
         bool any() const { return units != 0; }
     };
     bool unmatchedChanges(const Bytes &save, const Bytes &base, const std::string &renamesJson, Unmatched &out, std::string *error);
+    // The same when the pack also carries edit files: a created wrestler of the save counts as carried when the base or one of the edit files
+    // (read the way the profile reads it, group and all) has a slot with exactly its bytes.
+    bool unmatchedChanges(const Bytes &save, const Bytes &base, const std::string &renamesJson, const std::vector<EditPack> &edits, Unmatched &out,
+                          std::string *error);
 
     // ---- the package -------------------------------------------------------------------------------------------------------
     struct PackInfo

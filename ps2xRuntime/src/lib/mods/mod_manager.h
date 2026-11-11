@@ -152,10 +152,31 @@ namespace ps2x::mods
         // ---- the session ----
         // Makes the live set the session set (what a restart does). Tests call this to stand in for a restart.
         void commitSession();
-        // True when the live set of active mods (ids, versions, order) differs from the session set.
+        // True when the live set of active mods (ids, versions, order) differs from the session set: some change is waiting for the
+        // game to load it again, by a restart or, for data packs, by Load Now.
         bool restartNeeded() const;
         // The session's active mod ids in load order.
         std::vector<std::string> sessionActive() const;
+
+        // ---- the session by kind (task h1: Load Now) ----
+        // A data pack can be applied to the running game by loading the memory card again (a "hot load"); every other kind only by a
+        // restart. So the session is kept in two parts that move separately: the data packs, and everything else.
+        // True when the live set of active data packs (ids, versions, order) differs from what the running game has loaded.
+        bool dataChangesPending() const;
+        // True when the live set of active mods that are not data packs differs from the session: only a restart applies these.
+        bool otherChangesPending() const;
+        // The active data packs now, in load order, and their signature (what dataChangesPending compares). The host takes this
+        // before it builds the profile card and hands it back to commitDataSession, so a change the player makes while the game is
+        // loading is not mistaken for something that was loaded.
+        struct DataLoad
+        {
+            std::vector<std::string> ids;
+            std::string signature;
+        };
+        DataLoad liveDataPacks() const;
+        // The running game has loaded `loaded`: the session's data packs become exactly those. The session's other mods (texture packs,
+        // themes ...) are not touched, so restartNeeded() stays true for them.
+        void commitDataSession(const DataLoad &loaded);
 
         // ---- reading mod files ----
         // The file `path` (relative, forward slashes, exact capitals) from the last active mod of the session that has it.
@@ -182,6 +203,8 @@ namespace ps2x::mods
         static constexpr size_t kMaxInfoNotes = 40;
         void addInfoNote(const std::string &modId, const std::string &note);
         std::vector<std::string> infoNotes(const std::string &modId) const;
+        // Forgets both kinds of note for `modId` (a data pack whose profile was built again: the old lines may no longer be true).
+        void clearNotes(const std::string &modId);
         // True when the installed mod `modId` (on or off) has the file `path`.
         bool hasFile(const std::string &modId, const std::string &path) const;
         // One file of one installed mod, on or off (the details page's pictures, a theme's images). nullopt if missing.
@@ -208,7 +231,8 @@ namespace ps2x::mods
         StateFile buildStateLocked() const;
         bool saveStateLocked();
         void commitSessionLocked();
-        std::string signatureLocked() const;
+        // The active mods of one side as "id@version;" in load order: the data packs (data = true) or every other kind.
+        std::string signatureLocked(bool data) const;
         ModInfo infoLocked(const Slot &slot) const;
         Slot *slotLocked(const std::string &key);
         const Slot *slotLocked(const std::string &key) const;

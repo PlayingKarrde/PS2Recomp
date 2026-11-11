@@ -137,6 +137,13 @@ namespace ps2x::mods::import
             return out;
         }
 
+        bool slotUsed(const Bytes &image, int slot) { return readU16(image, kOffEditSlots + static_cast<size_t>(slot) * kEditStride) != 0; }
+        Bytes slotBytes(const Bytes &image, int slot)
+        {
+            const size_t o = kOffEditSlots + static_cast<size_t>(slot) * kEditStride;
+            return Bytes(image.begin() + static_cast<std::ptrdiff_t>(o), image.begin() + static_cast<std::ptrdiff_t>(o + kEditStride));
+        }
+
         // ---- JSON text, the way tools/fprsave.py dump_pack writes it ------------------------------------------------------------
 
         // A text field: plain text when it stores back to the same bytes, otherwise {"hex": "..."}.
@@ -384,7 +391,50 @@ namespace ps2x::mods::import
         return true;
     }
 
+    bool extractEdits(const Bytes &save, const Bytes &base, const edit::MoveNames *names, Extracted &out, std::string *error)
+    {
+        out.edits.clear();
+        out.counts.edits = 0;
+        if (save.size() != kSaveSize || base.size() != kSaveSize)
+        {
+            if (error)
+                *error = "a save must be " + withCommas(kSaveSize) + " bytes";
+            return false;
+        }
+        std::map<Bytes, int> have;
+        for (int s = 0; s < kEditSlots; ++s)
+            if (slotUsed(base, s))
+                ++have[slotBytes(base, s)];
+        for (int s = 0; s < kEditSlots; ++s)
+        {
+            if (!slotUsed(save, s))
+                continue;
+            const Bytes slot = slotBytes(save, s);
+            const auto it = have.find(slot);
+            if (it != have.end() && it->second > 0)
+            {
+                --it->second; // the base has this wrestler already
+                continue;
+            }
+            std::string text, why;
+            if (!edit::slotToText(slot, names, text, &why))
+            {
+                out.leftOut.push_back("the created wrestler in edit slot " + std::to_string(s) + " cannot be written as text (" + why + ")");
+                continue;
+            }
+            out.edits.push_back(EditPack{edit::editFileName(s, slot), std::move(text)});
+        }
+        out.counts.edits = out.edits.size();
+        return true;
+    }
+
     bool unmatchedChanges(const Bytes &save, const Bytes &base, const std::string &renamesJson, Unmatched &out, std::string *error)
+    {
+        return unmatchedChanges(save, base, renamesJson, std::vector<EditPack>(), out, error);
+    }
+
+    bool unmatchedChanges(const Bytes &save, const Bytes &base, const std::string &renamesJson, const std::vector<EditPack> &edits, Unmatched &out,
+                          std::string *error)
     {
         out = Unmatched();
         RenamePack pack;
@@ -454,12 +504,33 @@ namespace ps2x::mods::import
         if (looks)
             found.push_back({countPhrase(looks, "appearance record", "appearance records"), looks});
 
+        // The created wrestlers are matched as a set, not slot by slot: an edit takes the lowest free slot of the card it is applied to.
         size_t slots = 0;
-        for (int s = 0; s < kEditSlots; ++s)
         {
-            const size_t o = kOffEditSlots + static_cast<size_t>(s) * kEditStride;
-            if (std::memcmp(save.data() + o, made.data() + o, kEditStride) != 0)
-                ++slots;
+            std::map<Bytes, int> have;
+            for (int s = 0; s < kEditSlots; ++s)
+                if (slotUsed(made, s))
+                    ++have[slotBytes(made, s)];
+            for (const EditPack &e : edits)
+            {
+                Bytes slot;
+                if (!edit::textToSlot(e.text, nullptr, slot, nullptr, nullptr))
+                    continue; // the profile would refuse this file too: it carries nothing
+                const uint16_t group = edit::slotGroup(slot);
+                if (group != edit::kNoGroup && (group >= kGroups || !groupLive(made, group)))
+                    edit::setSlotGroup(slot, edit::kNoGroup);
+                ++have[slot];
+            }
+            for (int s = 0; s < kEditSlots; ++s)
+            {
+                if (!slotUsed(save, s))
+                    continue;
+                const auto it = have.find(slotBytes(save, s));
+                if (it != have.end() && it->second > 0)
+                    --it->second;
+                else
+                    ++slots;
+            }
         }
         if (slots)
             found.push_back({countPhrase(slots, "created wrestler (edit slot)", "created wrestlers (edit slots)"), slots});
@@ -467,7 +538,19 @@ namespace ps2x::mods::import
         const size_t editEnd = kOffEditSlots + static_cast<size_t>(kEditSlots) * kEditStride;
         const size_t namesEnd = kOffNames + static_cast<size_t>(kWrestlers) * kNameStride;
         const size_t appearanceEnd = kOffAppearance + static_cast<size_t>(kWrestlers) * kAppearanceStride;
-        if (rawDiffers(kOffSortOrder, kOffOrgs) || rawDiffers(namesEnd, kOffAppearance))
+        // The 827 wrestler ids at the start of the roster blob are the order the editor lists them in. Created wrestlers sit among the
+        // built-ins there, so only a different order of the built-in ids counts (a pack cannot carry it).
+        auto builtinOrder = [&](const Bytes &image) {
+            std::vector<uint16_t> ids;
+            for (size_t i = 0; i < 827; ++i)
+            {
+                const uint16_t id = readU16(image, kOffSortOrder + 2 * i);
+                if (id < 0x2000)
+                    ids.push_back(id);
+            }
+            return ids;
+        };
+        if (builtinOrder(save) != builtinOrder(made) || rawDiffers(namesEnd, kOffAppearance))
             found.push_back({"roster tables", 1});
         if (rawDiffers(kOffReferees, kOffWrestlerGroup))
             found.push_back({"referees", 1});
@@ -539,6 +622,7 @@ namespace ps2x::mods::import
         if (counts.organisations) parts.push_back(countPhrase(counts.organisations, "organisation", "organisations"));
         if (counts.groups) parts.push_back(countPhrase(counts.groups, "group", "groups"));
         if (counts.appearance) parts.push_back(countPhrase(counts.appearance, "appearance record", "appearance records"));
+        if (counts.edits) parts.push_back(countPhrase(counts.edits, "created wrestler", "created wrestlers"));
         std::string list;
         for (size_t i = 0; i < parts.size(); ++i)
             list += (i == 0 ? "" : (i + 1 == parts.size() ? " and " : ", ")) + parts[i];
@@ -745,13 +829,15 @@ namespace ps2x::mods::import
         Extracted pack;
         if (!extractRenames(chosen->save, base, true, fileName, kBaseName, pack, &why))
             return refuse(o, why);
+        if (!extractEdits(chosen->save, base, nullptr, pack, &why))
+            return refuse(o, why);
         o.counts = pack.counts;
         for (const std::string &note : pack.leftOut)
             o.log.push_back("import: left out: " + note);
         std::string tail;
         {
             Unmatched unmatched;
-            if (!unmatchedChanges(chosen->save, base, pack.json, unmatched, &why))
+            if (!unmatchedChanges(chosen->save, base, pack.json, pack.edits, unmatched, &why))
                 return refuse(o, "That save's changes cannot be applied to your card (" + why + ").");
             o.unmatched = unmatched;
             o.otherChanges = unmatched.any();
@@ -803,7 +889,12 @@ namespace ps2x::mods::import
             return refuse(o, "The mod id " + info.id + " is not valid (" + idWhy + ").");
 
         std::string packageError;
-        const auto package = buildPackage({{"mod.toml", manifestToml(info)}, {"data/renames.json", pack.json}}, &packageError);
+        std::vector<std::pair<std::string, std::string>> packageFiles = {{"mod.toml", manifestToml(info)}};
+        if (pack.counts.renames())
+            packageFiles.push_back({"data/renames.json", pack.json});
+        for (const EditPack &e : pack.edits)
+            packageFiles.push_back({"data/edits/" + e.file, e.text});
+        const auto package = buildPackage(packageFiles, &packageError);
         if (!package)
             return refuse(o, "The pack could not be built (" + packageError + ").");
         fs::path scratch = env.scratchDir.empty() ? fs::temp_directory_path() / "fpwr-import" : env.scratchDir;
@@ -831,6 +922,7 @@ namespace ps2x::mods::import
         addPart(pack.counts.organisations, "organisation", "organisations");
         addPart(pack.counts.groups, "group", "groups");
         addPart(pack.counts.appearance, "appearance record", "appearance records");
+        addPart(pack.counts.edits, "created wrestler", "created wrestlers");
         o.message = "Imported " + parts + regionNote + ". ";
         o.message += o.turnedOn ? "Restart the game to use it." : "It is installed but could not be turned on: " + enabled.message;
         o.message += tail;

@@ -1,16 +1,22 @@
 #include "MiniTest.h"
 
+#include "fpr_save.h"
+#include "hot_load.h"
 #include "mod_manager.h"
 #include "mod_manifest.h"
 #include "mod_package.h"
 #include "mod_state.h"
+#include "ps2_runtime.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -1192,6 +1198,836 @@ void register_mod_manager_tests()
             t.IsTrue(contains(env.manager.initError(), "cannot be created or read"), env.manager.initError());
             t.IsFalse(env.manager.ready(), "not ready");
             t.IsFalse(env.manager.install(env.root / "x.fprmod").ok, "install says the manager is not running");
+        });
+    });
+
+    // ---- Load Now (task h1): the session by kind, the guest check, the request's state machine, the plan ------------------------
+
+    MiniTest::Case("ModSessionByKind", [](TestCase &tc)
+    {
+        // A data pack and a texture pack: the first can be hot loaded, the second needs a restart.
+        auto twoMods = [](Env &env) {
+            writeMod(env.mods, "data-a.fprmod", tomlFor("data.a", "", "data"), {{"data/renames.json", "{}"}});
+            writeMod(env.mods, "data-b.fprmod", tomlFor("data.b", "", "data"), {{"data/renames.json", "{}"}});
+            writeMod(env.mods, "tex.fprmod", tomlFor("tex.one"), {{"assets/textures/x.png", fakePng()}});
+        };
+
+        tc.Run("a data pack turned on is a data change; a texture pack is a change only a restart applies", [](TestCase &t)
+        {
+            Env env("sess_flags");
+            writeMod(env.mods, "data-a.fprmod", tomlFor("data.a", "", "data"), {{"data/renames.json", "{}"}});
+            writeMod(env.mods, "tex.fprmod", tomlFor("tex.one"), {{"assets/textures/x.png", fakePng()}});
+            t.IsTrue(env.start(), "starts");
+            t.IsFalse(env.manager.dataChangesPending() || env.manager.otherChangesPending() || env.manager.restartNeeded(), "nothing pending");
+            t.IsTrue(env.manager.setEnabled("data.a", true).ok, "data pack on");
+            t.IsTrue(env.manager.dataChangesPending(), "a data change waits");
+            t.IsFalse(env.manager.otherChangesPending(), "no other change");
+            t.IsTrue(env.manager.restartNeeded(), "a restart would apply it too");
+            t.IsTrue(env.manager.setEnabled("tex.one", true).ok, "texture pack on");
+            t.IsTrue(env.manager.otherChangesPending(), "a change only a restart applies waits");
+        });
+
+        tc.Run("committing the data session clears the data change and leaves the restart-only one", [=](TestCase &t)
+        {
+            Env env("sess_commit");
+            twoMods(env);
+            t.IsTrue(env.start(), "starts");
+            env.manager.setEnabled("data.a", true);
+            env.manager.setEnabled("tex.one", true);
+            const Manager::DataLoad load = env.manager.liveDataPacks();
+            t.Equals(load.ids, (std::vector<std::string>{"data.a"}), "the live data packs");
+            t.IsFalse(load.signature.empty(), "with a signature");
+            env.manager.commitDataSession(load);
+            t.IsFalse(env.manager.dataChangesPending(), "the data change is applied");
+            t.IsTrue(env.manager.otherChangesPending(), "the texture pack still needs a restart");
+            t.IsTrue(env.manager.restartNeeded(), "so a restart is still needed");
+            const auto session = env.manager.sessionActive();
+            t.Equals(session, (std::vector<std::string>{"data.a"}), "the session has the data pack and not the texture pack");
+            t.IsTrue(env.manager.find("data.a")->inSession, "the data pack is in the session");
+            t.IsFalse(env.manager.find("tex.one")->inSession, "the texture pack is not");
+            env.manager.commitSession();
+            t.IsFalse(env.manager.restartNeeded(), "a full commit (a restart) clears both");
+        });
+
+        tc.Run("a data pack turned off is dropped from the session by the data commit; the session's texture pack keeps serving its files", [=](TestCase &t)
+        {
+            Env env("sess_keep");
+            twoMods(env);
+            t.IsTrue(env.start(), "starts");
+            env.manager.setEnabled("data.a", true);
+            env.manager.setEnabled("tex.one", true);
+            env.manager.commitSession(); // the game started with both
+            t.Equals(env.manager.sessionActive(), (std::vector<std::string>{"data.a", "tex.one"}), "the session in load order");
+            env.manager.setEnabled("data.a", false);
+            env.manager.setEnabled("tex.one", false);
+            t.IsTrue(env.manager.dataChangesPending() && env.manager.otherChangesPending(), "both moved");
+            env.manager.commitDataSession(env.manager.liveDataPacks());
+            t.IsFalse(env.manager.dataChangesPending(), "the data side matches");
+            t.IsTrue(env.manager.otherChangesPending(), "the texture pack is still running in the game");
+            t.Equals(env.manager.sessionActive(), (std::vector<std::string>{"tex.one"}), "only the texture pack is left in the session");
+            t.IsTrue(env.manager.open("assets/textures/x.png").has_value(), "its file is still served to the running game");
+            t.IsFalse(env.manager.find("data.a")->inSession, "the data pack is out");
+            // uninstalled while the game still runs with it
+            t.IsTrue(env.manager.uninstall("tex.one").ok, "uninstalls (it is off)");
+            env.manager.setEnabled("data.b", true);
+            env.manager.commitDataSession(env.manager.liveDataPacks());
+            t.Equals(env.manager.providers("assets/textures/x.png"), (std::vector<std::string>{"tex.one"}),
+                     "a data commit does not drop a session mod whose package was uninstalled (the file itself is gone with the package)");
+            t.Equals(env.manager.sessionActive(), (std::vector<std::string>{"data.b", "tex.one"}), "the data pack first (load order), the orphan after");
+        });
+
+        tc.Run("what was loaded is what the commit says: a change made while the game was loading stays pending", [=](TestCase &t)
+        {
+            Env env("sess_race");
+            twoMods(env);
+            t.IsTrue(env.start(), "starts");
+            env.manager.setEnabled("data.a", true);
+            const Manager::DataLoad taken = env.manager.liveDataPacks(); // the snapshot the load was built from
+            env.manager.setEnabled("data.b", true);                      // the player turns another on while the game loads
+            env.manager.commitDataSession(taken);
+            t.IsTrue(env.manager.dataChangesPending(), "the pack turned on meanwhile is still waiting");
+            t.Equals(env.manager.sessionActive(), (std::vector<std::string>{"data.a"}), "the session is exactly what was loaded");
+            env.manager.commitDataSession(env.manager.liveDataPacks());
+            t.IsFalse(env.manager.dataChangesPending(), "a second load catches up");
+        });
+
+        tc.Run("the order of data packs is part of the signature; moving one is a data change", [=](TestCase &t)
+        {
+            Env env("sess_order");
+            twoMods(env);
+            t.IsTrue(env.start(), "starts");
+            env.manager.setEnabled("data.a", true);
+            env.manager.setEnabled("data.b", true);
+            env.manager.commitSession();
+            t.IsFalse(env.manager.dataChangesPending(), "in step");
+            t.IsTrue(env.manager.move("data.b", -1).ok, "moves data.b earlier");
+            t.IsTrue(env.manager.dataChangesPending(), "a different order is a data change");
+            t.IsFalse(env.manager.otherChangesPending(), "and nothing else");
+        });
+
+        tc.Run("clearNotes forgets a pack's notes only", [](TestCase &t)
+        {
+            Env env("sess_notes");
+            writeMod(env.mods, "data-a.fprmod", tomlFor("data.a", "", "data"), {{"data/renames.json", "{}"}});
+            writeMod(env.mods, "tex.fprmod", tomlFor("tex.one"), {{"assets/textures/x.png", fakePng()}});
+            t.IsTrue(env.start(), "starts");
+            env.manager.addInfoNote("data.a", "Changes 3 fields on the profile card.");
+            env.manager.addRuntimeNote("data.a", "data/renames.json: broken");
+            env.manager.addRuntimeNote("tex.one", "a picture was refused");
+            env.manager.clearNotes("data.a");
+            t.IsTrue(env.manager.infoNotes("data.a").empty() && env.manager.runtimeNotes("data.a").empty(), "the pack's notes are gone");
+            t.Equals(env.manager.runtimeNotes("tex.one").size(), static_cast<size_t>(1), "another mod's note stays");
+        });
+    });
+
+    MiniTest::Case("HotLoadVerify", [](TestCase &tc)
+    {
+        namespace hl = ps2x::mods::hotload;
+        namespace fpr = ps2x::mods::fpr;
+        // A save image with a recognisable roster area and two used edit slots; the "game's memory" starts as a copy of those two areas.
+        auto makeSave = []() {
+            std::vector<uint8_t> save(fpr::kSaveSize, 0);
+            for (size_t i = 0; i < hl::kRosterSize; ++i)
+                save[hl::kRosterOffset + i] = static_cast<uint8_t>((i * 7 + 3) & 0xFF);
+            for (size_t k : {size_t(0), size_t(5)})
+            {
+                uint8_t *slot = save.data() + hl::kSlotsOffset + k * hl::kSlotSize;
+                slot[0] = 1;
+                for (size_t i = 2; i < hl::kSlotSize; ++i)
+                    slot[i] = static_cast<uint8_t>((i + k) & 0xFF);
+            }
+            return save;
+        };
+        struct Guest
+        {
+            std::vector<uint8_t> roster, slots;
+            hl::GuestView view()
+            {
+                hl::GuestView v;
+                v.roster = roster.data();
+                v.rosterSize = roster.size();
+                v.slots = slots.data();
+                v.slotsSize = slots.size();
+                return v;
+            }
+        };
+        auto guestOf = [](const std::vector<uint8_t> &save) {
+            Guest g;
+            g.roster.assign(save.begin() + hl::kRosterOffset, save.begin() + hl::kRosterOffset + hl::kRosterSize);
+            g.slots.assign(save.begin() + hl::kSlotsOffset, save.begin() + hl::kSlotsOffset + hl::kSlotCount * hl::kSlotSize);
+            return g;
+        };
+
+        tc.Run("memory that equals the save passes", [=](TestCase &t)
+        {
+            const auto save = makeSave();
+            Guest g = guestOf(save);
+            hl::GuestView v = g.view();
+            const hl::Verdict verdict = hl::verifyGuest(save, v);
+            t.IsTrue(verdict.ok, verdict.detail);
+            t.Equals(verdict.scrubbedSlots, static_cast<size_t>(0), "nothing to clean");
+        });
+
+        tc.Run("a different roster byte fails and is described", [=](TestCase &t)
+        {
+            const auto save = makeSave();
+            Guest g = guestOf(save);
+            g.roster[0x4A00] ^= 0x40;
+            hl::GuestView v = g.view();
+            const hl::Verdict verdict = hl::verifyGuest(save, v);
+            t.IsFalse(verdict.ok, "differs");
+            t.IsTrue(contains(verdict.detail, "roster data differs in 1 bytes"), verdict.detail);
+        });
+
+        tc.Run("a used edit slot must be identical, and a slot used on one side only fails", [=](TestCase &t)
+        {
+            const auto save = makeSave();
+            {
+                Guest g = guestOf(save);
+                g.slots[5 * hl::kSlotSize + 0x100] ^= 1;
+                hl::GuestView v = g.view();
+                const hl::Verdict verdict = hl::verifyGuest(save, v);
+                t.IsFalse(verdict.ok, "a changed byte in slot 5");
+                t.IsTrue(contains(verdict.detail, "1 edit slots differ (the first is slot 5)"), verdict.detail);
+            }
+            {
+                Guest g = guestOf(save);
+                g.slots[7 * hl::kSlotSize] = 1; // the game thinks slot 7 is used; the card says not
+                hl::GuestView v = g.view();
+                t.IsFalse(hl::verifyGuest(save, v).ok, "used in memory only");
+            }
+            {
+                Guest g = guestOf(save);
+                std::fill(g.slots.begin() + static_cast<std::ptrdiff_t>(5 * hl::kSlotSize), g.slots.begin() + static_cast<std::ptrdiff_t>(6 * hl::kSlotSize), 0);
+                hl::GuestView v = g.view();
+                t.IsFalse(hl::verifyGuest(save, v).ok, "used on the card only");
+            }
+        });
+
+        tc.Run("leftovers in an unused slot (the loader only clears its flag) are zeroed, as a restart has them", [=](TestCase &t)
+        {
+            const auto save = makeSave();
+            Guest g = guestOf(save);
+            // slots 9 and 11: an earlier wrestler's bytes with the flag cleared
+            for (size_t k : {size_t(9), size_t(11)})
+            {
+                g.slots[k * hl::kSlotSize + 0] = 0;
+                g.slots[k * hl::kSlotSize + 1] = 0;
+                for (size_t i = 2; i < hl::kSlotSize; ++i)
+                    g.slots[k * hl::kSlotSize + i] = 0xAB;
+            }
+            hl::GuestView v = g.view();
+            const hl::Verdict verdict = hl::verifyGuest(save, v);
+            t.IsTrue(verdict.ok, verdict.detail);
+            t.Equals(verdict.scrubbedSlots, static_cast<size_t>(2), "two slots cleaned");
+            t.IsTrue(std::all_of(g.slots.begin() + static_cast<std::ptrdiff_t>(9 * hl::kSlotSize), g.slots.begin() + static_cast<std::ptrdiff_t>(10 * hl::kSlotSize),
+                                 [](uint8_t b) { return b == 0; }), "slot 9 is all zero now");
+            t.IsTrue(std::equal(g.slots.begin(), g.slots.end(), save.begin() + static_cast<std::ptrdiff_t>(hl::kSlotsOffset)), "the whole area equals the card's");
+        });
+
+        tc.Run("missing or wrongly sized memory and a wrongly sized save fail without touching anything", [=](TestCase &t)
+        {
+            const auto save = makeSave();
+            Guest g = guestOf(save);
+            hl::GuestView none;
+            t.IsFalse(hl::verifyGuest(save, none).ok, "no pointers");
+            hl::GuestView v = g.view();
+            v.rosterSize -= 1;
+            t.IsFalse(hl::verifyGuest(save, v).ok, "short roster");
+            v = g.view();
+            std::vector<uint8_t> small(100, 0);
+            const hl::Verdict verdict = hl::verifyGuest(small, v);
+            t.IsFalse(verdict.ok, "a save of the wrong size");
+            t.IsTrue(contains(verdict.detail, "wrong size"), verdict.detail);
+        });
+    });
+
+    MiniTest::Case("HotLoadController", [](TestCase &tc)
+    {
+        namespace hl = ps2x::mods::hotload;
+        namespace fpr = ps2x::mods::fpr;
+        using Ctl = hl::Controller;
+        constexpr uint64_t ms = 1'000'000ull;
+
+        struct Fixture
+        {
+            Ctl ctl;
+            std::vector<std::string> calls;
+            std::vector<uint8_t> planSave;
+            bool busy = false, planOk = true;
+            std::string planWhy = "the profile could not be built";
+            Fixture()
+            {
+                planSave.assign(fpr::kSaveSize, 0);
+                for (size_t i = 0; i < hl::kRosterSize; ++i)
+                    planSave[hl::kRosterOffset + i] = static_cast<uint8_t>(i * 13);
+            }
+            Ctl::Hooks hooks()
+            {
+                Ctl::Hooks h;
+                h.cardBusy = [this]() { calls.push_back("busy?"); return busy ? std::string("the game is writing to the memory card.") : std::string(); };
+                h.plan = [this](hl::Plan &plan, std::string &why) {
+                    calls.push_back("plan");
+                    if (!planOk)
+                    {
+                        why = planWhy;
+                        return false;
+                    }
+                    plan.save = planSave;
+                    plan.useProfile = true;
+                    plan.line = "Memory card: profile card with 1 data pack on (your own card is not changed).";
+                    return true;
+                };
+                h.switchCard = [this](const hl::Plan &) { calls.push_back("switch"); };
+                h.commit = [this](const hl::Plan &) { calls.push_back("commit"); };
+                return h;
+            }
+            // guest memory equal to planSave
+            std::vector<uint8_t> roster, slots;
+            hl::GuestView guest(bool wrong = false)
+            {
+                roster.assign(planSave.begin() + hl::kRosterOffset, planSave.begin() + hl::kRosterOffset + hl::kRosterSize);
+                slots.assign(hl::kSlotCount * hl::kSlotSize, 0);
+                if (wrong)
+                    roster[10] ^= 0xFF;
+                hl::GuestView v;
+                v.roster = roster.data();
+                v.rosterSize = roster.size();
+                v.slots = slots.data();
+                v.slotsSize = slots.size();
+                return v;
+            }
+            // the screen was a safe point 10 ms before the overlay opened
+            void atSafePoint(uint64_t now = 1'000'000'000ull, bool unsaved = false)
+            {
+                ctl.noteSafePoint(hl::Where::Menu, unsaved, now - 10 * ms);
+                ctl.guestStopped(now);
+            }
+        };
+
+        tc.Run("nothing to load: no button, and a request is refused", [=](TestCase &t)
+        {
+            Fixture f;
+            f.atSafePoint();
+            const Ctl::Offer o = f.ctl.offer(false);
+            t.IsFalse(o.shown, "not shown");
+            t.IsTrue(o.note.empty(), "no line");
+            const auto r = f.ctl.request(false, 1000 * ms);
+            t.IsFalse(r.ok, "refused");
+            t.IsTrue(contains(r.message, "nothing to load"), r.message);
+            t.IsFalse(f.ctl.requested(), "no request is waiting");
+        });
+
+        tc.Run("the button follows the game: waiting, not at a safe point, stale, fresh, after the menu closed", [=](TestCase &t)
+        {
+            Fixture f;
+            Ctl::Offer o = f.ctl.offer(true);
+            t.IsTrue(o.shown && !o.enabled, "shown but dimmed before the game has stopped");
+            t.Equals(o.help, std::string("Waiting for the game to pause."), "and it says why");
+            f.ctl.guestStopped(1000 * ms); // stopped with no safe point ever stamped
+            o = f.ctl.offer(true);
+            t.IsTrue(o.shown && !o.enabled, "dimmed with no safe point");
+            t.Equals(o.help, std::string("Go to the title screen or the main menu."), "and it says where to go");
+            f.ctl.noteSafePoint(hl::Where::Title, false, 1000 * ms - hl::kFreshNs - 1);
+            f.ctl.guestStopped(1000 * ms);
+            t.IsFalse(f.ctl.offer(true).enabled, "a stamp older than the limit does not count");
+            f.ctl.noteSafePoint(hl::Where::Title, false, 1000 * ms - hl::kFreshNs);
+            f.ctl.guestStopped(1000 * ms);
+            o = f.ctl.offer(true);
+            t.IsTrue(o.shown && o.enabled, "a stamp exactly at the limit counts");
+            t.IsFalse(o.unsaved, "no unsaved changes");
+            t.IsTrue(contains(o.question, "since you last saved"), o.question);
+            f.ctl.guestResumed();
+            t.IsFalse(f.ctl.offer(true).enabled, "when the menu has closed the decision is void");
+        });
+
+        tc.Run("unsaved changes in the game make the question stronger", [=](TestCase &t)
+        {
+            Fixture f;
+            f.atSafePoint(1000 * ms, true);
+            const Ctl::Offer o = f.ctl.offer(true);
+            t.IsTrue(o.enabled && o.unsaved, "enabled, and the flag is carried");
+            t.IsTrue(contains(o.question, "have not saved yet"), o.question);
+        });
+
+        tc.Run("a request needs a pending change, a stopped game and a safe point; one request at a time", [=](TestCase &t)
+        {
+            Fixture f;
+            t.IsFalse(f.ctl.request(true, 1000 * ms).ok, "game not stopped yet");
+            f.ctl.guestStopped(1000 * ms);
+            auto r = f.ctl.request(true, 1000 * ms);
+            t.IsFalse(r.ok, "not at a safe point");
+            t.IsTrue(contains(r.message, "title screen or the main menu"), r.message);
+            f.atSafePoint();
+            r = f.ctl.request(true, 1000 * ms);
+            t.IsTrue(r.ok, r.message);
+            t.IsTrue(f.ctl.requested() && f.ctl.state() == Ctl::State::Requested, "the request is waiting");
+            const Ctl::Offer o = f.ctl.offer(true);
+            t.IsFalse(o.shown, "the button is hidden while it waits");
+            t.IsTrue(contains(o.note, "Waiting for the game"), o.note);
+            t.IsFalse(f.ctl.request(true, 1001 * ms).ok, "a second request is refused");
+        });
+
+        tc.Run("begin does nothing when no request is waiting", [=](TestCase &t)
+        {
+            Fixture f;
+            f.atSafePoint();
+            t.IsFalse(f.ctl.begin(hl::Where::Menu, 1000 * ms, f.hooks()), "no request");
+            t.IsTrue(f.calls.empty(), "no step ran");
+        });
+
+        tc.Run("the steps run in order, and the card is switched only when the loader will start", [=](TestCase &t)
+        {
+            Fixture f;
+            f.atSafePoint();
+            t.IsTrue(f.ctl.request(true, 1000 * ms).ok, "requested");
+            t.IsTrue(f.ctl.begin(hl::Where::Menu, 1020 * ms, f.hooks()), "go");
+            t.Equals(f.calls, (std::vector<std::string>{"busy?", "plan", "switch"}), "card checked, plan built and checked, then the switch");
+            t.IsTrue(f.ctl.state() == Ctl::State::Loading, "loading");
+            t.IsFalse(f.ctl.requested(), "the request is taken");
+            hl::GuestView g = f.guest();
+            f.ctl.end(g, f.hooks());
+            t.Equals(f.calls.back(), std::string("commit"), "committed after the check");
+            t.IsTrue(f.ctl.state() == Ctl::State::Loaded, "loaded");
+            t.Equals(f.ctl.message(), std::string("Loaded."), "the tab says Loaded");
+            std::string shown;
+            t.IsFalse(f.ctl.takeResult(shown), "a success is not announced by reopening the menu");
+            const Ctl::Offer o = f.ctl.offer(false);
+            t.Equals(o.note, std::string("Loaded."), "the line after the load");
+            t.IsTrue(f.ctl.whereLoaded() == hl::Where::Menu, "and where it ran");
+        });
+
+        tc.Run("a card file open for writing refuses before anything is built or switched", [=](TestCase &t)
+        {
+            Fixture f;
+            f.busy = true;
+            f.atSafePoint();
+            f.ctl.request(true, 1000 * ms);
+            t.IsFalse(f.ctl.begin(hl::Where::Title, 1010 * ms, f.hooks()), "refused");
+            t.Equals(f.calls, (std::vector<std::string>{"busy?"}), "only the card was looked at");
+            t.IsTrue(f.ctl.state() == Ctl::State::Refused, "refused");
+            std::string shown;
+            t.IsTrue(f.ctl.takeResult(shown) && contains(shown, "writing to the memory card"), "the player is told: " + shown);
+            t.IsFalse(f.ctl.takeResult(shown), "once");
+        });
+
+        tc.Run("a plan that does not pass is refused with its reason; the card is not switched", [=](TestCase &t)
+        {
+            Fixture f;
+            f.planOk = false;
+            f.planWhy = "The save on the profile card does not pass the game's own checks, so the game would not load it.";
+            f.atSafePoint();
+            f.ctl.request(true, 1000 * ms);
+            t.IsFalse(f.ctl.begin(hl::Where::Menu, 1010 * ms, f.hooks()), "refused");
+            t.Equals(f.calls, (std::vector<std::string>{"busy?", "plan"}), "no switch");
+            std::string shown;
+            t.IsTrue(f.ctl.takeResult(shown), "told");
+            t.IsTrue(contains(shown, "Load Now did not start") && contains(shown, "does not pass the game's own checks"), shown);
+            t.IsTrue(oneLine(shown), "one line");
+            // the button comes back for another try while the change is pending
+            const Ctl::Offer o = f.ctl.offer(true);
+            t.IsTrue(o.shown && contains(o.note, "did not start"), "the tab keeps the reason: " + o.note);
+        });
+
+        tc.Run("a memory that does not match the card fails and the session is not moved", [=](TestCase &t)
+        {
+            Fixture f;
+            f.atSafePoint();
+            f.ctl.request(true, 1000 * ms);
+            t.IsTrue(f.ctl.begin(hl::Where::Menu, 1010 * ms, f.hooks()), "go");
+            hl::GuestView g = f.guest(true);
+            f.ctl.end(g, f.hooks());
+            t.IsTrue(f.ctl.state() == Ctl::State::Failed, "failed");
+            t.IsTrue(std::find(f.calls.begin(), f.calls.end(), "commit") == f.calls.end(), "no commit");
+            std::string shown;
+            t.IsTrue(f.ctl.takeResult(shown) && contains(shown, "Restart the game"), shown);
+        });
+
+        tc.Run("a request that waits too long is refused, by the game thread or the host's timer", [=](TestCase &t)
+        {
+            {
+                Fixture f;
+                f.atSafePoint();
+                f.ctl.request(true, 1000 * ms);
+                t.IsFalse(f.ctl.expire(1000 * ms + hl::kRequestTimeoutNs), "not yet at the limit");
+                t.IsTrue(f.ctl.requested(), "still waiting");
+                t.IsTrue(f.ctl.expire(1000 * ms + hl::kRequestTimeoutNs + 1), "past it");
+                t.IsTrue(f.ctl.state() == Ctl::State::Refused && !f.ctl.requested(), "refused");
+                std::string shown;
+                t.IsTrue(f.ctl.takeResult(shown) && contains(shown, "not at the title screen or the main menu"), shown);
+            }
+            {
+                Fixture f;
+                f.atSafePoint();
+                f.ctl.request(true, 1000 * ms);
+                t.IsFalse(f.ctl.begin(hl::Where::Menu, 1000 * ms + hl::kRequestTimeoutNs + 5, f.hooks()), "a late safe point does not start it");
+                t.IsTrue(f.calls.empty(), "and nothing is built");
+                t.IsTrue(f.ctl.state() == Ctl::State::Refused, "refused");
+            }
+        });
+
+        tc.Run("after a refusal the player can ask again", [=](TestCase &t)
+        {
+            Fixture f;
+            f.busy = true;
+            f.atSafePoint();
+            f.ctl.request(true, 1000 * ms);
+            f.ctl.begin(hl::Where::Menu, 1010 * ms, f.hooks());
+            f.busy = false;
+            f.atSafePoint(2000 * ms);
+            t.IsTrue(f.ctl.request(true, 2000 * ms).ok, "asks again");
+            f.calls.clear();
+            t.IsTrue(f.ctl.begin(hl::Where::Menu, 2010 * ms, f.hooks()), "goes this time");
+        });
+
+        tc.Run("the safe-point stamp costs stores only", [=](TestCase &t)
+        {
+            Fixture f;
+            for (int i = 0; i < 100000; ++i)
+                f.ctl.noteSafePoint(hl::Where::Menu, false, static_cast<uint64_t>(i));
+            t.IsFalse(f.ctl.requested(), "nothing is requested");
+            t.IsTrue(f.calls.empty(), "no step ran");
+        });
+    });
+
+    MiniTest::Case("HotLoadPlan", [](TestCase &tc)
+    {
+        namespace hl = ps2x::mods::hotload;
+        namespace fpr = ps2x::mods::fpr;
+        namespace pf = ps2x::mods::profile;
+
+        // The same standard CRC table the other data pack tests use: the algorithm is the game's, the table is made up.
+        static const fpr::CrcTable table = []() {
+            fpr::CrcTable t{};
+            for (uint32_t i = 0; i < 256; ++i)
+            {
+                uint32_t c = i << 24;
+                for (int k = 0; k < 8; ++k)
+                    c = (c & 0x80000000u) ? (c << 1) ^ 0x04C11DB7u : (c << 1);
+                t[i] = c;
+            }
+            return t;
+        }();
+        auto putText = [](std::vector<uint8_t> &img, size_t at, const std::string &ascii, size_t width) {
+            std::vector<uint32_t> points(ascii.begin(), ascii.end());
+            std::vector<uint8_t> bytes;
+            fpr::encodeGameText(points, bytes);
+            bytes.resize(width, 0);
+            std::copy(bytes.begin(), bytes.end(), img.begin() + static_cast<std::ptrdiff_t>(at));
+        };
+        // A small valid save: every built-in wrestler has a first name "FirstN".
+        auto makeSave = [=](const std::string &tag) {
+            std::vector<uint8_t> img(fpr::kSaveSize, 0);
+            for (int i = 0; i < 4; ++i)
+            {
+                img[fpr::kSettingsMarkerOff + static_cast<size_t>(i)] = static_cast<uint8_t>(fpr::kSettingsMarker >> (8 * i));
+                img[fpr::kRosterMarkerOff + static_cast<size_t>(i)] = static_cast<uint8_t>(fpr::kRosterMarker >> (8 * i));
+            }
+            for (int k = 0; k < fpr::kWrestlers; ++k)
+            {
+                const size_t base = fpr::kOffNames + static_cast<size_t>(k) * fpr::kNameStride;
+                putText(img, base + 1, "First" + std::to_string(k), fpr::kWidthFirst);
+                putText(img, base + 15, "Last" + std::to_string(k), fpr::kWidthLast);
+                putText(img, base + 33, "Nick" + std::to_string(k), fpr::kWidthNickname);
+            }
+            img[0x1234] = static_cast<uint8_t>(tag.size()); // something the pack does not own, to tell cards apart
+            fpr::fixIntegrity(img, table);
+            return img;
+        };
+        auto write = [](const fs::path &path, const std::vector<uint8_t> &bytes) {
+            std::error_code ec;
+            fs::create_directories(path.parent_path(), ec);
+            std::ofstream out(path, std::ios::binary | std::ios::trunc);
+            out.write(reinterpret_cast<const char *>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+        };
+        auto readBack = [](const fs::path &path) {
+            std::ifstream in(path, std::ios::binary);
+            std::ostringstream out;
+            out << in.rdbuf();
+            const std::string s = out.str();
+            return std::vector<uint8_t>(s.begin(), s.end());
+        };
+        const std::string renameJson = "{\"format\": \"fpr-rename\", \"version\": 1, \"wrestlers\": {\"2\": {\"first\": \"Zed\"}}}";
+
+        struct World
+        {
+            fs::path root, base0, base1, profile;
+            Env env;
+            explicit World(const char *name) : env(name)
+            {
+                root = env.root;
+                base0 = root / "mc0";
+                base1 = root / "mc1";
+                profile = root / "profile";
+            }
+            fs::path baseSave() const { return base0 / fpr::kSaveName / fpr::kSaveName; }
+            fs::path profileSave() const { return profile / "mc0" / fpr::kSaveName / fpr::kSaveName; }
+        };
+        auto input = [=](World &w) {
+            hl::PlanInput in;
+            in.manager = &w.env.manager;
+            in.profileDir = w.profile;
+            in.baseCard0 = w.base0;
+            in.baseCard1 = w.base1;
+            Manager *m = &w.env.manager;
+            in.readPack = [m](const std::string &id) {
+                pf::PackInput p;
+                p.id = id;
+                if (auto info = m->find(id))
+                {
+                    p.name = info->name;
+                    p.version = info->version;
+                }
+                p.hasFile = m->hasFile(id, "data/renames.json");
+                if (p.hasFile)
+                    if (auto bytes = m->readFile(id, "data/renames.json"))
+                        p.renamesJson.assign(bytes->begin(), bytes->end());
+                return p;
+            };
+            in.loadCrcTable = [](fpr::CrcTable &out, std::string *) {
+                out = table;
+                return true;
+            };
+            return in;
+        };
+        auto firstNameOf = [](const std::vector<uint8_t> &save, int slot) {
+            const size_t at = fpr::kOffNames + static_cast<size_t>(slot) * fpr::kNameStride + 1;
+            bool isHex = false;
+            return fpr::fieldTextOrHex(save.data() + at, fpr::kWidthFirst, &isHex);
+        };
+
+        tc.Run("no data pack and no profile: the plan is the player's own card, untouched", [=](TestCase &t)
+        {
+            World w("plan_base");
+            t.IsTrue(w.env.start(), "starts");
+            write(w.baseSave(), makeSave("base"));
+            const auto before = readBack(w.baseSave());
+            const hl::PlanResult r = hl::makePlan(input(w));
+            t.IsTrue(r.ok, r.refusal);
+            t.IsFalse(r.plan.useProfile, "the own card");
+            t.IsTrue(r.plan.root0 == w.base0, "its root");
+            t.IsTrue(r.plan.save == before, "the save it will load");
+            t.IsFalse(fs::exists(w.profile), "no profile folder was made");
+            t.IsTrue(readBack(w.baseSave()) == before, "the card is unchanged");
+        });
+
+        tc.Run("a data pack that is on: the profile is built from the pack and is the plan", [=](TestCase &t)
+        {
+            World w("plan_pack");
+            writeMod(w.env.mods, "ren.fprmod", tomlFor("ren.one", "", "data"), {{"data/renames.json", renameJson}});
+            t.IsTrue(w.env.start(), "starts");
+            write(w.baseSave(), makeSave("base"));
+            t.IsTrue(w.env.manager.setEnabled("ren.one", true).ok, "on");
+            const hl::PlanResult r = hl::makePlan(input(w));
+            t.IsTrue(r.ok, r.refusal);
+            t.IsTrue(r.plan.useProfile && r.plan.root0 == w.profile / "mc0", "the profile card");
+            t.Equals(firstNameOf(r.plan.save, 2), std::string("Zed"), "the pack's name is in the save the game will load");
+            t.Equals(firstNameOf(r.plan.save, 3), std::string("First3"), "others are as they were");
+            t.IsTrue(r.plan.save == readBack(w.profileSave()), "and it is the profile's file");
+            t.IsTrue(fpr::checkIntegrity(r.plan.save, table).allOk(), "that passes the game's checks");
+            t.Equals(firstNameOf(readBack(w.baseSave()), 2), std::string("First2"), "the player's own card is not changed");
+            t.Equals(r.plan.data.ids, (std::vector<std::string>{"ren.one"}), "the plan says which packs it was built from");
+            t.Equals(r.plan.packs.size(), static_cast<size_t>(1), "a report per pack");
+            t.Equals(r.plan.packs[0].written, static_cast<size_t>(1), "one field written");
+        });
+
+        tc.Run("turning the pack off: the next plan reverts the field and stays on the profile", [=](TestCase &t)
+        {
+            World w("plan_off");
+            writeMod(w.env.mods, "ren.fprmod", tomlFor("ren.one", "", "data"), {{"data/renames.json", renameJson}});
+            t.IsTrue(w.env.start(), "starts");
+            write(w.baseSave(), makeSave("base"));
+            w.env.manager.setEnabled("ren.one", true);
+            t.IsTrue(hl::makePlan(input(w)).ok, "built with the pack");
+            w.env.manager.setEnabled("ren.one", false);
+            const hl::PlanResult r = hl::makePlan(input(w));
+            t.IsTrue(r.ok, r.refusal);
+            t.IsTrue(r.plan.useProfile, "the game stays on the profile card");
+            t.Equals(firstNameOf(r.plan.save, 2), std::string("First2"), "the name is back");
+            t.IsTrue(r.plan.data.ids.empty(), "no packs");
+        });
+
+        tc.Run("Back to my card: the plan is the own card; with no save there it is refused", [=](TestCase &t)
+        {
+            World w("plan_back");
+            writeMod(w.env.mods, "ren.fprmod", tomlFor("ren.one", "", "data"), {{"data/renames.json", renameJson}});
+            t.IsTrue(w.env.start(), "starts");
+            write(w.baseSave(), makeSave("base"));
+            w.env.manager.setEnabled("ren.one", true);
+            t.IsTrue(hl::makePlan(input(w)).ok, "profile built");
+            w.env.manager.setEnabled("ren.one", false);
+            std::string said;
+            t.IsTrue(pf::recordOwnCard(w.profile, &said), said);
+            const std::vector<uint8_t> profileBefore = readBack(w.profileSave());
+            hl::PlanResult r = hl::makePlan(input(w));
+            t.IsTrue(r.ok, r.refusal);
+            t.IsFalse(r.plan.useProfile, "the own card");
+            t.IsTrue(r.plan.root0 == w.base0, "its root");
+            t.IsTrue(readBack(w.profileSave()) == profileBefore, "the profile was not touched");
+            fs::remove(w.baseSave());
+            r = hl::makePlan(input(w));
+            t.IsFalse(r.ok, "no save on the own card");
+            t.IsTrue(contains(r.refusal, "Your own memory card has no save"), r.refusal);
+            write(w.baseSave(), std::vector<uint8_t>(1000, 7));
+            r = hl::makePlan(input(w));
+            t.IsFalse(r.ok, "a save of the wrong size");
+            std::vector<uint8_t> bad = makeSave("base");
+            bad[0x3000] ^= 1;
+            write(w.baseSave(), bad);
+            r = hl::makePlan(input(w));
+            t.IsFalse(r.ok, "a save that fails the game's checks");
+            t.IsTrue(contains(r.refusal, "does not pass the game's own checks"), r.refusal);
+        });
+
+        tc.Run("a pack on with no save anywhere: refused, nothing for the game to load", [=](TestCase &t)
+        {
+            World w("plan_nosave");
+            writeMod(w.env.mods, "ren.fprmod", tomlFor("ren.one", "", "data"), {{"data/renames.json", renameJson}});
+            t.IsTrue(w.env.start(), "starts");
+            w.env.manager.setEnabled("ren.one", true);
+            const hl::PlanResult r = hl::makePlan(input(w));
+            t.IsFalse(r.ok, "refused");
+            t.IsTrue(contains(r.refusal, "no save to load yet"), r.refusal);
+            t.IsTrue(oneLine(r.refusal), "one line");
+        });
+
+        tc.Run("a damaged profile save is refused before the game sees it, and left as it is", [=](TestCase &t)
+        {
+            World w("plan_corrupt");
+            writeMod(w.env.mods, "ren.fprmod", tomlFor("ren.one", "", "data"), {{"data/renames.json", renameJson}});
+            t.IsTrue(w.env.start(), "starts");
+            write(w.baseSave(), makeSave("base"));
+            w.env.manager.setEnabled("ren.one", true);
+            t.IsTrue(hl::makePlan(input(w)).ok, "built");
+            std::vector<uint8_t> damaged = readBack(w.profileSave());
+            damaged[0x5000] ^= 0x10; // a data byte: the block checksum fails
+            write(w.profileSave(), damaged);
+            const hl::PlanResult r = hl::makePlan(input(w));
+            t.IsFalse(r.ok, "refused");
+            t.IsTrue(contains(r.refusal, "does not pass the game's own checks"), r.refusal);
+            t.IsTrue(readBack(w.profileSave()) == damaged, "the damaged file was not rewritten");
+            write(w.profileSave(), std::vector<uint8_t>(500, 1));
+            const hl::PlanResult small = hl::makePlan(input(w));
+            t.IsFalse(small.ok, "a file of the wrong size");
+            t.IsTrue(contains(small.refusal, "not a Fire Pro Wrestling Returns save"), small.refusal);
+        });
+
+        tc.Run("the checksum table missing: refused", [=](TestCase &t)
+        {
+            World w("plan_notable");
+            t.IsTrue(w.env.start(), "starts");
+            write(w.baseSave(), makeSave("base"));
+            hl::PlanInput in = input(w);
+            in.loadCrcTable = [](fpr::CrcTable &, std::string *why) {
+                if (why)
+                    *why = "no executable";
+                return false;
+            };
+            const hl::PlanResult r = hl::makePlan(in);
+            t.IsFalse(r.ok, "refused");
+            t.IsTrue(contains(r.refusal, "checksum table could not be read (no executable)"), r.refusal);
+        });
+
+        tc.Run("a pack file that cannot be used is reported on the pack, and the load still goes ahead with the rest", [=](TestCase &t)
+        {
+            World w("plan_badpack");
+            writeMod(w.env.mods, "bad.fprmod", tomlFor("bad.one", "", "data"), {{"data/renames.json", "{\"format\": \"other\"}"}});
+            writeMod(w.env.mods, "ren.fprmod", tomlFor("ren.one", "", "data"), {{"data/renames.json", renameJson}});
+            t.IsTrue(w.env.start(), "starts");
+            write(w.baseSave(), makeSave("base"));
+            w.env.manager.setEnabled("bad.one", true);
+            w.env.manager.setEnabled("ren.one", true);
+            const hl::PlanResult r = hl::makePlan(input(w));
+            t.IsTrue(r.ok, r.refusal);
+            t.Equals(r.plan.packs.size(), static_cast<size_t>(2), "two reports");
+            size_t withError = 0;
+            for (const auto &p : r.plan.packs)
+                withError += p.error.empty() ? 0 : 1;
+            t.Equals(withError, static_cast<size_t>(1), "one pack is not used, with its reason");
+            t.Equals(firstNameOf(r.plan.save, 2), std::string("Zed"), "the other applies");
+        });
+
+        tc.Run("a full pass: plan, switch, load, check, commit moves the manager's session", [=](TestCase &t)
+        {
+            World w("plan_full");
+            writeMod(w.env.mods, "ren.fprmod", tomlFor("ren.one", "", "data"), {{"data/renames.json", renameJson}});
+            t.IsTrue(w.env.start(), "starts");
+            write(w.baseSave(), makeSave("base"));
+            w.env.manager.setEnabled("ren.one", true);
+            t.IsTrue(w.env.manager.dataChangesPending(), "pending before");
+            hl::Controller ctl;
+            ctl.noteSafePoint(hl::Where::Title, false, 90);
+            ctl.guestStopped(100);
+            t.IsTrue(ctl.request(true, 100).ok, "requested");
+            fs::path root;
+            hl::Controller::Hooks hooks;
+            hooks.cardBusy = []() { return std::string(); };
+            hooks.plan = [&](hl::Plan &plan, std::string &why) {
+                hl::PlanResult r = hl::makePlan(input(w));
+                if (!r.ok)
+                {
+                    why = r.refusal;
+                    return false;
+                }
+                plan = std::move(r.plan);
+                return true;
+            };
+            hooks.switchCard = [&](const hl::Plan &plan) { root = plan.root0; };
+            hooks.commit = [&](const hl::Plan &plan) { w.env.manager.commitDataSession(plan.data); };
+            t.IsTrue(ctl.begin(hl::Where::Title, 110, hooks), "go");
+            t.IsTrue(root == w.profile / "mc0", "the card root is the profile's");
+            // the "game" loads the profile's save: its memory is those areas of the file
+            const auto save = readBack(w.profileSave());
+            std::vector<uint8_t> roster(save.begin() + hl::kRosterOffset, save.begin() + hl::kRosterOffset + hl::kRosterSize);
+            std::vector<uint8_t> slots(save.begin() + hl::kSlotsOffset, save.begin() + hl::kSlotsOffset + hl::kSlotCount * hl::kSlotSize);
+            slots[3 * hl::kSlotSize + 17] = 0x5A; // a leftover in an unused slot
+            hl::GuestView guest{roster.data(), roster.size(), slots.data(), slots.size()};
+            ctl.end(guest, hooks);
+            t.IsTrue(ctl.state() == hl::Controller::State::Loaded, ctl.message());
+            t.Equals(ctl.scrubbedSlots(), static_cast<size_t>(1), "the leftover was cleaned");
+            t.IsFalse(w.env.manager.dataChangesPending(), "the data change is applied");
+            t.IsFalse(w.env.manager.restartNeeded(), "and no restart is needed for it");
+        });
+    });
+
+    MiniTest::Case("IoPathsSwitch", [](TestCase &tc)
+    {
+        // Load Now switches the memory card root while the game runs; the F1 debug panel reads the paths on another thread (task h1).
+        tc.Run("a reference from getIoPaths() stays what it was, and a reader on another thread never sees a torn or freed path", [](TestCase &t)
+        {
+            const PS2Runtime::IoPaths original = PS2Runtime::getIoPaths();
+            const PS2Runtime::IoPaths &held = PS2Runtime::getIoPaths();
+            const std::string heldBefore = held.mcRoot.string();
+
+            std::atomic<bool> stop{false};
+            std::atomic<size_t> reads{0}, bad{0};
+            const std::string originalRoot = original.mcRoot.string();
+            std::thread reader([&]() {
+                while (!stop.load())
+                {
+                    const PS2Runtime::IoPaths &now = PS2Runtime::getIoPaths();
+                    const std::string root = now.mcRoot.string();
+                    const std::string folder = now.elfDirectory.string();
+                    const bool known = root == originalRoot || root.find("h1_root_a") != std::string::npos || root.find("h1_root_b") != std::string::npos;
+                    if (!known || folder != original.elfDirectory.string())
+                        bad.fetch_add(1);
+                    reads.fetch_add(1);
+                }
+            });
+            for (int i = 0; i < 20000; ++i)
+            {
+                PS2Runtime::IoPaths next = original;
+                next.mcRoot = fs::temp_directory_path() / (i % 2 ? "h1_root_a" : "h1_root_b") / "mc0";
+                PS2Runtime::setIoPaths(next);
+            }
+            stop.store(true);
+            reader.join();
+            t.Equals(bad.load(), static_cast<size_t>(0), "the reader never saw a path that was not one of the values set");
+            t.IsTrue(reads.load() > 0, "the reader ran");
+            t.Equals(held.mcRoot.string(), heldBefore, "the reference taken before the switches still holds the old value");
+            t.IsTrue(PS2Runtime::getIoPaths().mcRoot.string().find("h1_root_") != std::string::npos, "the newest value is what getIoPaths() returns now");
+            PS2Runtime::setIoPaths(original);
+            t.Equals(PS2Runtime::getIoPaths().mcRoot.string(), originalRoot, "and it is put back");
         });
     });
 }

@@ -88,6 +88,11 @@
             <div id="mods-foot">
                 <!-- Which memory card is in use and why: the whole width, and it wraps. -->
                 <div id="mods-card"></div>
+                <!-- Load Now (task h1): shown while data-pack changes wait to be applied to the running game. The line beside it says what is going on. -->
+                <div id="mods-apply">
+                    <div class="mbtn small" id="load-now" data-help="Load the memory card again now, with the data packs as they are (asks first).">Load Now</div>
+                    <div id="mods-load-note"></div>
+                </div>
                 <div id="mods-lower">
                     <!-- The folder lines are shortened in the middle by the code, and clipped here as a last resort, so they never run under the buttons. -->
                     <div id="mods-paths">
@@ -105,7 +110,11 @@
             </div>
         </div>
 
-        <div id="notice"><span id="restart-note" class="hidden"></span></div>
+        <div id="notice">
+            <span id="restart-note" class="hidden"></span>
+            <!-- Restart Now (task h1): shown with the note; the Mods tab asks first and starts the game again. -->
+            <div class="button compact" id="restart-now" data-help="Close the game and start it again to apply the changes (asks first).">Restart Now</div>
+        </div>
         <div id="help"><span id="help-text"></span></div>
 
         <div id="footer">

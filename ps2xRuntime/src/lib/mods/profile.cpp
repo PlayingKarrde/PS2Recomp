@@ -1,15 +1,20 @@
 #include "profile.h"
 
 #include "data_pack.h"
+#include "edit_pack.h"
 #include "mini_json.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <ctime>
 #include <fstream>
+#include <future>
 #include <map>
 #include <set>
+#include <thread>
 
 #if defined(_WIN32)
 #include <io.h>
@@ -96,7 +101,11 @@ namespace ps2x::mods::profile
             std::string version;
             Bytes before;
             Bytes written;
-            bool operator==(const LedgerEntry &o) const { return pack == o.pack && version == o.version && before == o.before && written == o.written; }
+            std::string file; // an edit slot ("e<slot>") only: the name of the edit file in the pack that wrote it
+            bool operator==(const LedgerEntry &o) const
+            {
+                return pack == o.pack && version == o.version && before == o.before && written == o.written && file == o.file;
+            }
         };
         using LedgerFields = std::map<std::string, LedgerEntry>;
 
@@ -117,6 +126,7 @@ namespace ps2x::mods::profile
                 const std::string &key = *order[i].second;
                 const LedgerEntry &e = fields.at(key);
                 out += "  " + json::quote(key) + ": {\"pack\": " + json::quote(e.pack) + ", \"version\": " + json::quote(e.version) +
+                       (e.file.empty() ? std::string() : ", \"file\": " + json::quote(e.file)) +
                        ", \"before\": \"" + toHex(e.before) + "\", \"written\": \"" + toHex(e.written) + "\"}";
                 out += i + 1 < order.size() ? ",\n" : "\n";
             }
@@ -169,6 +179,8 @@ namespace ps2x::mods::profile
                 }
                 entry.pack = pack->text;
                 entry.version = ver->text;
+                if (const json::Value *file = e.find("file"); file && file->isString())
+                    entry.file = file->text;
                 out[member.first] = std::move(entry);
             }
             return true;
@@ -613,7 +625,8 @@ namespace ps2x::mods::profile
             }
             if (!pack.hasFile)
             {
-                report.notes.push_back("This data pack has no data/renames.json, so it changes nothing.");
+                if (pack.edits.empty())
+                    report.notes.push_back("This data pack has no data/renames.json or data/edits/*.edit.toml, so it changes nothing.");
                 continue;
             }
             RenamePack parsed;
@@ -638,13 +651,154 @@ namespace ps2x::mods::profile
             suppressedBy[i] = outcome.suppressed;
         }
 
+        // 4b. created wrestlers: every edit file of every pack takes an edit slot (edit_pack.h has the rules). This comes after all the
+        //     packs' renames, so a group a pack creates exists when an edit refers to it.
+        std::map<std::string, size_t> editProvider;             // "e<slot>" -> the pack that wrote it now
+        std::map<std::string, std::string> editFileOf;          // "e<slot>" -> the edit file
+        std::set<std::string> editHeld;                         // "e<slot>" the player changed: kept
+        std::vector<size_t> editsNoRoom(cfg.packs.size(), 0);
+        {
+            struct Want
+            {
+                size_t pack;
+                std::string file;
+                Bytes slot;
+            };
+            std::vector<Want> wants;
+            // 1. every edit file, pack by pack in load order and file by file in name order (whatever order the host listed them in: the slots
+            //    must not depend on it)
+            struct Job
+            {
+                size_t pack = 0;
+                const EditFile *file = nullptr;
+                bool ok = false;
+                Bytes slot;
+                std::vector<std::string> warnings;
+                std::string why;
+            };
+            std::vector<Job> jobs;
+            for (size_t i = 0; i < cfg.packs.size(); ++i)
+            {
+                std::vector<const EditFile *> files;
+                for (const EditFile &e : cfg.packs[i].edits)
+                    files.push_back(&e);
+                std::stable_sort(files.begin(), files.end(), [](const EditFile *a, const EditFile *b) { return a->name < b->name; });
+                for (const EditFile *file : files)
+                {
+                    Job job;
+                    job.pack = i;
+                    job.file = file;
+                    jobs.push_back(std::move(job));
+                }
+            }
+            // 2. reading the text is the slow part (about 10 ms a file: toml11), so a big pack is read by several threads. The result of each file
+            //    is its own, and everything that depends on the order happens after, in order. (Config::moveNames is called from these threads.)
+            const edit::MoveNames *names = cfg.moveNames ? &cfg.moveNames : nullptr;
+            auto read = [&](Job &job) {
+                if (job.file->readError.empty())
+                    job.ok = edit::textToSlot(job.file->text, names, job.slot, &job.warnings, &job.why);
+            };
+            if (jobs.size() < 8)
+            {
+                for (Job &job : jobs)
+                    read(job);
+            }
+            else
+            {
+                const unsigned threads = std::min<unsigned>(std::max(1u, std::thread::hardware_concurrency()), 8u);
+                std::atomic<size_t> next{0};
+                std::vector<std::future<void>> running;
+                for (unsigned t = 0; t < threads; ++t)
+                    running.push_back(std::async(std::launch::async, [&]() {
+                        for (size_t k = next++; k < jobs.size(); k = next++)
+                            read(jobs[k]);
+                    }));
+                for (auto &f : running)
+                    f.get();
+            }
+            // 3. the notes, in order
+            for (Job &job : jobs)
+            {
+                const EditFile &e = *job.file;
+                PackReport &report = r.packs[job.pack];
+                const std::string label = "data/edits/" + e.name;
+                if (!e.readError.empty())
+                {
+                    report.notes.push_back(label + ": " + e.readError);
+                    ++report.editsSkipped;
+                    continue;
+                }
+                if (!job.ok)
+                {
+                    report.notes.push_back(label + ": " + job.why);
+                    ++report.editsSkipped;
+                    continue;
+                }
+                for (size_t w = 0; w < job.warnings.size() && w < 3; ++w)
+                    report.notes.push_back(label + ": " + job.warnings[w]);
+                wants.push_back(Want{job.pack, e.name, std::move(job.slot)});
+            }
+            if (!wants.empty() || !ledger.empty())
+            {
+                std::vector<bool> used(static_cast<size_t>(fpr::kEditSlotCount), false);
+                for (int k = 0; k < fpr::kEditSlotCount; ++k)
+                    used[static_cast<size_t>(k)] = fpr::readU16(R, fpr::editSlotOffset(k)) != 0;
+                std::vector<edit::SlotClaim> claims;
+                for (const auto &entry : ledger)
+                {
+                    const std::string &key = entry.first;
+                    if (key.size() < 2 || key[0] != 'e' || key.find('.') != std::string::npos)
+                        continue;
+                    edit::SlotClaim claim;
+                    claim.slot = std::atoi(key.c_str() + 1);
+                    claim.pack = entry.second.pack;
+                    claim.file = entry.second.file;
+                    claim.held = frozen.count(key) != 0;
+                    claims.push_back(std::move(claim));
+                }
+                std::vector<edit::Wanted> wanted;
+                for (const Want &w : wants)
+                    wanted.push_back(edit::Wanted{cfg.packs[w.pack].id, w.file});
+                const std::vector<edit::Placement> plan = edit::planSlots(used, claims, wanted);
+                for (size_t j = 0; j < wants.size(); ++j)
+                {
+                    const Want &w = wants[j];
+                    PackReport &report = r.packs[w.pack];
+                    if (!plan[j].placed)
+                    {
+                        ++editsNoRoom[w.pack];
+                        ++report.editsSkipped;
+                        continue;
+                    }
+                    const std::string key = "e" + std::to_string(plan[j].slot);
+                    if (plan[j].kept)
+                    {
+                        editHeld.insert(key);
+                        editProvider[key] = w.pack;
+                        editFileOf[key] = w.file;
+                        continue;
+                    }
+                    Bytes slot = w.slot;
+                    const uint16_t group = edit::slotGroup(slot);
+                    if (group != edit::kNoGroup && (group >= fpr::kGroups || !fpr::groupLive(W, group)))
+                    {
+                        edit::setSlotGroup(slot, edit::kNoGroup);
+                        report.notes.push_back("data/edits/" + w.file + ": group " + std::to_string(group) + " is not in your card, so this wrestler has no group (the game lists it under Retired).");
+                    }
+                    std::copy(slot.begin(), slot.end(), W.begin() + static_cast<std::ptrdiff_t>(fpr::editSlotOffset(plan[j].slot)));
+                    editProvider[key] = w.pack;
+                    editFileOf[key] = w.file;
+                }
+            }
+        }
+
         // 5. the new ledger, and the notes
         LedgerFields next;
         for (const auto &p : provider)
         {
             FieldRange range;
             fpr::fieldRange(p.first, range);
-            next[p.first] = LedgerEntry{cfg.packs[p.second].id, cfg.packs[p.second].version, fpr::readField(R, range), fpr::readField(W, range)};
+            next[p.first] = LedgerEntry{cfg.packs[p.second].id, cfg.packs[p.second].version, fpr::readField(R, range), fpr::readField(W, range), std::string()};
         }
         std::map<std::string, size_t> keptBy;                   // frozen field -> the last pack that wanted it
         for (size_t i = 0; i < cfg.packs.size(); ++i)
@@ -659,6 +813,27 @@ namespace ps2x::mods::profile
             next[k.first] = std::move(e);
             ++r.packs[k.second].kept;
         }
+        for (const auto &p : editProvider)
+        {
+            FieldRange range;
+            fpr::fieldRange(p.first, range);
+            const PackInput &pack = cfg.packs[p.second];
+            if (editHeld.count(p.first))
+            {
+                // The player changed (or deleted) this wrestler in the game: it stays as the player's, and the ledger keeps recognising it.
+                LedgerEntry e = ledger.at(p.first);
+                e.pack = pack.id;
+                e.version = pack.version;
+                e.file = editFileOf[p.first];
+                next[p.first] = std::move(e);
+                ++r.packs[p.second].editsKept;
+            }
+            else
+            {
+                next[p.first] = LedgerEntry{pack.id, pack.version, fpr::readField(R, range), fpr::readField(W, range), editFileOf[p.first]};
+                ++r.packs[p.second].editsAdded;
+            }
+        }
         for (const auto &p : provider)
             ++r.packs[p.second].written;
         for (size_t i = 0; i < cfg.packs.size(); ++i)
@@ -672,6 +847,11 @@ namespace ps2x::mods::profile
                 continue;
             if (report.written)
                 report.notes.push_back("Changes " + std::to_string(report.written) + plural(report.written, " field", " fields") + " on the profile card.");
+            if (report.editsAdded)
+                report.notes.push_back("Adds " + std::to_string(report.editsAdded) + plural(report.editsAdded, " created wrestler", " created wrestlers") + " (edit slots) to the profile card.");
+            if (editsNoRoom[i])
+                report.notes.push_back(std::to_string(editsNoRoom[i]) + plural(editsNoRoom[i], " created wrestler", " created wrestlers") +
+                                       " could not be added: all " + std::to_string(fpr::kEditSlotCount) + " edit slots are in use.");
         }
         {
             for (size_t i = 0; i < cfg.packs.size(); ++i)
@@ -690,6 +870,12 @@ namespace ps2x::mods::profile
                 }
                 if (total > shown)
                     r.packs[i].notes.push_back("And " + std::to_string(total - shown) + " more changes of yours were kept.");
+            }
+            for (const std::string &key : editHeld)
+            {
+                const size_t i = editProvider.at(key);
+                if (r.packs[i].notes.size() < 40)
+                    r.packs[i].notes.push_back("Kept your change to " + fpr::describeField(key) + " (" + editFileOf.at(key) + ").");
             }
         }
 

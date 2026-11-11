@@ -34,6 +34,7 @@
 // unit tests drive this with a temporary folder and a made-up checksum table.
 #pragma once
 
+#include "edit_text.h"
 #include "fpr_save.h"
 
 #include <cstdint>
@@ -44,6 +45,14 @@
 
 namespace ps2x::mods::profile
 {
+    // One edit file of a data pack: data/edits/<name>.edit.toml (task e2; docs/formats/edit-text.md). Each becomes a created wrestler.
+    struct EditFile
+    {
+        std::string name;          // "000-karl-gotch.edit.toml", without the folder
+        std::string text;
+        std::string readError;     // set when the file could not be read
+    };
+
     // One active data pack, as the host read it.
     struct PackInput
     {
@@ -53,6 +62,7 @@ namespace ps2x::mods::profile
         bool hasFile = false;      // the package holds data/renames.json
         std::string renamesJson;   // its text
         std::string readError;     // set when the file is there but could not be read
+        std::vector<EditFile> edits; // its data/edits/*.edit.toml files in name order (edit_pack.h readEditFiles fills them)
     };
 
     struct Config
@@ -66,6 +76,9 @@ namespace ps2x::mods::profile
         // select() only: reads the checksum table when (and only when) the profile is going to be used, so a start that uses the base
         // card does not read the executable. Used when crcTable is null.
         std::function<bool(fpr::CrcTable &, std::string *)> loadCrcTable;
+        // Optional: the game's move names (an edit file's `name` for a move is a readable check against them; a mismatch is a note on the
+        // pack's page, never an error). Empty: no check.
+        edit::MoveNames moveNames;
         // Tests only: stop at a point as if the process had died there. 0 none; 1 after ledger.json.new is written; 2 after the save
         // is replaced but before ledger.json is.
         // 3 (select() only): after the card choice was cleared, before the profile is prepared.
@@ -79,6 +92,9 @@ namespace ps2x::mods::profile
         size_t written = 0;                // fields the pack provides now
         size_t kept = 0;                   // fields it wanted to write but the player had changed
         size_t overridden = 0;             // fields a later pack provides instead
+        size_t editsAdded = 0;             // created wrestlers (edit files) now in the card because of this pack
+        size_t editsKept = 0;              // edits whose slot holds the player's version now (changed or deleted in the game)
+        size_t editsSkipped = 0;           // edit files that could not be used (a problem in the file, or no free slot)
         std::vector<std::string> notes;    // lines for the pack's page in the Mods tab
     };
 

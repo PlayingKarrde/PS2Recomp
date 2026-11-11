@@ -47,6 +47,8 @@ add_library(ps2_mods STATIC
     mod_manager.cpp
     mini_json.cpp
     fpr_save.cpp
+    edit_text.cpp
+    edit_pack.cpp
     data_pack.cpp
     profile.cpp
     save_container.cpp

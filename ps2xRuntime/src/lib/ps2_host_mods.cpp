@@ -3,14 +3,19 @@
 #include "runtime/gs/gs_tex_pack.h"
 
 #if defined(PS2X_HAS_MODS)
+#include "edit_pack.h"
 #include "fpr_save.h"
+#include "hot_load.h"
 #include "mod_manager.h"
 #include "profile.h"
 #include "save_import.h"
 #include "ps2_runtime.h"
 #include "ps2_settings.h"
+#include "runtime/ps2_card_activity.h"
 #endif
 
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -36,6 +41,9 @@ namespace ps2x_host_mods
             static Holder h;
             return h;
         }
+
+        // The game's override found the places Load Now needs (hotLoadInstalled); the Mods tab offers the button only then.
+        std::atomic<bool> g_hotLoadInstalled{false};
 
         // What selectCard decided, for the Mods tab and "Keep this card".
         struct CardState
@@ -245,6 +253,63 @@ namespace ps2x_host_mods
         }
     }
 
+    namespace
+    {
+        // One data pack as the profile builder wants it: its identity and the text of its data files, read through the manager (on or
+        // off, live or session: the caller chose which packs). The one place that knows which files a data pack holds, shared by the
+        // start of a session (selectCard) and Load Now.
+        ps2x::mods::profile::PackInput readPackInput(ps2x::mods::Manager *m, const std::string &id)
+        {
+            ps2x::mods::profile::PackInput pack;
+            pack.id = id;
+            const auto info = m->find(id);
+            if (!info)
+                return pack;
+            pack.id = info->id;
+            pack.name = info->name;
+            pack.version = info->version;
+            pack.hasFile = m->hasFile(id, "data/renames.json");
+            if (pack.hasFile)
+            {
+                std::string why;
+                const auto bytes = m->readFile(id, "data/renames.json", 16ull * 1024 * 1024, &why);
+                if (bytes)
+                    pack.renamesJson.assign(bytes->begin(), bytes->end());
+                else
+                    pack.readError = why.empty() ? "the file could not be read" : why;
+            }
+            ps2x::mods::edit::readEditFiles(*m, id, pack); // data/edits/*.edit.toml: created wrestlers (task e2)
+            return pack;
+        }
+
+        // What the profile builder takes besides the packs and the cards, the same at a session start and at Load Now (one place, so the two
+        // cannot differ). Nothing yet.
+        void extendProfileConfig(ps2x::mods::profile::Config &)
+        {
+        }
+
+        // The game's checksum table, read from its executable once (the importer and Load Now both need it).
+        bool crcTableCached(ps2x::mods::fpr::CrcTable &table, std::string *why)
+        {
+            std::lock_guard<std::mutex> lock(card().mutex);
+            if (!card().crcTable)
+            {
+                ps2x::mods::fpr::CrcTable read{};
+                if (card().elfPath.empty())
+                {
+                    if (why)
+                        *why = "the game's executable is not known yet";
+                    return false;
+                }
+                if (!ps2x::mods::fpr::crcTableFromElf(card().elfPath, read, why))
+                    return false;
+                card().crcTable = read;
+            }
+            table = *card().crcTable;
+            return true;
+        }
+    }
+
     void selectCard(const std::string &elfPath)
     {
         ps2x::mods::Manager *m = manager();
@@ -273,21 +338,7 @@ namespace ps2x_host_mods
             const auto info = m->find(id);
             if (!info || info->kind != ps2x::mods::Kind::Data)
                 continue;
-            profile::PackInput pack;
-            pack.id = info->id;
-            pack.name = info->name;
-            pack.version = info->version;
-            pack.hasFile = m->hasFile(id, "data/renames.json");
-            if (pack.hasFile)
-            {
-                std::string why;
-                const auto bytes = m->readFile(id, "data/renames.json", 16ull * 1024 * 1024, &why);
-                if (bytes)
-                    pack.renamesJson.assign(bytes->begin(), bytes->end());
-                else
-                    pack.readError = why.empty() ? "the file could not be read" : why;
-            }
-            config.packs.push_back(std::move(pack));
+            config.packs.push_back(readPackInput(m, id));
         }
         if (config.profileDir.empty())
             return; // no preference folder: the base card, exactly as without mods
@@ -295,6 +346,7 @@ namespace ps2x_host_mods
         // Which card, and (when it is the profile) building it: mods/profile.h select(). The checksum table is read from the executable
         // only if the profile is going to be used.
         config.loadCrcTable = [elfPath](fpr::CrcTable &table, std::string *why) { return fpr::crcTableFromElf(fromUtf8(elfPath), table, why); };
+        extendProfileConfig(config);
 
         profile::Selection selection;
         try
@@ -363,7 +415,7 @@ namespace ps2x_host_mods
         // "Back to my card" was pressed during this session: the card in use does not change until the next start, so say what will happen.
         ps2x::mods::Manager *m = manager();
         if (m && usingProfile && !profileDir.empty() && liveDataPacks(m) == 0 && ps2x::mods::profile::choseOwnCard(profileDir))
-            return "Memory card: profile card until the next start. You chose Back to my card: your own card is used from then, and the profile card stays on disk.";
+            return "Memory card: profile card until Load Now or the next start. You chose Back to my card: your own card is used from then, and the profile card stays on disk.";
         return line;
     }
 
@@ -412,9 +464,12 @@ namespace ps2x_host_mods
             profileDir = card().profileDir;
         }
         std::string message;
-        ps2x::mods::profile::recordOwnCard(profileDir, &message);
+        const bool recorded = ps2x::mods::profile::recordOwnCard(profileDir, &message);
         std::printf("[mods] back to my card: %s\n", message.c_str());
         std::fflush(stdout);
+        // The choice is a change a load can apply (task h1): the Mods tab now offers Load Now for it.
+        if (recorded)
+            message += " Load Now uses it at once, at the title screen or the main menu.";
         return message;
     }
 
@@ -435,38 +490,24 @@ namespace ps2x_host_mods
         }
         imp::Env env;
         env.manager = m;
-        fs::path elf;
         {
             std::lock_guard<std::mutex> lock(card().mutex);
             env.profileDir = card().profileDir;
             env.baseCard0 = card().baseCard0;
-            elf = card().elfPath;
             env.scratchDir = (card().prefFolder.empty() ? fs::temp_directory_path() : card().prefFolder) / "import-tmp";
         }
         // The checksum table is read from the player's own executable, once, the first time a save is imported.
-        env.loadCrcTable = [&elf](ps2x::mods::fpr::CrcTable &table, std::string *why) {
-            std::lock_guard<std::mutex> lock(card().mutex);
-            if (!card().crcTable)
-            {
-                ps2x::mods::fpr::CrcTable read{};
-                if (elf.empty())
-                {
-                    if (why)
-                        *why = "the game's executable is not known yet";
-                    return false;
-                }
-                if (!ps2x::mods::fpr::crcTableFromElf(elf, read, why))
-                    return false;
-                card().crcTable = read;
-            }
-            table = *card().crcTable;
-            return true;
-        };
+        env.loadCrcTable = [](ps2x::mods::fpr::CrcTable &table, std::string *why) { return crcTableCached(table, why); };
         const imp::Outcome result = imp::importFile(env, fromUtf8(utf8Path), folder);
         outcome.handled = true;
         outcome.ok = result.ok;
         outcome.message = result.message;
         outcome.modKey = result.modKey;
+        // The importer ends its report with "Restart the game to use it."; where the game can load the card again that is not the only way.
+        static const std::string restartOnly = "Restart the game to use it.";
+        if (result.ok && g_hotLoadInstalled.load() && outcome.message.size() >= restartOnly.size() &&
+            outcome.message.compare(outcome.message.size() - restartOnly.size(), restartOnly.size(), restartOnly) == 0)
+            outcome.message.replace(outcome.message.size() - restartOnly.size(), restartOnly.size(), "Use Load Now to apply it, or restart the game.");
         if (result.needsChoice)
         {
             for (const imp::Choice &c : result.choices)
@@ -515,6 +556,228 @@ namespace ps2x_host_mods
         std::fflush(stdout);
         return outcome;
     }
+
+    // ---- Load Now (task h1) --------------------------------------------------------------------------------------------------
+    namespace
+    {
+        namespace hot = ps2x::mods::hotload;
+
+        hot::Controller &controller()
+        {
+            static hot::Controller c;
+            return c;
+        }
+
+        uint64_t nowNs()
+        {
+            return ps2x_host::cardSteadyNowNs();
+        }
+
+        // Changes a load can apply: the data packs that are on differ from what the game has loaded, or the player's choice of card
+        // (the profile, or "Back to my card") differs from the card in use.
+        bool loadPending()
+        {
+            ps2x::mods::Manager *m = manager();
+            fs::path profileDir;
+            bool usingProfile = false;
+            {
+                std::lock_guard<std::mutex> lock(card().mutex);
+                profileDir = card().profileDir;
+                usingProfile = card().usingProfile;
+            }
+            if (!m || profileDir.empty())
+                return false;
+            if (m->dataChangesPending())
+                return true;
+            return ps2x::mods::profile::planCard(profileDir, liveDataPacks(m)).useProfile != usingProfile;
+        }
+
+        const char *whereText(int where)
+        {
+            return where == 1 ? "the title screen" : (where == 2 ? "the main menu" : "an unknown screen");
+        }
+
+        // The steps of a load, bound to the real manager, card and runtime. (mods/hot_load.h has the order and the rules.)
+        hot::Controller::Hooks hooks()
+        {
+            hot::Controller::Hooks h;
+            h.cardBusy = []() -> std::string {
+                const ps2x_host::CardWriteStatus status = ps2x_host::cardWriteStatus();
+                if (status.writeHandlesOpen > 0)
+                    return "the game is writing to the memory card. Try again in a moment.";
+                return std::string();
+            };
+            h.plan = [](hot::Plan &plan, std::string &why) {
+                ps2x::mods::Manager *m = manager();
+                hot::PlanInput in;
+                in.manager = m;
+                {
+                    std::lock_guard<std::mutex> lock(card().mutex);
+                    in.profileDir = card().profileDir;
+                    in.baseCard0 = card().baseCard0;
+                }
+                in.baseCard1 = ps2x::mods::profile::slot2Root(in.baseCard0);
+                in.readPack = [m](const std::string &id) { return readPackInput(m, id); };
+                in.loadCrcTable = [](ps2x::mods::fpr::CrcTable &table, std::string *reason) { return crcTableCached(table, reason); };
+                in.extendConfig = [](ps2x::mods::profile::Config &config) { extendProfileConfig(config); };
+                hot::PlanResult result = hot::makePlan(in);
+                for (const std::string &line : result.plan.log)
+                    std::printf("[mods] %s\n", line.c_str());
+                if (!result.ok)
+                {
+                    why = result.refusal;
+                    return false;
+                }
+                plan = std::move(result.plan);
+                return true;
+            };
+            h.switchCard = [](const hot::Plan &plan) {
+                PS2Runtime::IoPaths paths = PS2Runtime::getIoPaths();
+                const std::string before = utf8(paths.mcRoot);
+                if (paths.mcRoot.lexically_normal() == plan.root0.lexically_normal())
+                {
+                    std::printf("[mods] Load Now: card root stays %s\n", before.c_str());
+                    std::fflush(stdout);
+                    return;
+                }
+                paths.mcRoot = plan.root0;
+                PS2Runtime::setIoPaths(paths);
+                std::printf("[mods] Load Now: card root %s -> %s\n", before.c_str(), utf8(PS2Runtime::getIoPaths().mcRoot).c_str());
+                std::fflush(stdout);
+            };
+            h.commit = [](const hot::Plan &plan) {
+                ps2x::mods::Manager *m = manager();
+                if (!m)
+                    return;
+                m->commitDataSession(plan.data);
+                // The notes on each pack's page describe the profile as it was built just now.
+                for (const auto &report : plan.packs)
+                {
+                    m->clearNotes(report.id);
+                    if (!report.error.empty())
+                        m->addRuntimeNote(report.id, report.error);
+                    for (const std::string &note : report.notes)
+                        m->addInfoNote(report.id, note);
+                }
+                {
+                    std::lock_guard<std::mutex> lock(card().mutex);
+                    card().usingProfile = plan.useProfile;
+                    card().line = plan.line;
+                }
+                std::printf("[mods] Load Now: %s\n", plan.line.c_str());
+                for (const auto &report : plan.packs)
+                    std::printf("[mods]   %s: %zu fields written, %zu kept (changed by you), %zu overridden by a later pack%s%s\n", report.id.c_str(),
+                                report.written, report.kept, report.overridden, report.error.empty() ? "" : "; NOT USED: ", report.error.c_str());
+                std::fflush(stdout);
+            };
+            return h;
+        }
+    }
+
+    LoadOffer loadOffer()
+    {
+        LoadOffer out;
+        if (!g_hotLoadInstalled.load() || !manager())
+            return out;
+        {
+            std::lock_guard<std::mutex> lock(card().mutex);
+            if (card().profileDir.empty())
+                return out;
+        }
+        const hot::Controller::Offer offer = controller().offer(loadPending());
+        out.shown = offer.shown;
+        out.enabled = offer.enabled;
+        out.unsaved = offer.unsaved;
+        out.note = offer.note;
+        out.help = offer.help;
+        out.question = offer.question;
+        return out;
+    }
+
+    std::string requestLoad(bool *accepted)
+    {
+        if (accepted)
+            *accepted = false;
+        if (!g_hotLoadInstalled.load() || !manager())
+            return "Load Now is not available in this build.";
+        const hot::Controller::Requested result = controller().request(loadPending(), nowNs());
+        if (accepted)
+            *accepted = result.ok;
+        std::printf("[mods] Load Now %s: %s\n", result.ok ? "requested" : "not requested", result.message.c_str());
+        std::fflush(stdout);
+        return result.message;
+    }
+
+    void hotLoadGuestStopped()
+    {
+        controller().guestStopped(nowNs());
+    }
+
+    void hotLoadGuestResumed()
+    {
+        controller().guestResumed();
+    }
+
+    void hotLoadTick()
+    {
+        if (controller().expire(nowNs()))
+        {
+            std::printf("[mods] Load Now: %s\n", controller().message().c_str());
+            std::fflush(stdout);
+        }
+    }
+
+    bool takeLoadResult(std::string &message)
+    {
+        return controller().takeResult(message);
+    }
+
+    void hotLoadInstalled()
+    {
+        g_hotLoadInstalled.store(true);
+    }
+
+    void hotLoadSafePoint(int where, bool unsaved)
+    {
+        controller().noteSafePoint(static_cast<hot::Where>(where), unsaved, nowNs());
+    }
+
+    bool hotLoadRequested()
+    {
+        return controller().requested();
+    }
+
+    bool hotLoadBegin(int where)
+    {
+        const auto started = std::chrono::steady_clock::now();
+        const bool go = controller().begin(static_cast<hot::Where>(where), nowNs(), hooks());
+        if (go)
+        {
+            std::printf("[mods] Load Now: starting the game's loader at %s (%.1f ms to prepare)\n", whereText(where),
+                        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
+        }
+        else if (controller().state() == hot::Controller::State::Refused)
+        {
+            std::printf("[mods] %s\n", controller().message().c_str());
+        }
+        std::fflush(stdout);
+        return go;
+    }
+
+    void hotLoadEnd(uint8_t *roster, size_t rosterSize, uint8_t *slots, size_t slotsSize)
+    {
+        hot::GuestView view;
+        view.roster = roster;
+        view.rosterSize = rosterSize;
+        view.slots = slots;
+        view.slotsSize = slotsSize;
+        controller().end(view, hooks());
+        if (controller().state() == hot::Controller::State::Loaded)
+            std::printf("[mods] Load Now: the game's memory matches the card (%zu unused edit slots had leftovers and were cleared)\n", controller().scrubbedSlots());
+        else
+            std::printf("[mods] Load Now: %s\n", controller().message().c_str());
+        std::fflush(stdout);
+    }
 #else
     void initialize() {}
     ps2x::mods::Manager *manager() { return nullptr; }
@@ -537,5 +800,21 @@ namespace ps2x_host_mods
     bool canImportSave() { return false; }
     DropOutcome importSave(const std::string &, const std::string &) { return installDropped(std::string()); }
     DropOutcome handleDropped(const std::string &path) { return installDropped(path); }
+    LoadOffer loadOffer() { return LoadOffer(); }
+    std::string requestLoad(bool *accepted)
+    {
+        if (accepted)
+            *accepted = false;
+        return "This build has no mod manager.";
+    }
+    void hotLoadGuestStopped() {}
+    void hotLoadGuestResumed() {}
+    void hotLoadTick() {}
+    bool takeLoadResult(std::string &) { return false; }
+    void hotLoadInstalled() {}
+    void hotLoadSafePoint(int, bool) {}
+    bool hotLoadRequested() { return false; }
+    bool hotLoadBegin(int) { return false; }
+    void hotLoadEnd(uint8_t *, size_t, uint8_t *, size_t) {}
 #endif
 }

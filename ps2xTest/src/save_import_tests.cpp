@@ -580,6 +580,7 @@ void register_save_import_tests()
         {
             const Bytes base = makeSave();
             Bytes s = base;
+            s[kOffEditSlots + 3 * kEditStride] = 1; // a slot the game would list (its used flag) whose record is not a wrestler the text can say
             s[kOffEditSlots + 3 * kEditStride + 10] = 1;
             s[kOffEditSlots + 9 * kEditStride] = 1;
             check(t, base, fixed(s), "2 created wrestlers (edit slots)", "edit slots");
@@ -826,7 +827,7 @@ void register_save_import_tests()
             t.IsTrue(o.nothingToImport && !o.otherChanges, "play state is not a change: " + o.message);
             // only created wrestlers differ: nothing to import, but the report says why
             Bytes edits = base;
-            edits[kOffEditSlots + 40 * kEditStride + 3] = 1;
+            edits[kOffEditSlots + 40 * kEditStride] = 1; // used, but not a wrestler the text can say
             fixIntegrity(edits, testTable());
             o = imp::importEntries(rig.env(), {entryOf("BASLUS-21702", edits)}, "edits.max", "");
             t.IsTrue(o.nothingToImport && o.otherChanges && contains(o.message, "This save also has other changes that packs cannot carry yet."), o.message);

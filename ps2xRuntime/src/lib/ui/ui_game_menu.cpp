@@ -96,6 +96,11 @@ namespace ps2x::ui
                 tools.backToOwnCard = [this]() { return host->backToOwnCard(); };
                 tools.canImportSave = [this]() { return host->canImportSave(); };
                 tools.importSave = [this]() { return host->importSave(); };
+                tools.loadOffer = [this]() { return host->loadOffer(); };
+                tools.loadNow = [this]() { return host->loadNow(); };
+                tools.canRestart = [this]() { return host->canRestart(); };
+                tools.restartBlockedReason = [this]() { return host->restartBlockedReason(); };
+                tools.restartNow = [this]() { host->restartNow(); };
                 mods.setTools(std::move(tools));
                 modsAttached = true;
             }
@@ -173,6 +178,11 @@ namespace ps2x::ui
                     note->SetClass("hidden", restartNames.empty());
                 }
             }
+#if defined(PS2X_UI_MODS)
+            // Load Now (data packs, without a restart) and Restart Now (whenever the note above shows) follow the host.
+            if (modsAttached)
+                mods.updateApplyRow(!restartNames.empty());
+#endif
         }
     };
 
