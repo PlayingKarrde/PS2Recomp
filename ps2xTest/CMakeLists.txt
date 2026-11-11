@@ -43,6 +43,7 @@ add_library(ps2_test_lib STATIC
     src/gs_tex_pack_tests.cpp
     src/gs_font_tests.cpp
     src/ui_settings_tests.cpp
+    src/rom_override_tests.cpp
 )
 
 # The mod layer's tests (src/lib/mods) exist when the build has the mod manager (PS2X_BUILD_MODS). The tests use only the

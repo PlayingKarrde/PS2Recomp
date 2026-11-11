@@ -1,6 +1,8 @@
 #include <algorithm>
 #include <cctype>
 
+#include "RomOverride.h" // development aid: PS2X_ROM_OVERRIDE_DIR (task a3)
+
 namespace
 {
     constexpr uint32_t kCdSectorSize = 2048;
@@ -444,7 +446,20 @@ namespace
 
             const uint64_t relativeLbn = static_cast<uint64_t>(lbn - entry.baseLbn);
             const uint64_t offset = relativeLbn * kCdSectorSize;
-            return readHostRange(entry.hostPath, offset, dst, byteCount);
+            const bool hostOk = readHostRange(entry.hostPath, offset, dst, byteCount);
+            if (hostOk && ps2x_rom_override::enabled())
+            {
+                // PS2X_ROM_OVERRIDE_DIR: FPR.ROM's directory is rewritten here so replaced files have their new place and size.
+                ps2x_rom_override::afterHostRead(entry.hostPath, entry.baseLbn, relativeLbn, dst, byteCount);
+            }
+            return hostOk;
+        }
+
+        // PS2X_ROM_OVERRIDE_DIR: the replacement files live beyond the end of every registered file.
+        if (ps2x_rom_override::serveVirtual(lbn, sectors, dst, byteCount))
+        {
+            g_lastCdError = 0;
+            return true;
         }
 
         const std::filesystem::path cdImage = getCdImagePath();
