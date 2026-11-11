@@ -154,6 +154,14 @@ namespace ps2x::mods::profile
     // <profileDir>/base-backup-<date-time>/. Each file is written through a temporary file and a rename.
     KeepResult keepCard(const std::filesystem::path &profileDir, const std::filesystem::path &baseCard0);
 
+    // ---- the player's own state (task s4: the importer's comparison base) ----
+    // The profile's save with every ledger field that still holds what a pack wrote put back to its "before" bytes, and every field the
+    // player changed in the game left as it is: the save as it would be had no data pack ever been on (what building the profile with an
+    // empty pack list leaves; the integrity data is recomputed, so the result is a valid save, and with nothing changed by the player it is
+    // byte for byte the base card's save). The profile's save must pass the game's checks first.
+    // False with *why (one line, for the player) when the profile has no save or its save fails them. Reads only.
+    bool playerSave(const std::filesystem::path &profileDir, const fpr::CrcTable &table, std::vector<uint8_t> &out, std::string *why);
+
     // ---- helpers the tests and the host share ----
     // Writes `bytes` to `target` through target + ".tmp" and a rename, flushed to disk. False if it could not (the old file is kept).
     bool writeFileAtomic(const std::filesystem::path &target, const std::string &bytes);

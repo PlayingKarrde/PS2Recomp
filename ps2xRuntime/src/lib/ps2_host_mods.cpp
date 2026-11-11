@@ -6,6 +6,7 @@
 #include "fpr_save.h"
 #include "mod_manager.h"
 #include "profile.h"
+#include "save_import.h"
 #include "ps2_runtime.h"
 #include "ps2_settings.h"
 #endif
@@ -15,6 +16,7 @@
 #include <filesystem>
 #include <memory>
 #include <mutex>
+#include <optional>
 
 namespace ps2x_host_mods
 {
@@ -44,6 +46,8 @@ namespace ps2x_host_mods
             fs::path baseCard0;  // the base card's slot 1 root, as the runtime had it before any redirect
             std::string line;
             bool usingProfile = false; // this session plays from the profile card
+            fs::path elfPath;          // the game executable: the save importer reads the checksum table from it
+            std::optional<ps2x::mods::fpr::CrcTable> crcTable; // read once, when the first save is imported
         };
 
         CardState &card()
@@ -256,6 +260,7 @@ namespace ps2x_host_mods
                 card().profileDir = card().prefFolder / "profile";
             card().baseCard0 = io.mcRoot;
             card().usingProfile = false;
+            card().elfPath = fromUtf8(elfPath);
             config.profileDir = card().profileDir;
             card().line = profile::baseCardLine();
         }
@@ -413,6 +418,85 @@ namespace ps2x_host_mods
         return message;
     }
 
+    bool canImportSave()
+    {
+        return manager() != nullptr;
+    }
+
+    DropOutcome importSave(const std::string &utf8Path, const std::string &folder)
+    {
+        namespace imp = ps2x::mods::import;
+        DropOutcome outcome;
+        ps2x::mods::Manager *m = manager();
+        if (!m)
+        {
+            outcome.message = "Mods are not available.";
+            return outcome;
+        }
+        imp::Env env;
+        env.manager = m;
+        fs::path elf;
+        {
+            std::lock_guard<std::mutex> lock(card().mutex);
+            env.profileDir = card().profileDir;
+            env.baseCard0 = card().baseCard0;
+            elf = card().elfPath;
+            env.scratchDir = (card().prefFolder.empty() ? fs::temp_directory_path() : card().prefFolder) / "import-tmp";
+        }
+        // The checksum table is read from the player's own executable, once, the first time a save is imported.
+        env.loadCrcTable = [&elf](ps2x::mods::fpr::CrcTable &table, std::string *why) {
+            std::lock_guard<std::mutex> lock(card().mutex);
+            if (!card().crcTable)
+            {
+                ps2x::mods::fpr::CrcTable read{};
+                if (elf.empty())
+                {
+                    if (why)
+                        *why = "the game's executable is not known yet";
+                    return false;
+                }
+                if (!ps2x::mods::fpr::crcTableFromElf(elf, read, why))
+                    return false;
+                card().crcTable = read;
+            }
+            table = *card().crcTable;
+            return true;
+        };
+        const imp::Outcome result = imp::importFile(env, fromUtf8(utf8Path), folder);
+        outcome.handled = true;
+        outcome.ok = result.ok;
+        outcome.message = result.message;
+        outcome.modKey = result.modKey;
+        if (result.needsChoice)
+        {
+            for (const imp::Choice &c : result.choices)
+            {
+                outcome.folders.push_back(c.folder);
+                outcome.choices.push_back(c.region); // the buttons are short; the question's text names the folders
+            }
+            outcome.path = utf8Path;
+        }
+        if (result.ok)
+            for (const std::string &note : result.notes)
+                m->addInfoNote(result.modKey, note);
+        for (const std::string &line : result.log)
+            std::printf("[mods] %s\n", line.c_str());
+        std::printf("[mods] imported %s: %s\n", utf8Path.c_str(), result.message.c_str());
+        std::fflush(stdout);
+        return outcome;
+    }
+
+    DropOutcome handleDropped(const std::string &utf8Path)
+    {
+        std::string extension = utf8(fromUtf8(utf8Path).extension()); // u8string: a file name with letters outside the system's code page is fine
+        for (char &c : extension)
+            if (c >= 'A' && c <= 'Z')
+                c = static_cast<char>(c - 'A' + 'a');
+        if (extension == ".fprmod")
+            return installDropped(utf8Path);
+        return importSave(utf8Path, std::string());
+    }
+
     DropOutcome installDropped(const std::string &utf8Path)
     {
         DropOutcome outcome;
@@ -426,6 +510,7 @@ namespace ps2x_host_mods
         outcome.handled = true;
         outcome.ok = result.ok;
         outcome.message = result.message;
+        outcome.modKey = result.ok ? result.key : std::string();
         std::printf("[mods] dropped %s: %s\n", utf8Path.c_str(), result.message.c_str());
         std::fflush(stdout);
         return outcome;
@@ -449,5 +534,8 @@ namespace ps2x_host_mods
         outcome.message = "This build has no mod manager.";
         return outcome;
     }
+    bool canImportSave() { return false; }
+    DropOutcome importSave(const std::string &, const std::string &) { return installDropped(std::string()); }
+    DropOutcome handleDropped(const std::string &path) { return installDropped(path); }
 #endif
 }

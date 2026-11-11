@@ -78,7 +78,24 @@ namespace ps2x_host_mods
         bool handled = false; // the manager exists and looked at the file
         bool ok = false;      // it was installed
         std::string message;  // one sentence for the player
+        // A save import (task s4) only: the file held several saves of the game, so nothing was imported yet. `choices` are the labels to
+        // offer ("USA", "Japan", "Europe": the question's text names the folders), `folders` the folder names in the same order; call importSave(path, folders[i]) with the one picked.
+        std::vector<std::string> choices;
+        std::vector<std::string> folders;
+        std::string path; // the file, for that second call
+        std::string modKey; // the mod that was installed (an import, or a dropped .fprmod): the Mods tab selects it
     };
     // The player dropped a file (UTF-8 path) on the window: installs it if it is a good .fprmod. Logs the result.
     DropOutcome installDropped(const std::string &utf8Path);
+
+    // ---- importing a community save as a data pack (task s4; mods/save_import.h, docs/formats/fprmod.md "Importing a save") ----
+    // True when this build can import (it has a mod manager). The Mods tab's "Import a save..." button is shown only then.
+    bool canImportSave();
+    // Turns the save in `utf8Path` (a .max, .psu, .xps/.sps, .cbs, .psv, a .ps2 card image, a raw save...) into an installed, switched-on data
+    // pack, comparing it with the player's own card (or, when a profile has a save, with the profile without its packs). `folder` names
+    // the save to take when the file holds several saves of the game (leave it empty the first time; see DropOutcome::choices).
+    // Logs what it did. The result is shown on the Mods tab.
+    DropOutcome importSave(const std::string &utf8Path, const std::string &folder = std::string());
+    // What a file dropped on the window gets: a .fprmod is installed (installDropped), anything else is tried as a save (importSave).
+    DropOutcome handleDropped(const std::string &utf8Path);
 }

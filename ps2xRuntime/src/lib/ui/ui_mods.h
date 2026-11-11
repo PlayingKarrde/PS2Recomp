@@ -70,15 +70,24 @@ namespace ps2x::ui
             // returns one sentence).
             std::function<bool()> canBackToOwnCard;
             std::function<std::string()> backToOwnCard;
+            // Task s4b, "Import a Save..." (#import-save: shown while canImportSave() is true). importSave() starts the file dialog (the answer
+            // comes later, through the host) and returns one sentence for the status line.
+            std::function<bool()> canImportSave;
+            std::function<std::string()> importSave;
         };
         void setTools(Tools tools);
 
+        // Makes the mod with this key the one whose page shows (the next refresh() draws it); a mod that is not there is ignored.
+        void selectMod(const std::string &key);
         // Builds the list and the details again from the manager, keeping the selected mod if it is still there.
         void refresh();
         // The line under the list.
         void setStatus(const std::string &message);
         // The focus goes to the selected mod (or the first one); with no mods, to the tab.
         void focusList();
+        // "Which save?": the file the player picked holds more than one save of the game. The confirm layer shows `body` and one button per
+        // label (at most three) and Cancel; `picked(i)` is called with the index of the label chosen (not for Cancel). The focus starts on Cancel.
+        void askWhichSave(const std::string &body, const std::vector<std::string> &labels, std::function<void(size_t)> picked);
         // The question about uninstalling is showing.
         bool confirming() const { return m_confirming; }
         void closeConfirm();
@@ -107,7 +116,9 @@ namespace ps2x::ui
         bool m_confirming = false;
         std::string m_confirmKey; // the mod the question is about
         // What the question on the confirm layer is about.
-        enum class Ask { Uninstall, KeepCard, BackToOwnCard };
+        enum class Ask { Uninstall, KeepCard, BackToOwnCard, PickSave };
+        std::function<void(size_t)> m_picked;
+        void leavePick(size_t index);
         Ask m_ask = Ask::Uninstall;
         void openKeepConfirm();
         void openBackConfirm();

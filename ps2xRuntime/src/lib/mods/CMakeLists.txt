@@ -49,6 +49,8 @@ add_library(ps2_mods STATIC
     fpr_save.cpp
     data_pack.cpp
     profile.cpp
+    save_container.cpp
+    save_import.cpp
 )
 target_include_directories(ps2_mods PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(ps2_mods PRIVATE toml11::toml11 miniz)

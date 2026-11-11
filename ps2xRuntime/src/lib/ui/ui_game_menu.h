@@ -22,6 +22,7 @@
 
 #include "ui_overlay.h"
 
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -84,6 +85,11 @@ namespace ps2x::ui
         // one sentence.
         virtual bool canBackToOwnCard() { return false; }
         virtual std::string backToOwnCard() { return std::string(); }
+        // Task s4b: "Import a Save..." in the Mods tab. canImportSave() is true when this build can import; importSave() opens the file dialog
+        // (the pick arrives later, through the host, which then calls GameMenu::showMods with the result) and returns one sentence for the
+        // status line.
+        virtual bool canImportSave() { return false; }
+        virtual std::string importSave() { return std::string(); }
     };
 
     class GameMenu
@@ -108,7 +114,13 @@ namespace ps2x::ui
         void refresh();
         // Shows the Mods tab with `message` under the list ("Installed X.", "That is not a mod file."). The host calls it after a file was
         // dropped on the window; it opens the menu first if it is not open.
-        void showMods(const std::string &message);
+        // With `selectKey` the mod of that key is the one whose page shows (a mod that was just installed).
+        void showMods(const std::string &message, const std::string &selectKey = std::string());
+        // The file the player picked (or dropped) holds more than one save of the game: shows the question "Which save?" over the Mods tab with
+        // one button per label (at most three) and Cancel. `picked(i)` gets the index chosen; Cancel calls nothing.
+        void askWhichSave(const std::string &body, const std::vector<std::string> &labels, std::function<void(size_t)> picked);
+        // Takes down a question of the Mods tab that is showing (the answer to something else arrived).
+        void closeQuestion();
 
         // The overlay for events, update and record (see ui_overlay.h).
         Overlay &overlay();

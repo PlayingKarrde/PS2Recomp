@@ -732,6 +732,52 @@ namespace ps2x::mods::profile
         return finish();
     }
 
+    // ---- the player's own state ---------------------------------------------------------------------------------------
+
+    bool playerSave(const fs::path &profileDir, const fpr::CrcTable &table, std::vector<uint8_t> &out, std::string *why)
+    {
+        auto say = [&](const std::string &text) {
+            if (why)
+                *why = text;
+            return false;
+        };
+        const fs::path save = profileDir / "mc0" / fpr::kSaveName / fpr::kSaveName;
+        Bytes P;
+        std::error_code ec;
+        if (profileDir.empty() || !fs::is_regular_file(save, ec) || !readFileBytes(save, P))
+            return say("The profile card has no save.");
+        if (P.size() != fpr::kSaveSize)
+            return say("The save on the profile card is not a Fire Pro Wrestling Returns save (" + std::to_string(P.size()) + " bytes).");
+        const fpr::Integrity in = fpr::checkIntegrity(P, table);
+        if (!in.allOk())
+            return say("The save on the profile card does not pass the game's own checks.");
+        if (!in.markersOk)
+            return say("The save on the profile card is not from this version of the game.");
+        Bytes ledgerText;
+        if (readFileBytes(profileDir / "ledger.json", ledgerText))
+        {
+            LedgerFields ledger;
+            std::string sha, error;
+            size_t skipped = 0;
+            if (parseLedger(std::string(ledgerText.begin(), ledgerText.end()), ledger, sha, skipped, &error))
+            {
+                Bytes R = P;
+                for (const auto &entry : ledger)
+                {
+                    FieldRange range;
+                    if (fpr::fieldRange(entry.first, range) && fpr::readField(P, range) == entry.second.written)
+                        fpr::writeField(R, range, entry.second.before);
+                }
+                fpr::fixIntegrity(R, table);
+                out = std::move(R);
+                return true;
+            }
+            // A ledger that cannot be read is set aside by the next start; the profile's save is the player's as it stands.
+        }
+        out = std::move(P);
+        return true;
+    }
+
     // ---- Keep this card -----------------------------------------------------------------------------------------------
 
     KeepResult keepCard(const fs::path &profileDir, const fs::path &baseCard0)

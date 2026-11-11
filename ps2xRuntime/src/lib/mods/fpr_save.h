@@ -82,7 +82,21 @@ namespace ps2x::mods::fpr
     std::string sha256Hex(const uint8_t *data, size_t size);
     inline std::string sha256Hex(const std::vector<uint8_t> &bytes) { return sha256Hex(bytes.data(), bytes.size()); }
 
+    // SHA-1 (only the "base_sha1" line of a rename file, which names the save a pack was made against; not a security check).
+    std::string sha1Hex(const uint8_t *data, size_t size);
+    inline std::string sha1Hex(const std::vector<uint8_t> &bytes) { return sha1Hex(bytes.data(), bytes.size()); }
+
     // ---- text ------------------------------------------------------------------------------------------------------------
+    // The game's name bytes to code points, strictly: false when a byte sequence is not one code page 932 character (the same
+    // characters Python's "cp932" codec decodes, for the ones that encode back to the same bytes; see fieldTextOrHex).
+    bool decodeGameBytes(const uint8_t *bytes, size_t size, std::vector<uint32_t> &out);
+    // UTF-8 for code points.
+    std::string encodeUtf8(const std::vector<uint32_t> &codePoints);
+    // What a rename file holds for a text field (tools/fprsave.py field_value): the bytes up to the first zero, as plain text when
+    // that stores back to exactly the same bytes (full-width ASCII shown as ASCII, a full-width space as a space), otherwise the same
+    // text without the ASCII folding, otherwise nothing (*isHex is set and the return value is the bytes as lower-case hexadecimal).
+    std::string fieldTextOrHex(const uint8_t *field, size_t width, bool *isHex);
+
     // UTF-8 to code points. False (with *error) on a byte sequence that is not valid UTF-8.
     bool decodeUtf8(const std::string &utf8, std::vector<uint32_t> &out, std::string *error = nullptr);
     // What the game's name fields hold: printable ASCII becomes the full-width form (a space becomes U+3000), then the text is

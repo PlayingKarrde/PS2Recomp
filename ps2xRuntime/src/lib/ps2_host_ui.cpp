@@ -59,6 +59,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -191,6 +192,24 @@ namespace ps2x_host::ui
                 SDL_SetJoystickVirtualButton(g.testPad.joystick, static_cast<int>(button), std::strcmp(verb, "down") == 0);
         }
 
+        // ---- importing a save (task s4b) --------------------------------------------------------------------------
+        // The Mods tab's "Import a Save..." button opens the system's file window (SDL_ShowOpenFileDialog; it answers on some other thread, so
+        // the path is parked here and update() takes it on the main thread). A file dropped on the window goes the same way once it is
+        // known not to be a .fprmod. When the file holds several saves of the game the Mods tab asks which one (askWhichSave) and the
+        // answer calls importAndShow again with the folder chosen.
+        struct ImportState
+        {
+            std::mutex mutex;
+            std::string picked;                      // the path the file window returned, until update() takes it
+            std::string failed;                      // why the file window could not open (the system has none), until update() shows it
+            bool dialogOpen = false;
+            std::string choosePath;                  // a file with several saves, waiting for the answer
+            std::vector<std::string> chooseFolders;
+        } imports;
+
+        std::string startImportDialog();
+        void importAndShow(const std::string &path, const std::string &folder);
+
         // ---- what the controls page shows (ps2_pad.cpp has the real map) ----------------------------------------
 
 #if defined(PS2X_HAS_UI)
@@ -318,6 +337,9 @@ namespace ps2x_host::ui
             std::string keepCard() override { return ps2x_host_mods::keepCard(); }
             bool canBackToOwnCard() override { return ps2x_host_mods::canBackToOwnCard(); }
             std::string backToOwnCard() override { return ps2x_host_mods::backToOwnCard(); }
+            // Task s4b: "Import a Save...".
+            bool canImportSave() override { return ps2x_host_mods::canImportSave(); }
+            std::string importSave() override { return startImportDialog(); }
             std::string dumpTextures() override { return ps2x_gs::requestTextureDump(); }
             void openDumpsFolder() override { ps2x_gs::openFolder(ps2x_gs::dumpsFolder()); }
             std::string lastDumpResult() override
@@ -414,22 +436,112 @@ namespace ps2x_host::ui
                 openOverlay(how);
         }
 
-        // A file was dropped on the window (SDL_EVENT_DROP_FILE, or a line of the PS2X_TEST_DROP file): the mod manager installs
-        // it if it is a good .fprmod, and the player is shown the answer on the Mods tab, which opens for the purpose (the game
-        // pauses while the menu is open, as always). Without an overlay the answer only goes to the log.
-        void handleDroppedFile(const std::string &path)
+        // The answer to a file that was dropped or picked, on the Mods tab, which opens for the purpose (the game pauses while the menu is
+        // open, as always). Without an overlay the answer only goes to the log. A file with several saves of the game also gets the
+        // question "Which save?"; the answer imports the one chosen.
+        void showModsOutcome(const std::string &path, const ps2x_host_mods::DropOutcome &outcome, const char *how)
         {
-            const ps2x_host_mods::DropOutcome outcome = ps2x_host_mods::installDropped(path);
 #if defined(PS2X_HAS_UI)
             if (!outcome.handled || !g.created)
                 return;
             if (!g.visible.load())
-                openOverlay("file dropped");
-            if (g.visible.load())
-                menu().showMods(outcome.message);
+                openOverlay(how);
+            if (!g.visible.load())
+                return;
+            menu().closeQuestion();
+            menu().showMods(outcome.message, outcome.modKey);
+            if (!outcome.choices.empty() && outcome.choices.size() == outcome.folders.size())
+            {
+                {
+                    std::lock_guard<std::mutex> lock(imports.mutex);
+                    imports.choosePath = path;
+                    imports.chooseFolders = outcome.folders;
+                }
+                const std::vector<std::string> folders = outcome.folders;
+                menu().askWhichSave(outcome.message, outcome.choices, [path, folders](size_t index) {
+                    if (index < folders.size())
+                        importAndShow(path, folders[index]);
+                });
+            }
 #else
+            (void)path;
             (void)outcome;
+            (void)how;
 #endif
+        }
+
+        void importAndShow(const std::string &path, const std::string &folder)
+        {
+            {
+                std::lock_guard<std::mutex> lock(imports.mutex);
+                imports.choosePath.clear();
+                imports.chooseFolders.clear();
+            }
+            showModsOutcome(path, ps2x_host_mods::importSave(path, folder), "save imported");
+        }
+
+        // A file was dropped on the window (SDL_EVENT_DROP_FILE, or a line of the PS2X_TEST_DROP file): a .fprmod is installed by the mod
+        // manager; any other file is tried as a community save and turned into a data pack (ps2_host_mods.h importSave).
+        void handleDroppedFile(const std::string &path)
+        {
+            showModsOutcome(path, ps2x_host_mods::handleDropped(path), "file dropped");
+        }
+
+        void SDLCALL onSavePicked(void *, const char *const *files, int)
+        {
+            std::lock_guard<std::mutex> lock(imports.mutex);
+            imports.dialogOpen = false;
+            if (!files)
+                imports.failed = SDL_GetError(); // an error, not a cancel (a cancel is an empty list)
+            else if (files[0] && files[0][0])
+                imports.picked = files[0];
+        }
+
+        // The button: opens the file window and returns the line for the status row. PS2X_TEST_IMPORT_FILE=<path> stands in for the window
+        // (tests cannot drive a native dialog): the button then imports that file.
+        std::string startImportDialog()
+        {
+            if (const char *forced = std::getenv("PS2X_TEST_IMPORT_FILE"); forced && forced[0])
+            {
+                std::lock_guard<std::mutex> lock(imports.mutex);
+                imports.picked = forced;
+                return "Importing the file PS2X_TEST_IMPORT_FILE names.";
+            }
+            {
+                std::lock_guard<std::mutex> lock(imports.mutex);
+                if (imports.dialogOpen)
+                    return "The file window is already open.";
+                imports.dialogOpen = true;
+            }
+            static const SDL_DialogFileFilter filters[] = {{"Saves and memory cards", "max;psu;xps;sps;cbs;psv;ps2;mc2;bin"}, {"All files", "*"}};
+            SDL_ShowOpenFileDialog(onSavePicked, nullptr, g.window, filters, 2, nullptr, false);
+            return "Choose the save file in the window that opened.";
+        }
+
+        // Main thread, every update(): a path the file window returned.
+        void pumpPickedImport()
+        {
+            std::string path, failed;
+            {
+                std::lock_guard<std::mutex> lock(imports.mutex);
+                path.swap(imports.picked);
+                failed.swap(imports.failed);
+            }
+            if (!failed.empty())
+            {
+                ps2x_host_mods::DropOutcome outcome;
+                outcome.handled = true;
+                outcome.message = "The file window could not open (" + failed + "). Drop the save file on the game window instead.";
+                std::printf("[ui] %s\n", outcome.message.c_str());
+                std::fflush(stdout);
+                showModsOutcome(std::string(), outcome, "file window failed");
+            }
+            if (!path.empty())
+            {
+                std::printf("[ui] save chosen: %s\n", path.c_str());
+                std::fflush(stdout);
+                importAndShow(path, std::string());
+            }
         }
 
         // PS2X_TEST_DROP=<file>: for scripted runs. Each line the script appends to the file is "drop <path>" (the rest of the line is
@@ -465,6 +577,27 @@ namespace ps2x_host::ui
                     std::printf("[ui] PS2X_TEST_DROP: dropping %s\n", line.c_str() + 5);
                     std::fflush(stdout);
                     handleDroppedFile(line.substr(5));
+                }
+                else if (line.compare(0, 7, "import ") == 0)
+                {
+                    // What the file window does when the player picks a file: the Import a Save... button, without the native window.
+                    std::printf("[ui] PS2X_TEST_DROP: picking %s in the file window\n", line.c_str() + 7);
+                    std::fflush(stdout);
+                    std::lock_guard<std::mutex> lock(imports.mutex);
+                    imports.picked = line.substr(7);
+                }
+                else if (line.compare(0, 7, "choose ") == 0)
+                {
+                    // The answer to "Which save?": the folder name of the save chosen.
+                    std::string path;
+                    {
+                        std::lock_guard<std::mutex> lock(imports.mutex);
+                        path = imports.choosePath;
+                    }
+                    std::printf("[ui] PS2X_TEST_DROP: choosing %s%s\n", line.c_str() + 7, path.empty() ? " (no question is open)" : "");
+                    std::fflush(stdout);
+                    if (!path.empty())
+                        importAndShow(path, line.substr(7));
                 }
                 return;
             }
@@ -629,6 +762,7 @@ namespace ps2x_host::ui
             g.closeRequested = false;
             closeOverlay("Back");
         }
+        pumpPickedImport(); // a save picked in the file window (Mods tab > Import a Save...)
         // Test hook (tests only): open the menu the moment the game has a file open for writing on the card. With
         // PS2X_TEST_CARD_HOLD_MS (the stubs) the game waits there, so the menu is open in the middle of a save.
         if (g.testOpenOnCardWrite && !g.visible.load() && cardActivityState().writeHandlesOpen.load() > 0)

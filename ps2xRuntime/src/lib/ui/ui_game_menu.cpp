@@ -94,6 +94,8 @@ namespace ps2x::ui
                 tools.keepCard = [this]() { return host->keepCard(); };
                 tools.canBackToOwnCard = [this]() { return host->canBackToOwnCard(); };
                 tools.backToOwnCard = [this]() { return host->backToOwnCard(); };
+                tools.canImportSave = [this]() { return host->canImportSave(); };
+                tools.importSave = [this]() { return host->importSave(); };
                 mods.setTools(std::move(tools));
                 modsAttached = true;
             }
@@ -249,18 +251,42 @@ namespace ps2x::ui
             m_impl->refresh();
     }
 
-    void GameMenu::showMods(const std::string &message)
+    void GameMenu::showMods(const std::string &message, const std::string &selectKey)
     {
 #if defined(PS2X_UI_MODS)
         if (!ready() || !m_impl->loadPage() || !m_impl->modsAttached)
             return;
         m_impl->page.selectTab("mods");
+        if (!selectKey.empty())
+            m_impl->mods.selectMod(selectKey);
         m_impl->mods.refresh();
         m_impl->mods.setStatus(message);
         m_impl->refresh();
         m_impl->mods.focusList();
 #else
         (void)message;
+        (void)selectKey;
+#endif
+    }
+
+    void GameMenu::askWhichSave(const std::string &body, const std::vector<std::string> &labels, std::function<void(size_t)> picked)
+    {
+#if defined(PS2X_UI_MODS)
+        if (!ready() || !m_impl->loadPage() || !m_impl->modsAttached)
+            return;
+        m_impl->mods.askWhichSave(body, labels, std::move(picked));
+#else
+        (void)body;
+        (void)labels;
+        (void)picked;
+#endif
+    }
+
+    void GameMenu::closeQuestion()
+    {
+#if defined(PS2X_UI_MODS)
+        if (m_impl && m_impl->built && m_impl->modsAttached)
+            m_impl->mods.closeConfirm();
 #endif
     }
 

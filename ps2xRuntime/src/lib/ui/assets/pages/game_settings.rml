@@ -85,6 +85,7 @@
                         <div id="dev-folder"></div>
                     </div>
                     <div id="mods-tools">
+                        <div class="mbtn small wide" id="import-save" data-help="Import a community save as a data pack (or drop it on the window).">Import a Save...</div>
                         <div class="mbtn small" id="keep-card" data-help="Copy the profile card's save to your own card (asks first).">Keep Card</div>
                         <div class="mbtn small" id="back-card" data-help="Play from your own memory card from the next start (asks first).">Back to My Card</div>
                         <div class="mbtn small" id="dump-textures" data-help="For modders: save this screen's textures and text to a dumps folder.">Dump Textures</div>
@@ -115,6 +116,9 @@
             <div id="mod-confirm-text"></div>
             <div id="mod-confirm-buttons">
                 <div class="button" id="mod-confirm-yes" data-help="Move the mod's file to the .trash folder.">Uninstall</div>
+                <!-- The "which save?" question has up to three answers; these two are shown only then. -->
+                <div class="button hidden" id="mod-confirm-alt1" data-help="Import this save.">Second</div>
+                <div class="button hidden" id="mod-confirm-alt2" data-help="Import this save.">Third</div>
                 <div class="button" id="mod-confirm-no" data-help="Keep the mod.">Cancel</div>
             </div>
         </div>

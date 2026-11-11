@@ -48,7 +48,7 @@ add_library(ps2_test_lib STATIC
 # The mod layer's tests (src/lib/mods) exist when the build has the mod manager (PS2X_BUILD_MODS). The tests use only the
 # manager's own headers and the static library; the game build does not include ps2xTest.
 if(TARGET ps2_mods)
-    target_sources(ps2_test_lib PRIVATE src/mod_manager_tests.cpp src/data_pack_tests.cpp)
+    target_sources(ps2_test_lib PRIVATE src/mod_manager_tests.cpp src/data_pack_tests.cpp src/save_container_tests.cpp src/save_import_tests.cpp)
     target_link_libraries(ps2_test_lib PRIVATE ps2_mods)
     target_compile_definitions(ps2_test_lib PRIVATE PS2X_HAS_MODS_TESTS=1)
 endif()

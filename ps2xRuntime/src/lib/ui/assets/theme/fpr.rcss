@@ -455,13 +455,13 @@ body
 {
     display: flex;
     flex-direction: row;
-    height: 318dp;
+    height: 296dp;
 }
 
 #mods-list
 {
     width: 330dp;
-    height: 318dp;
+    height: 296dp;
     margin-right: 14dp;
     overflow-y: auto;
 }
@@ -546,13 +546,13 @@ body
 #mod-details
 {
     flex: 1 1 0;
-    height: 318dp;
+    height: 296dp;
 }
 
 /* Everything but the buttons scrolls (a long description, many settings); the buttons below stay in view. */
 #mod-info
 {
-    height: 266dp;
+    height: 244dp;
     overflow-y: auto;
 }
 
@@ -753,10 +753,10 @@ body
 
 #mods-status
 {
-    height: 22dp;
+    height: 44dp;
     margin-top: 8dp;
     overflow: hidden;
-    white-space: nowrap;
+    white-space: normal;
     font-size: 17dp;
     font-weight: normal;
     letter-spacing: 0.5dp;
@@ -826,6 +826,12 @@ body
     margin-left: 5dp;
     font-size: 14dp;
     letter-spacing: 0.5dp;
+}
+
+/* Import a Save... has the longest label of the small buttons. */
+.mbtn.small.wide
+{
+    width: 140dp;
 }
 
 /* Scroll bars (a list or a details page longer than its box): a cream-framed trough with the blue thumb of the game's own lists. */

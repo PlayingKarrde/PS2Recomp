@@ -206,6 +206,15 @@ namespace ps2x::ui
             line->SetInnerRML(text(message));
     }
 
+    void ModsPage::selectMod(const std::string &key)
+    {
+        if (m_manager && m_manager->find(key))
+        {
+            m_selected = key;
+            m_picture = 0;
+        }
+    }
+
     void ModsPage::refresh()
     {
         if (!m_document || !m_manager)
@@ -301,7 +310,8 @@ namespace ps2x::ui
         {
             details->SetInnerRML("<div id=\"mod-title\">Mods</div>"
                                  "<div id=\"mod-desc\">Mods add things to the game. To install one, drop its .fprmod file on the game window, "
-                                 "or copy it into the mods folder shown below.</div>");
+                                 "or copy it into the mods folder shown below. To use a community save (.max, .psu, .ps2 ...), drop it on the "
+                                 "window too, or press Import a Save...</div>");
             return;
         }
         const ModInfo &m = *info;
@@ -671,6 +681,49 @@ namespace ps2x::ui
             button->SetProperty("display", m_tools.canKeepCard && m_tools.keepCard && m_tools.canKeepCard() ? "block" : "none");
         if (Rml::Element *button = byId("back-card"))
             button->SetProperty("display", m_tools.canBackToOwnCard && m_tools.backToOwnCard && m_tools.canBackToOwnCard() ? "block" : "none");
+        if (Rml::Element *button = byId("import-save"))
+            button->SetProperty("display", m_tools.canImportSave && m_tools.importSave && m_tools.canImportSave() ? "block" : "none");
+    }
+
+    // "Which save?": the layer of the other questions with one button per save. The buttons are #mod-confirm-yes, #mod-confirm-alt1 and
+    // #mod-confirm-alt2; Cancel has the focus, as in the other questions.
+    void ModsPage::askWhichSave(const std::string &body, const std::vector<std::string> &labels, std::function<void(size_t)> picked)
+    {
+        if (labels.empty() || m_confirming)
+            return;
+        openCardConfirm(Ask::PickSave, "Which save?", text(body).c_str(), text(labels[0]).c_str(), "Import this save.");
+        if (!m_confirming)
+            return;
+        m_picked = std::move(picked);
+        const char *ids[2] = {"mod-confirm-alt1", "mod-confirm-alt2"};
+        for (size_t i = 0; i < 2; ++i)
+        {
+            Rml::Element *button = byId(ids[i]);
+            if (!button)
+                continue;
+            const bool used = labels.size() > i + 1;
+            if (used)
+                button->SetInnerRML(text(labels[i + 1]));
+            button->SetClass("hidden", !used);
+        }
+        if (Rml::Element *yes = byId("mod-confirm-yes"))
+            yes->SetInnerRML(text(labels[0]));
+        m_document->UpdateDocument();
+        if (Rml::Element *cancel = byId("mod-confirm-no"))
+            cancel->Focus(true);
+    }
+
+    // The player picked save `index` in the question: close it and tell the host.
+    void ModsPage::leavePick(size_t index)
+    {
+        leaveConfirm(false);
+        // The focus goes back to the button that started it; the host then shows the answer, which moves it to the list.
+        if (Rml::Element *button = byId("import-save"))
+            button->Focus(true);
+        const auto picked = std::move(m_picked);
+        m_picked = nullptr;
+        if (picked)
+            picked(index);
     }
 
     void ModsPage::leaveConfirm(bool refocus)
@@ -684,8 +737,18 @@ namespace ps2x::ui
             window->SetClass("confirming", false);
         if (Rml::Element *confirm = byId("mod-confirm"))
             confirm->SetClass("hidden", true);
+        for (const char *id : {"mod-confirm-alt1", "mod-confirm-alt2"})
+            if (Rml::Element *button = byId(id))
+                button->SetClass("hidden", true);
+        if (was == Ask::PickSave && refocus)
+            m_picked = nullptr; // cancelled
         m_document->UpdateDocument();
-        if (refocus)
+        if (refocus && was == Ask::PickSave)
+        {
+            if (Rml::Element *button = byId("import-save"))
+                button->Focus(true);
+        }
+        else if (refocus)
         {
             if (was == Ask::KeepCard || was == Ask::BackToOwnCard)
             {
@@ -763,9 +826,20 @@ namespace ps2x::ui
                     leaveConfirm(true);
                     return;
                 }
+                if (e->GetId() == "import-save" && !m_confirming)
+                {
+                    const std::string said = m_tools.importSave ? m_tools.importSave() : std::string();
+                    setStatus(said.empty() ? "Importing a save is not available." : said);
+                    return;
+                }
                 if (e->GetId() == "keep-card" && !m_confirming)
                 {
                     openKeepConfirm();
+                    return;
+                }
+                if ((e->GetId() == "mod-confirm-alt1" || e->GetId() == "mod-confirm-alt2") && m_confirming && m_ask == Ask::PickSave)
+                {
+                    leavePick(e->GetId() == "mod-confirm-alt1" ? 1 : 2);
                     return;
                 }
                 if (e->GetId() == "back-card" && !m_confirming)
@@ -777,6 +851,11 @@ namespace ps2x::ui
                 {
                     if (!m_confirming)
                         return;
+                    if (m_ask == Ask::PickSave)
+                    {
+                        leavePick(0);
+                        return;
+                    }
                     if (m_ask == Ask::KeepCard)
                     {
                         leaveConfirm(false);

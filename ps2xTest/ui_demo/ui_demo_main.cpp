@@ -46,6 +46,9 @@
 //                 it is applied, as at a game start. --expect then also understands mods-on, mods-active, mods-order (comma
 //                 lists of mod ids), mods-restart (1 or 0), mods-status, selected-mod, mod-title, mod-problem, mod-confirm,
 //                 restart-note and mods-count. `drop:PATH` as a script step installs a file as a drop on the window would.
+//                 Task s4b: --card-buttons import shows the Import a Save... button (--expect import-save=shown, import-asked=1 once it
+//                 was pressed); the script step `pick:LABEL|LABEL|LABEL` shows the "Which save?" question with those buttons, and
+//                 --expect picked=N says which one was answered (-1 before an answer).
 //   --window      with --script or --png: open a window anyway, so the frames go through the swapchain. The PNG is
 //                 then taken from a second, offscreen draw of the same frame.
 //
@@ -475,6 +478,16 @@ namespace
             return "From the next start the game plays from your own card. The profile card stays on disk; turn a data pack on to use it again.";
         }
         bool backDone = false;
+        // Task s4b: the Import a Save... button, and the answer to "Which save?".
+        bool importShown = false, importAsked = false;
+        int picked = -1;
+        bool canImportSave() override { return importShown; }
+        std::string importSave() override
+        {
+            importAsked = true;
+            std::printf("import a save\n");
+            return "Choose the save file in the window that opened.";
+        }
         std::vector<ControlLine> controls() override
         {
             return {{"Move", "Arrow keys, W A S D", "D-pad, left stick"}, {"Cross", "X, Space", "A (bottom button)"},
@@ -744,6 +757,26 @@ namespace
             return false;
 #endif
         }
+        else if (name == "pick")
+        {
+            // The question "Which save?" with the labels in arg, separated by |.
+            std::vector<std::string> labels;
+            size_t from = 0;
+            while (from <= arg.size())
+            {
+                const size_t bar = arg.find('|', from);
+                labels.push_back(arg.substr(from, bar == std::string::npos ? std::string::npos : bar - from));
+                if (bar == std::string::npos)
+                    break;
+                from = bar + 1;
+            }
+            d.menu.askWhichSave("That file holds " + std::to_string(labels.size()) + " saves of the game. Which one do you want to import?", labels,
+                                [&d](size_t index) {
+                                    d.fake.picked = static_cast<int>(index);
+                                    std::printf("picked %zu\n", index);
+                                });
+            d.frames(static_cast<int>(kSettleFrames), false);
+        }
         else if (name == "move" || name == "click")
         {
             float x = 0, y = 0;
@@ -845,7 +878,11 @@ namespace
             Rml::Element *element = document->GetElementById("mods-card");
             return element ? element->GetInnerRML() : std::string("(no element)");
         }
-        if (key == "back-card" || key == "keep-card")
+        if (key == "import-asked")
+            return d.fake.importAsked ? "1" : "0";
+        if (key == "picked")
+            return std::to_string(d.fake.picked);
+        if (key == "back-card" || key == "keep-card" || key == "import-save")
         {
             Rml::Element *element = document->GetElementById(key);
             if (!element)
@@ -1040,6 +1077,7 @@ int main(int argc, char **argv)
         d.fake.devLineText = opt.devLine;
         d.fake.keepShown = opt.cardButtons.find("keep") != std::string::npos;
         d.fake.backShown = opt.cardButtons.find("back") != std::string::npos;
+        d.fake.importShown = opt.cardButtons.find("import") != std::string::npos;
 #if defined(PS2X_DEMO_MODS)
         if (!opt.modsDir.empty())
         {
@@ -1181,7 +1219,7 @@ int main(int argc, char **argv)
                 if (opt.menu && (key == "focus" || key == "confirm" || key == "quit-locked" || key == "help" || key == "tab" ||
                                  key == "mod-confirm" || key == "selected-mod" || key == "mods-status" || key == "mod-title" ||
                                  key == "mod-problem" || key == "restart-note" || key == "mods-card" || key == "back-card" || key == "keep-card" ||
-                                 key == "back-asked"))
+                                 key == "back-asked" || key == "import-save" || key == "import-asked" || key == "picked"))
                     got = menuState(d, key);
 #if defined(PS2X_DEMO_MODS)
                 if (opt.menu && d.fake.manager && (key == "mods-on" || key == "mods-active" || key == "mods-order" || key == "mods-restart" || key == "mods-count"))

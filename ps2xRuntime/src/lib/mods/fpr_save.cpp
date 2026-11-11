@@ -5,6 +5,7 @@
 #include <cstring>
 #include <fstream>
 #include <iterator>
+#include <unordered_map>
 
 namespace ps2x::mods::fpr
 {
@@ -87,6 +88,57 @@ namespace ps2x::mods::fpr
         for (int i = 0; i < 8; ++i)
             std::snprintf(text + i * 8, 9, "%08x", state[i]);
         return std::string(text, 64);
+    }
+
+    // ---- SHA-1 -----------------------------------------------------------------------------------------------------------
+
+    std::string sha1Hex(const uint8_t *data, size_t size)
+    {
+        uint32_t h[5] = {0x67452301u, 0xEFCDAB89u, 0x98BADCFEu, 0x10325476u, 0xC3D2E1F0u};
+        auto rotl = [](uint32_t x, int n) { return (x << n) | (x >> (32 - n)); };
+        auto block = [&](const uint8_t *p) {
+            uint32_t w[80];
+            for (int i = 0; i < 16; ++i)
+                w[i] = (static_cast<uint32_t>(p[i * 4]) << 24) | (static_cast<uint32_t>(p[i * 4 + 1]) << 16) | (static_cast<uint32_t>(p[i * 4 + 2]) << 8) |
+                       static_cast<uint32_t>(p[i * 4 + 3]);
+            for (int i = 16; i < 80; ++i)
+                w[i] = rotl(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
+            uint32_t a = h[0], b = h[1], c = h[2], d = h[3], e = h[4];
+            for (int i = 0; i < 80; ++i)
+            {
+                uint32_t f, k;
+                if (i < 20) { f = (b & c) | (~b & d); k = 0x5A827999u; }
+                else if (i < 40) { f = b ^ c ^ d; k = 0x6ED9EBA1u; }
+                else if (i < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8F1BBCDCu; }
+                else { f = b ^ c ^ d; k = 0xCA62C1D6u; }
+                const uint32_t t = rotl(a, 5) + f + e + k + w[i];
+                e = d;
+                d = c;
+                c = rotl(b, 30);
+                b = a;
+                a = t;
+            }
+            h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e;
+        };
+        size_t offset = 0;
+        for (; offset + 64 <= size; offset += 64)
+            block(data + offset);
+        uint8_t tail[128] = {};
+        const size_t rest = size - offset;
+        if (rest)
+            std::memcpy(tail, data + offset, rest);
+        tail[rest] = 0x80;
+        const size_t tailSize = rest + 1 + 8 <= 64 ? 64 : 128;
+        const uint64_t bits = static_cast<uint64_t>(size) * 8;
+        for (int i = 0; i < 8; ++i)
+            tail[tailSize - 1 - static_cast<size_t>(i)] = static_cast<uint8_t>(bits >> (8 * i));
+        block(tail);
+        if (tailSize == 128)
+            block(tail + 64);
+        char text[41];
+        for (int i = 0; i < 5; ++i)
+            std::snprintf(text + i * 8, 9, "%08x", h[i]);
+        return std::string(text, 40);
     }
 
     // ---- the CRC table and the integrity data ----------------------------------------------------------------------------
@@ -314,6 +366,150 @@ namespace ps2x::mods::fpr
             }
         }
         return true;
+    }
+
+    namespace
+    {
+        // Code page 932 bytes (one or two, as a number) to a code point: the inverse of kCp932. Where several code points encode to the
+        // same bytes (U+00A2 and U+FFE0 both give 0x8191) the codec's decoder answers with the larger one, which is the rule here too
+        // (checked against Python's cp932 decoder for every entry of the table).
+        const std::unordered_map<uint16_t, uint32_t> &cp932Decode()
+        {
+            static const std::unordered_map<uint16_t, uint32_t> map = []() {
+                std::unordered_map<uint16_t, uint32_t> m;
+                m.reserve(std::size(kCp932) * 2);
+                for (const uint32_t entry : kCp932) // sorted by code point, so a later (larger) one replaces an earlier
+                    m[static_cast<uint16_t>(entry & 0xFFFF)] = entry >> 16;
+                return m;
+            }();
+            return map;
+        }
+    }
+
+    bool decodeGameBytes(const uint8_t *bytes, size_t size, std::vector<uint32_t> &out)
+    {
+        out.clear();
+        const auto &map = cp932Decode();
+        size_t i = 0;
+        while (i < size)
+        {
+            const uint8_t b = bytes[i];
+            if (b < 0x80)
+            {
+                out.push_back(b);
+                ++i;
+                continue;
+            }
+            if (i + 1 < size)
+            {
+                const auto two = map.find(static_cast<uint16_t>((b << 8) | bytes[i + 1]));
+                if (two != map.end())
+                {
+                    out.push_back(two->second);
+                    i += 2;
+                    continue;
+                }
+            }
+            const auto one = map.find(b);
+            if (one == map.end())
+                return false;
+            out.push_back(one->second);
+            ++i;
+        }
+        return true;
+    }
+
+    std::string encodeUtf8(const std::vector<uint32_t> &codePoints)
+    {
+        std::string out;
+        for (const uint32_t cp : codePoints)
+        {
+            if (cp < 0x80)
+            {
+                out += static_cast<char>(cp);
+            }
+            else if (cp < 0x800)
+            {
+                out += static_cast<char>(0xC0 | (cp >> 6));
+                out += static_cast<char>(0x80 | (cp & 0x3F));
+            }
+            else if (cp < 0x10000)
+            {
+                out += static_cast<char>(0xE0 | (cp >> 12));
+                out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+                out += static_cast<char>(0x80 | (cp & 0x3F));
+            }
+            else
+            {
+                out += static_cast<char>(0xF0 | (cp >> 18));
+                out += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
+                out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+                out += static_cast<char>(0x80 | (cp & 0x3F));
+            }
+        }
+        return out;
+    }
+
+    namespace
+    {
+        // Characters whose NFKC form cannot be written back to their bytes; sorted. Generated by gen_nfkc_breaks.py.
+        const uint32_t kNfkcBreaks[] = {
+#include "nfkc_breaks.inc"
+        };
+    }
+
+    std::string fieldTextOrHex(const uint8_t *field, size_t width, bool *isHex)
+    {
+        size_t n = 0;
+        while (n < width && field[n] != 0)
+            ++n;
+        auto hex = [&]() {
+            if (isHex)
+                *isHex = true;
+            static const char digits[] = "0123456789abcdef";
+            std::string h;
+            for (size_t i = 0; i < n; ++i)
+            {
+                h += digits[field[i] >> 4];
+                h += digits[field[i] & 15];
+            }
+            return h;
+        };
+        if (isHex)
+            *isHex = false;
+        std::vector<uint32_t> shown;
+        if (!decodeGameBytes(field, n, shown))
+            return hex();
+        // Python tries NFKC(text) first and the decoded text second (tools/fprsave.py field_value). NFKC of a code page 932 string
+        // means: the full-width ASCII block and the ideographic space become ASCII, U+FFE0 to U+FFE2 become the cent, pound and not
+        // signs, and every other character the page holds is left alone EXCEPT the ones in kNfkcBreaks (Roman numerals, circled
+        // digits, half-width katakana, the diaeresis, ...): their NFKC form cannot be written back to the same bytes, so the first
+        // try fails for the whole field, whatever else is in it, and the text is shown as decoded (nfkc_breaks.inc, gen_nfkc_breaks.py).
+        const uint32_t *const breaksBegin = std::begin(kNfkcBreaks);
+        const uint32_t *const breaksEnd = std::end(kNfkcBreaks);
+        bool combining = false;
+        std::vector<uint32_t> plain = shown;
+        for (uint32_t &cp : plain)
+        {
+            if (std::binary_search(breaksBegin, breaksEnd, cp))
+                combining = true;
+            else if (cp >= 0xFF01 && cp <= 0xFF5E)
+                cp -= 0xFEE0;
+            else if (cp == 0x3000)
+                cp = 0x20;
+            else if (cp == 0xFFE0)
+                cp = 0xA2;
+            else if (cp == 0xFFE1)
+                cp = 0xA3;
+            else if (cp == 0xFFE2)
+                cp = 0xAC;
+        }
+        std::vector<uint8_t> back;
+        if (!combining && encodeGameText(plain, back) && back.size() == n && std::equal(back.begin(), back.end(), field))
+            return encodeUtf8(plain);
+        if (encodeGameText(shown, back) && back.size() == n && std::equal(back.begin(), back.end(), field))
+            return encodeUtf8(shown);
+        return hex();
     }
 
     // ---- fields ----------------------------------------------------------------------------------------------------------
