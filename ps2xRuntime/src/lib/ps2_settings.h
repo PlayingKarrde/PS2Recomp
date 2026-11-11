@@ -43,7 +43,7 @@ namespace ps2x_settings
     };
 
     // renderer (gpu|cpu), resolution (1..4), aspect (4:3|16:9|21:9), fullscreen (on|off), vsync (on|off),
-    // filter (sharp|linear), volume (0..100)
+    // filter (sharp|linear), volume (0..100), texture_tools (on|off), skip_intros (on|off: start at the title screen, task i1)
     const std::vector<Definition> &definitions();
     const Definition *find(const std::string &key);
 

@@ -122,6 +122,17 @@ void register_ui_settings_tests()
             t.Equals(valueFromEnvironment("texture_tools", "0").value_or(""), std::string("off"), "PS2X_AUTHORING=0 is off");
             const ps2x_settings::Definition *tools = ps2x_settings::find("texture_tools");
             t.IsTrue(tools && std::string(tools->envName) == "PS2X_AUTHORING", "the setting is fixed by PS2X_AUTHORING");
+
+            // skip the logos and the opening movie (task i1): off is the default and sets nothing, on is PS2X_SKIP_INTROS=1
+            t.IsFalse(environmentFromValue("skip_intros", "off").has_value(), "skip intros default");
+            t.Equals(environmentFromValue("skip_intros", "on").value_or(""), std::string("1"), "skip intros on");
+            t.IsFalse(environmentFromValue("skip_intros", "maybe").has_value(), "skip intros nonsense is refused");
+            t.Equals(valueFromEnvironment("skip_intros", "1").value_or(""), std::string("on"), "PS2X_SKIP_INTROS=1 is on");
+            t.Equals(valueFromEnvironment("skip_intros", "0").value_or(""), std::string("off"), "PS2X_SKIP_INTROS=0 is off");
+            t.IsFalse(valueFromEnvironment("skip_intros", "soon").has_value(), "PS2X_SKIP_INTROS nonsense means nothing");
+            const ps2x_settings::Definition *intros = ps2x_settings::find("skip_intros");
+            t.IsTrue(intros && std::string(intros->envName) == "PS2X_SKIP_INTROS" && std::string(intros->defaultValue) == "off",
+                     "the setting is fixed by PS2X_SKIP_INTROS and is off by default");
         });
 
         tc.Run("the file's values reach the environment, an environment variable wins, and a save round-trips", [](TestCase &t)
