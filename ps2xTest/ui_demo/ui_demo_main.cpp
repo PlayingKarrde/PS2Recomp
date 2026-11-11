@@ -20,6 +20,9 @@
 //                   lsup lsdown lsleft lsright         left stick pushed and released
 //                   key:NAME                           a keyboard key by its SDL name (Tab, Return, Escape, ...)
 //                   move:X,Y   click:X,Y               mouse, in window pixels
+//                   move:@SEL  click:@SEL              mouse, at the middle of the first element that matches an RCSS selector
+//                                                      (click:@#quit, click:@.tab.selected; "panel" is the content box showing;
+//                                                      "SEL|3" is the third match, click:@.mod|3)
 //                   drag:X0,Y0,X1,Y1                   press, move and release the left button (sliders)
 //                   wait:N                             N more frames
 //                 Real controllers are ignored while a script runs.
@@ -40,7 +43,8 @@
 //                 (its text), back-card and keep-card (shown or hidden) and back-asked (1 once the Back to My Card question was answered Yes). Besides the setting
 //                 values, --expect understands focus (the id of the focused element), confirm (shown or hidden: the
 //                 Quit Game question), quit (asked, once Quit was confirmed), quit-locked (1 or empty), help (the
-//                 help line's text) and tab (the selected tab).
+//                 help line's text) and tab (the selected tab). Task u3: rect:SELECTOR (the element's box in window pixels, "x y w h",
+//                 or (none); for example rect:#header, rect:panel) and scale (the overlay's UI scale).
 //   --mods-dir DIR [--mods-state FILE]   with --menu: give the menu a mod manager on that mods folder (src/lib/mods), so the
 //                 Mods tab is there. The state file (default DIR/../mods.toml) decides which mods are on; a theme mod that is on in
 //                 it is applied, as at a game start. --expect then also understands mods-on, mods-active, mods-order (comma
@@ -429,7 +433,8 @@ namespace
     struct FakeHost final : MenuHost
     {
         std::map<std::string, std::string> values{{"renderer", "gpu"},   {"resolution", "1"}, {"aspect", "4:3"}, {"fullscreen", "off"},
-                                                  {"vsync", "off"},      {"filter", "sharp"},  {"volume", "100"}};
+                                                  {"vsync", "off"},      {"filter", "sharp"},  {"volume", "100"},  {"texture_tools", "off"},
+                                                  {"skip_intros", "off"}};
         std::map<std::string, std::string> startup;
         std::map<std::string, std::string> env;
         bool closeAsked = false;
@@ -701,6 +706,41 @@ namespace
         return s;
     }
 
+    // The page the demo is showing: the menu's in --menu mode, else the demo page.
+    Rml::ElementDocument *currentDocument(Demo &d)
+    {
+        Rml::Context *context = d.overlay().context();
+        return context && context->GetNumDocuments() > 0 ? context->GetDocument(0) : nullptr;
+    }
+
+    // The first element that matches an RCSS selector ("#quit", ".tab.selected"). "panel" is the content box that is showing (the
+    // .panel without the class "hidden"); a hidden element has no box, so the answer is nullptr for one.
+    Rml::Element *findElement(Demo &d, const std::string &selector)
+    {
+        Rml::ElementDocument *document = currentDocument(d);
+        if (!document)
+            return nullptr;
+        if (selector == "panel")
+        {
+            Rml::ElementList panels;
+            document->QuerySelectorAll(panels, ".panel");
+            for (Rml::Element *panel : panels)
+                if (!panel->IsClassSet("hidden"))
+                    return panel;
+            return nullptr;
+        }
+        // "SELECTOR|N": the Nth match (counting from 1), for lists of rows (".mod|3").
+        const size_t bar = selector.rfind('|');
+        if (bar != std::string::npos)
+        {
+            Rml::ElementList matches;
+            document->QuerySelectorAll(matches, selector.substr(0, bar));
+            const size_t n = static_cast<size_t>(std::max(1, std::atoi(selector.c_str() + bar + 1)));
+            return n <= matches.size() ? matches[n - 1] : nullptr;
+        }
+        return document->QuerySelector(selector);
+    }
+
     // Runs one scripted step: pushes its events, draws frames, writes the PNG. Returns false if the step is unknown.
     bool runStep(Demo &d, const std::string &step, int number)
     {
@@ -780,7 +820,21 @@ namespace
         else if (name == "move" || name == "click")
         {
             float x = 0, y = 0;
-            if (std::sscanf(arg.c_str(), "%f,%f", &x, &y) != 2)
+            if (!arg.empty() && arg[0] == '@')
+            {
+                // The middle of the first element that matches a selector ("click:@#quit"), so a script does not depend on the layout.
+                Rml::Element *target = findElement(d, arg.substr(1));
+                if (!target || target->GetClientWidth() <= 0.0f)
+                {
+                    std::fprintf(stderr, "FAIL no visible element for '%s'\n", arg.c_str());
+                    return false;
+                }
+                const Rml::Vector2f at = target->GetAbsoluteOffset(Rml::BoxArea::Border);
+                const Rml::Vector2f size = target->GetBox().GetSize(Rml::BoxArea::Border);
+                x = at.x + size.x * 0.5f;
+                y = at.y + size.y * 0.5f;
+            }
+            else if (std::sscanf(arg.c_str(), "%f,%f", &x, &y) != 2)
                 return false;
             mouseMove(x, y);
             d.frames(2, false);
@@ -861,6 +915,26 @@ namespace
             if (focus->IsClassSet("mrow"))
                 return "setting:" + focus->GetAttribute<Rml::String>("data-setting", "");
             return "(unnamed)";
+        }
+        if (key.compare(0, 5, "rect:") == 0)
+        {
+            // "rect:#header" or "rect:panel": the element's border box in window pixels as "x y w h" (rounded), "(none)" if it is
+            // missing or not shown. Check scripts compare these across tabs and sizes.
+            Rml::Element *element = findElement(d, key.substr(5));
+            if (!element || element->GetClientWidth() <= 0.0f)
+                return "(none)";
+            const Rml::Vector2f at = element->GetAbsoluteOffset(Rml::BoxArea::Border);
+            const Rml::Vector2f size = element->GetBox().GetSize(Rml::BoxArea::Border);
+            char text[96];
+            std::snprintf(text, sizeof(text), "%d %d %d %d", static_cast<int>(std::lround(at.x)), static_cast<int>(std::lround(at.y)),
+                          static_cast<int>(std::lround(size.x)), static_cast<int>(std::lround(size.y)));
+            return text;
+        }
+        if (key == "scale")
+        {
+            char text[32];
+            std::snprintf(text, sizeof(text), "%.3f", d.overlay().scale());
+            return text;
         }
         if (key == "mod-confirm")
         {
@@ -1216,7 +1290,7 @@ int main(int argc, char **argv)
                 const std::string key = item.substr(0, eq);
                 const std::string want = item.substr(eq + 1);
                 std::string got = opt.menu ? d.fake.values[key] : d.page.value(key);
-                if (opt.menu && (key == "focus" || key == "confirm" || key == "quit-locked" || key == "help" || key == "tab" ||
+                if (opt.menu && (key.compare(0, 5, "rect:") == 0 || key == "scale" || key == "focus" || key == "confirm" || key == "quit-locked" || key == "help" || key == "tab" ||
                                  key == "mod-confirm" || key == "selected-mod" || key == "mods-status" || key == "mod-title" ||
                                  key == "mod-problem" || key == "restart-note" || key == "mods-card" || key == "back-card" || key == "keep-card" ||
                                  key == "back-asked" || key == "import-save" || key == "import-asked" || key == "picked"))

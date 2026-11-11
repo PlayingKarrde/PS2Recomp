@@ -17,11 +17,16 @@ namespace ps2x::ui
 {
     namespace
     {
-        // The UI is designed for a 720 pixel high window at scale 1.0 (1 dp = 1 pixel there).
+        // The UI is designed for a 720 pixel high window at scale 1.0 (1 dp = 1 pixel there). The page fills the whole window at any shape
+        // (it is a flex layout, see assets/theme/fpr.rcss), so the scale follows the window's height; the width only matters when the
+        // window is so narrow that the Mods tab would no longer fit: the page needs about 840 dp across.
         constexpr float kDesignHeight = 720.0f;
-        // The settings page is 960 dp wide; with margins the design needs 1000 dp. A window narrower than that (a portrait
-        // window, a 500 px wide one) scales the page down to fit its width instead of squeezing the text.
-        constexpr float kDesignWidth = 1000.0f;
+        constexpr float kDesignWidth = 840.0f;
+        // A small window would make the text too small to read (a 480 pixel high one would give 12 pixel text), so the scale does not
+        // fall under kSmallScale while the window is at least kLeastHeight dp high at that scale (the layout is 540 dp high at the
+        // least: the content box shrinks and scrolls). A window shorter than that scales down with its height again.
+        constexpr float kSmallScale = 0.75f;
+        constexpr float kLeastHeight = 540.0f;
 
         // RmlUi's window onto the platform: time, log, the mouse cursor and the clipboard, through SDL.
         class SystemInterface final : public Rml::SystemInterface
@@ -319,11 +324,12 @@ namespace ps2x::ui
         if (!m_impl || width <= 0 || height <= 0)
             return;
         Impl &s = *m_impl;
-        // Automatic scale: the smaller of height / 720 and width / 1000, rounded down to a multiple of 1/8. RmlUi builds a font atlas for every font
-        // size it is asked for and keeps it until shutdown, so a scale that followed every pixel of a window drag
-        // would pile up atlases (a resize storm left 60 textures alive); in steps there are few. Rounding down
-        // keeps the page inside the window.
-        const float fit = std::min(static_cast<float>(height) / kDesignHeight, static_cast<float>(width) / kDesignWidth);
+        // Automatic scale: height / 720 (see kSmallScale for small windows), but not so large that the page would be narrower than
+        // kDesignWidth, rounded down to a multiple of 1/8. RmlUi builds a font atlas for every font size it is asked for and keeps it
+        // until shutdown, so a scale that followed every pixel of a window drag would pile up atlases (a resize storm left 60
+        // textures alive); in steps there are few. Rounding down keeps the page inside the window.
+        const float byHeight = std::max(static_cast<float>(height) / kDesignHeight, std::min(kSmallScale, static_cast<float>(height) / kLeastHeight));
+        const float fit = std::min(byHeight, static_cast<float>(width) / kDesignWidth);
         const float effective = scale > 0.0f ? scale : std::max(0.25f, std::floor(fit * 8.0f) / 8.0f);
         if (width == s.width && height == s.height && effective == s.scale && scale == s.requestedScale)
             return;

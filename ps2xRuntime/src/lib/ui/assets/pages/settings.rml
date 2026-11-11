@@ -6,10 +6,12 @@
 <body>
     <div id="window">
         <div id="header">
-            <span id="brand">Fire Pro Wrestling Returns</span>
             <span id="page-title">Settings</span>
+            <span id="brand">Fire Pro Wrestling Returns</span>
         </div>
 
+        <!-- Everything under the title band is one column, centred, with a maximum width (#page in the theme). -->
+        <div id="page">
         <div id="tabs">
             <div class="tab selected" id="tab-graphics" data-tab="graphics" data-help="Picture options.">Graphics</div>
             <div class="tab" id="tab-controls" data-tab="controls" data-help="Controller options.">Controls</div>
@@ -85,11 +87,13 @@
             </div>
         </div>
 
+        <div id="notice"></div>
         <div id="help"><span id="help-text">Shape of the picture.</span></div>
 
         <div id="footer">
             <div id="hints"><span>A: Select</span><span>B: Back</span><span>LB / RB: Tab</span></div>
             <div class="button" id="back" data-help="Close the settings.">Back</div>
+        </div>
         </div>
     </div>
 </body>

@@ -4,12 +4,17 @@
     <link type="text/rcss" href="../theme/fpr.rcss"/>
 </head>
 <body>
+    <!-- The page fills the window. Top to bottom: the title band (the full width), then one centred column with the tabs, the content
+         box (one .panel per tab; the one showing takes all the room that is left, so every tab has the same frame), the restart
+         note, the help line and the footer. -->
     <div id="window">
         <div id="header">
-            <span id="brand">Fire Pro Wrestling Returns</span>
             <span id="page-title">Settings</span>
+            <span id="brand">Fire Pro Wrestling Returns</span>
         </div>
 
+        <!-- Everything under the title band is one column, centred, with a maximum width (#page in the theme). -->
+        <div id="page">
         <div id="tabs">
             <div class="tab selected" id="tab-graphics" data-tab="graphics" data-help="Picture options.">Graphics</div>
             <div class="tab" id="tab-audio" data-tab="audio" data-help="Sound options.">Audio</div>
@@ -47,9 +52,14 @@
                  data-help="Sharp keeps pixels crisp, Linear smooths them.">
                 <span class="label">Picture Filter</span><span class="tag"></span><span class="value">[Sharp]</span>
             </div>
-            <div class="row" data-kind="toggle" data-key="texture_tools" data-value="off" data-restart="1"
+            <div class="row" data-kind="toggle" data-key="texture_tools" data-name="Texture Tools" data-value="off" data-restart="1"
                  data-help="For modders: dump textures and see edits at once. Needs a restart.">
                 <span class="label">Texture Tools</span><span class="tag"></span><span class="value">[OFF]</span>
+            </div>
+            <!-- Task i1 owns the setting (key skip_intros, off by default); this row only shows and changes it. -->
+            <div class="row" data-kind="toggle" data-key="skip_intros" data-name="Skip Intros" data-value="off" data-restart="1"
+                 data-help="Start at the title screen without the opening logos and movie. Applies at the next start.">
+                <span class="label">Skip Intros</span><span class="tag"></span><span class="value">[OFF]</span>
             </div>
         </div>
 
@@ -106,6 +116,7 @@
                 <div class="button" id="back" data-help="Save the settings and go back to the game.">Back</div>
                 <div class="button" id="quit" data-help="Close the game and return to the desktop.">Quit Game</div>
             </div>
+        </div>
         </div>
     </div>
 

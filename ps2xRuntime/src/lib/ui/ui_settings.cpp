@@ -402,13 +402,11 @@ namespace ps2x::ui
         for (Rml::Element *panel : panels)
             panel->SetClass("hidden", panel->GetId() != "panel-" + name);
 
-        // A focused row inside a panel that just disappeared would leave the focus on an invisible element.
+        // A focused element (a row, or on the Mods tab a mod or a button) inside a panel that just disappeared would leave the focus on an
+        // invisible element: the directions would do nothing and A would act on something the player cannot see.
         Rml::Element *focus = m_document->GetFocusLeafNode();
-        if (Rml::Element *row = rowOf(focus))
-        {
-            if (Rml::Element *panel = panelOf(row); panel && panel->IsClassSet("hidden"))
-                focusFirstRow();
-        }
+        if (Rml::Element *panel = panelOf(focus); panel && panel->IsClassSet("hidden"))
+            focusFirstRow();
     }
 
     void SettingsPage::switchTab(int delta)

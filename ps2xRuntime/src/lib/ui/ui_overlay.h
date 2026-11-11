@@ -78,10 +78,11 @@ namespace ps2x::ui
         void shutdown();
         bool ready() const { return m_impl != nullptr; }
 
-        // The target's size in pixels, and the UI scale: 1.0 lays pages out as designed for a 720 pixel high, 1000 pixel
-        // wide window (RCSS `dp` units are scale pixels). scale <= 0 picks the smaller of height / 720 and width / 1000,
-        // rounded down to a multiple of 1/8, so the page keeps its proportions, fits a narrow window, and RmlUi does not
-        // build a font atlas for every window size on the way.
+        // The target's size in pixels, and the UI scale: 1.0 lays pages out as designed for a 720 pixel high window (RCSS `dp` units
+        // are scale pixels). The pages fill the whole window at any shape, so scale <= 0 follows the height (height / 720), with two
+        // limits: not larger than width / 840, so the page is never narrower than the Mods tab needs, and not under 0.75 unless the
+        // window is under 405 pixels high, so the text of a small window stays readable. The result is rounded down to a multiple of
+        // 1/8, so RmlUi does not build a font atlas for every window size on the way.
         void setViewport(int width, int height, float scale = 0.0f);
         int width() const;
         int height() const;

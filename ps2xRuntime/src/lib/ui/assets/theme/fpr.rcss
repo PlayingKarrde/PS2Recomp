@@ -1,24 +1,37 @@
 /*
- * Theme "fpr": the overlay's look, taken from the menus of Fire Pro Wrestling Returns.
+ * Theme "fpr": the overlay's look. It takes its colours from the menus of Fire Pro Wrestling Returns, and leaves its weight behind.
  *
  * What the game's own screens look like (from screenshots of its Options, wrestler select, edit and main menu):
- *   - panels: near-black translucent fill with a thick cream border (#d1caaf, about 4 px at 640x480) and rounded
- *     corners, drawn over a busy yellow and grey background;
- *   - the cursor is a bar across the row, a steel-blue vertical gradient (#2c68a3 at the top to #4d8cc6), with
- *     the row's text staying white;
- *   - all text is white, bold and italic, widely spaced, with a black drop shadow;
- *   - values sit at the right of a row in square brackets, "[Stereo]", "[85%]", "[OFF]";
- *   - a description of the highlighted row in a separate bar at the bottom ("Adjust sound options.");
- *   - the main menu's items are khaki bevelled bars (#c3bda4, light top edge, dark underside) under a gold band
- *     (#cba32c to #e7bc3d); scroll bars are a bright blue thumb (#40a0ff) in a cream frame.
+ *   - near-black translucent panels over a busy yellow and grey background, with a cream border;
+ *   - the cursor is a steel-blue bar across the row (#2c68a3 at the top to #4d8cc6), the row's text staying white;
+ *   - a gold title band (#cba32c to #e7bc3d) and khaki bevelled buttons;
+ *   - values at the right of a row in square brackets, "[Stereo]", "[85%]", "[OFF]", and a description of the highlighted
+ *     row in a bar at the bottom.
  *
- * Nothing from the game is used here: the font is Lato (SIL OFL 1.1, ../fonts), the colours are measured from the
- * screenshots, the shapes are RCSS. Using the game's own font (fpr.fnt on the disc) and textures at run time would
- * be a later step and is not needed for this look.
+ * This theme keeps that palette (gold, steel blue, near-black, cream) and the bracketed values, and makes everything flatter and
+ * quieter than the game itself: regular Lato instead of heavy italics, smaller type, one-pixel borders, flat fills instead of
+ * bevels, no drop shadows, and the same spacing everywhere.
  *
- * Units: dp, the UI scale (1 dp = 1 pixel in a 720 pixel high window).
- * RmlUi limits the theme works within: no box-shadow or filters (the renderer has no offscreen layers), so depth
- * comes from borders and gradients.
+ * The palette, so that a theme mod knows what to change:
+ *   gold    #e7bc3d  (the title band, the focus edge, notes)      steel blue  #2c68a3 .. #4d8cc6  (the cursor, the selected tab)
+ *   dark    #0b1019  (panels)                                      cream       #d1caaf  (borders, drawn faint)
+ *   text    #f0ede0  (main)  #c4c0ae  (secondary)  #8f8c80  (disabled)
+ *
+ * The layout, at the design size of 720 dp high (1 dp = 1 pixel in a 720 pixel high window; Overlay::setViewport scales it):
+ *   - #window is the whole window. The title band runs across all of it; everything below it is one column that is centred
+ *     and at most 1280 dp wide, so on a very wide window lines do not get too long to read. On a narrower window the column
+ *     is the window's width.
+ *   - the column is a flex column: the tabs, the content box (.panel; the one that is showing takes all the room that is left),
+ *     the restart note, the help line and the footer. The heights of everything but the content box are fixed here, so every
+ *     tab has the same frame whatever it shows. A tab whose content is taller than its box scrolls inside it.
+ *
+ * Nothing from the game is used: the font is Lato (SIL OFL 1.1, ../fonts), the colours are measured from screenshots, the shapes
+ * are RCSS. RmlUi limits the theme works within: no box-shadow or filters (the renderer has no offscreen layers), no rounded
+ * clipping of overflow, so depth comes from borders and gradients.
+ *
+ * Theme mods (docs/formats/fprmod.md) add style sheets after this one. The rules a mod is likely to change keep the same selectors
+ * as before: .tab.selected, .row / .mod / .mrow hover and focus, .button and .mbtn hover and focus, .row .fill, #header, #brand,
+ * #page-title.
  */
 
 /* RmlUi has no built-in HTML defaults: an element is inline unless told otherwise, which makes a div ignore its
@@ -31,27 +44,26 @@ div
 body
 {
     font-family: LatoLatin;
-    font-weight: bold;
-    font-style: italic;
-    font-size: 28dp;
-    letter-spacing: 1.8dp;
-    color: #ffffff;
-    font-effect: shadow(2dp 2dp #000000);
+    font-weight: normal;
+    font-style: normal;
+    font-size: 20dp;
+    letter-spacing: 0.2dp;
+    color: #f0ede0;
     width: 100%;
     height: 100%;
-    display: flex;
-    justify-content: center;
-    align-items: center;
     /* A dim over the whole game picture, so the overlay reads as in front of it. */
-    background-color: #00000078;
+    background-color: #04060cc4;
 }
 
-/* ---- The window: a gold title band over the panels ---------------------------------------------------- */
+/* ---- The window and the title band ------------------------------------------------------------------------ */
 
 #window
 {
-    width: 960dp;
-    padding: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    width: 100%;
+    height: 100%;
 }
 
 #header
@@ -60,36 +72,51 @@ body
     flex-direction: row;
     justify-content: space-between;
     align-items: center;
-    height: 46dp;
-    padding: 0 20dp;
-    decorator: linear-gradient(180deg, #cba32c, #e7bc3d 70%, #d4ac32);
-    border-bottom: 3dp #7b735d;
-    border-top-left-radius: 10dp;
-    border-top-right-radius: 10dp;
-}
-
-#brand
-{
-    font-size: 18dp;
-    font-weight: normal;
-    font-effect: none;
-    color: #1c1a14;
+    flex: none;
+    box-sizing: border-box;
+    width: 100%;
+    height: 38dp;
+    padding: 0 24dp;
+    decorator: linear-gradient(180deg, #e2b83c, #d0a62e);
 }
 
 #page-title
 {
-    font-size: 30dp;
+    font-size: 21dp;
+    font-weight: bold;
+    letter-spacing: 0.4dp;
     color: #1c1a14;
-    font-effect: shadow(1dp 1dp #f6e7a8);
 }
 
-/* ---- Tabs: khaki bars like the main menu's items; the current one takes the blue cursor ------------------- */
+#brand
+{
+    font-size: 14dp;
+    letter-spacing: 0.8dp;
+    color: #4a3f1a;
+}
+
+/* Everything under the band: one column, centred, with a maximum width. */
+#page
+{
+    display: flex;
+    flex-direction: column;
+    flex: 1 1 0;
+    min-height: 0;
+    box-sizing: border-box;
+    width: 100%;
+    max-width: 1280dp;
+    padding: 0 16dp 14dp 16dp;
+}
+
+/* ---- Tabs: plain labels over the content box; the current one has a gold underline, the focused one the blue cursor ---- */
 
 #tabs
 {
     display: flex;
     flex-direction: row;
-    padding: 12dp 0 0 0;
+    flex: none;
+    height: 34dp;
+    margin: 12dp 0 0 0;
 }
 
 .tab
@@ -97,46 +124,59 @@ body
     display: block;
     tab-index: auto;
     nav: auto;
-    width: 210dp;
-    height: 52dp;
-    margin-right: 10dp;
-    padding-top: 9dp;
+    box-sizing: border-box;
+    height: 34dp;
+    min-width: 112dp;
+    margin-right: 4dp;
+    padding: 0 22dp;
+    line-height: 31dp;
     text-align: center;
-    color: #1c1a14;
-    font-effect: outline(1dp #ffffff);
-    decorator: linear-gradient(180deg, #efefef, #c3bda4 14%, #a59f89 80%, #6b6759);
-    border: 2dp #3c3b32;
-    border-radius: 4dp;
+    font-size: 18dp;
+    font-weight: bold;
+    color: #aeaa98;
+    background-color: #ffffff0a;
+    border-bottom: 3dp #00000000;
+    border-top-left-radius: 4dp;
+    border-top-right-radius: 4dp;
 }
 
 .tab:hover
 {
-    decorator: linear-gradient(180deg, #ffffff, #d8d2b8 14%, #b8b29a 80%, #7c7868);
+    color: #ffffff;
+    background-color: #ffffff18;
 }
 
 .tab.selected
 {
     color: #ffffff;
-    font-effect: shadow(2dp 2dp #000000);
-    decorator: linear-gradient(180deg, #2c68a3, #4d8cc6);
-    border-color: #d1caaf;
+    background-color: #ffffff14;
+    border-bottom-color: #e7bc3d;
 }
 
 .tab:focus
 {
-    border-color: #ffffff;
+    color: #ffffff;
+    decorator: linear-gradient(180deg, #3a77b4, #2c68a3);
+    border-bottom-color: #e7bc3d;
 }
 
-/* ---- Panels: dark, translucent, cream border, rounded ----------------------------------------------------- */
+/* ---- The content box: dark, thin cream border. One per tab, all the same size. -------------------------------------- */
 
 .panel
 {
+    display: block;
+    flex: 1 1 0;
+    min-height: 0;
     box-sizing: border-box;
-    margin-top: 10dp;
-    padding: 12dp 14dp;
-    background-color: #000000d6;
-    border: 5dp #d1caaf;
-    border-radius: 10dp;
+    padding: 12dp;
+    background-color: #0b1019eb;
+    border: 1dp #d1caaf40;
+    border-radius: 6dp;
+}
+
+.panel.hidden
+{
+    display: none;
 }
 
 .row
@@ -146,51 +186,63 @@ body
     align-items: center;
     tab-index: auto;
     nav: auto;
-    height: 52dp;
-    padding: 0 14dp;
+    box-sizing: border-box;
+    height: 38dp;
+    padding: 0 14dp 0 12dp;
+    border-left: 3dp #00000000;
     border-radius: 3dp;
 }
 
 .row:hover,
 .row:focus
 {
-    decorator: linear-gradient(180deg, #2c68a3, #3a76b2 45%, #4d8cc6);
+    decorator: linear-gradient(180deg, #3673b0, #2c68a3);
+    border-left-color: #e7bc3d;
 }
 
 .row .label
 {
     flex: 1 1 0;
+    color: #e6e2d2;
 }
 
 .row .value
 {
     width: 150dp;
     text-align: right;
+    color: #ffffff;
+    font-weight: bold;
 }
 
-/* A slider is a cream-framed dark trough with a blue fill, between the label and the value. */
+.row:hover .label,
+.row:focus .label
+{
+    color: #ffffff;
+}
+
+/* A slider is a thin dark trough with a blue fill, between the label and the value. */
 .row .slider
 {
-    width: 300dp;
-    height: 20dp;
+    width: 280dp;
+    height: 10dp;
     margin-right: 18dp;
 }
 
 .row .track
 {
     width: 100%;
-    height: 20dp;
+    height: 10dp;
     box-sizing: border-box;
-    background-color: #000000;
-    border: 3dp #d1caaf;
-    border-radius: 10dp;
+    background-color: #000000b0;
+    border: 1dp #d1caaf80;
+    border-radius: 5dp;
     overflow: hidden;
 }
 
 .row .fill
 {
     width: 50%;
-    height: 14dp;
+    height: 8dp;
     decorator: linear-gradient(180deg, #8ec7ff, #40a0ff 45%, #2a68a6);
 }
 
@@ -199,18 +251,76 @@ body
     border-color: #ffffff;
 }
 
-/* ---- The help line and the footer ------------------------------------------------------------------------ */
+/* A short word in a row ("ENV", "RESTART"); the space is kept so values do not move. */
+.row .tag
+{
+    width: 96dp;
+    margin-right: 10dp;
+    text-align: right;
+    font-size: 13dp;
+    font-weight: bold;
+    letter-spacing: 1dp;
+    color: #e7bc3d;
+}
+
+/* A locked row can still be focused (the help line says why) but is dimmed. */
+.row.locked .label,
+.row.locked .value
+{
+    color: #8f8c80;
+}
+
+.row.locked .track
+{
+    border-color: #8f8c80;
+}
+
+.row.locked:hover .label,
+.row.locked:focus .label,
+.row.locked:hover .value,
+.row.locked:focus .value
+{
+    color: #cfcbbb;
+}
+
+/* ---- The restart note, the help line and the footer ------------------------------------------------------------- */
+
+#notice
+{
+    flex: none;
+    height: 24dp;
+    margin-top: 6dp;
+    padding: 0 4dp;
+    font-size: 15dp;
+}
+
+#restart-note
+{
+    color: #e7bc3d;
+    letter-spacing: 0.3dp;
+}
 
 #help
 {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    flex: none;
     box-sizing: border-box;
-    margin-top: 10dp;
-    height: 58dp;
-    padding: 8dp 14dp 0 14dp;
-    text-align: center;
-    background-color: #000000d6;
-    border: 5dp #d1caaf;
-    border-radius: 10dp;
+    height: 44dp;
+    padding: 0 14dp;
+    font-size: 17dp;
+    color: #f0ede0;
+    background-color: #0b1019eb;
+    border: 1dp #d1caaf40;
+    border-left: 3dp #e7bc3d;
+    border-radius: 4dp;
+}
+
+#help-text
+{
+    flex: 1 1 0;
+    min-width: 0;
 }
 
 #footer
@@ -219,146 +329,22 @@ body
     flex-direction: row;
     justify-content: space-between;
     align-items: center;
-    margin-top: 12dp;
+    flex: none;
+    height: 34dp;
+    margin-top: 10dp;
 }
 
 #hints
 {
-    font-size: 19dp;
-    font-weight: normal;
-    color: #e6e0c8;
-    /* Over a bright game picture the bare text is hard to read. */
-    padding: 5dp 14dp 3dp 14dp;
-    background-color: #000000b4;
-    border-radius: 6dp;
+    font-size: 14dp;
+    letter-spacing: 0.3dp;
+    color: #c4c0ae;
 }
 
 #hints span
 {
-    margin-right: 22dp;
+    margin-right: 20dp;
 }
-
-.button
-{
-    display: block;
-    tab-index: auto;
-    nav: auto;
-    width: 190dp;
-    height: 50dp;
-    padding-top: 9dp;
-    text-align: center;
-    color: #1c1a14;
-    font-effect: outline(1dp #ffffff);
-    decorator: linear-gradient(180deg, #efefef, #c3bda4 14%, #a59f89 80%, #6b6759);
-    border: 2dp #3c3b32;
-    border-radius: 4dp;
-}
-
-.button:hover,
-.button:focus
-{
-    color: #ffffff;
-    font-effect: shadow(2dp 2dp #000000);
-    decorator: linear-gradient(180deg, #2c68a3, #4d8cc6);
-    border-color: #d1caaf;
-}
-
-/* ---- In the game: row tags, locked rows, the restart note and the read-only controls list --------------- */
-
-/* A short word in a row ("ENV", "RESTART"); the space is kept so values do not move. */
-.row .tag
-{
-    width: 130dp;
-    margin-right: 10dp;
-    text-align: right;
-    font-size: 16dp;
-    color: #e7bc3d;
-    letter-spacing: 1dp;
-}
-
-/* A locked row can still be focused (the help line says why) but is dimmed. */
-.row.locked .label,
-.row.locked .value
-{
-    color: #8f8c80;
-    font-effect: none;
-}
-
-.row.locked .track
-{
-    border-color: #8f8c80;
-}
-
-#notice
-{
-    height: 30dp;
-    margin-top: 6dp;
-    text-align: center;
-}
-
-#help
-{
-    font-size: 24dp;
-}
-
-#restart-note
-{
-    font-size: 20dp;
-    font-weight: normal;
-    color: #e7bc3d;
-    letter-spacing: 1dp;
-}
-
-/* The panels of the game's settings page are the same height, so the window does not jump between tabs. The Mods tab needs
-   the room for a list and a details page side by side. */
-#window .panel
-{
-    min-height: 400dp;
-}
-
-.ctl
-{
-    display: flex;
-    flex-direction: row;
-    height: 23dp;
-    padding: 0 14dp;
-    font-size: 17dp;
-    letter-spacing: 1dp;
-}
-
-.ctl .c-act
-{
-    width: 150dp;
-}
-
-.ctl .c-key
-{
-    flex: 1 1 0;
-    color: #e6e0c8;
-}
-
-.ctl .c-pad
-{
-    width: 340dp;
-}
-
-.ctl.head
-{
-    color: #e7bc3d;
-    margin-bottom: 4dp;
-    border-bottom: 2dp #d1caaf;
-}
-
-#controller-name
-{
-    margin-top: 10dp;
-    padding: 0 14dp;
-    font-size: 16dp;
-    font-weight: normal;
-    color: #e6e0c8;
-}
-
-/* ---- Quit Game and its question ------------------------------------------------------------------------- */
 
 #footer-buttons
 {
@@ -368,24 +354,101 @@ body
 
 #quit
 {
-    margin-right: 14dp;
+    margin-right: 8dp;
+}
+
+/* ---- Buttons: flat, dark, thin border; the focused one takes the blue cursor and the gold edge -------------------- */
+
+.button
+{
+    display: block;
+    tab-index: auto;
+    nav: auto;
+    box-sizing: border-box;
+    height: 34dp;
+    min-width: 112dp;
+    padding: 0 22dp;
+    line-height: 32dp;
+    text-align: center;
+    font-size: 17dp;
+    font-weight: bold;
+    color: #f0ede0;
+    decorator: linear-gradient(180deg, #2c3544, #252d3a);
+    border: 1dp #d1caaf55;
+    border-radius: 4dp;
+}
+
+.button:hover,
+.button:focus
+{
+    color: #ffffff;
+    decorator: linear-gradient(180deg, #3673b0, #2c68a3);
+    border-color: #e7bc3d;
 }
 
 /* A button that cannot be used now (Quit Game while the game is writing to the memory card). It stays focusable, so the
    help line can say why. */
 .button.locked
 {
-    color: #6e6b60;
-    font-effect: none;
-    decorator: linear-gradient(180deg, #8d8a7c, #7a7769 14%, #67645a 80%, #4a483f);
+    color: #7d7a6e;
+    decorator: linear-gradient(180deg, #232a35, #1f252f);
 }
 
 .button.locked:hover,
 .button.locked:focus
 {
     color: #cfcbbb;
+    decorator: linear-gradient(180deg, #232a35, #1f252f);
     border-color: #d1caaf;
 }
+
+/* ---- The Controls tab: a read-only list ------------------------------------------------------------------------- */
+
+.ctl
+{
+    display: flex;
+    flex-direction: row;
+    height: 24dp;
+    padding: 0 14dp;
+    font-size: 16dp;
+}
+
+.ctl .c-act
+{
+    width: 150dp;
+}
+
+.ctl .c-key
+{
+    width: 330dp;
+    color: #c4c0ae;
+}
+
+.ctl .c-pad
+{
+    flex: 1 1 0;
+}
+
+.ctl.head
+{
+    height: 26dp;
+    margin-bottom: 4dp;
+    font-size: 14dp;
+    font-weight: bold;
+    letter-spacing: 1dp;
+    color: #e7bc3d;
+    border-bottom: 1dp #d1caaf40;
+}
+
+#controller-name
+{
+    margin-top: 10dp;
+    padding: 0 14dp;
+    font-size: 14dp;
+    color: #c4c0ae;
+}
+
+/* ---- The questions: Quit Game, uninstall a mod, "Which save?" ---------------------------------------------------- */
 
 /* While the question is up, nothing behind it takes the focus (the controller's directions would otherwise walk off the
    question into the settings). The mouse cannot reach the settings either: the question's dim layer covers them. */
@@ -394,7 +457,8 @@ body
     focus: none;
 }
 
-#confirm
+#confirm,
+#mod-confirm
 {
     position: absolute;
     top: 0;
@@ -405,73 +469,91 @@ body
     flex-direction: row;
     justify-content: center;
     align-items: center;
-    background-color: #000000b4;
+    background-color: #04060ccc;
 }
 
-#confirm-box
+#confirm-box,
+#mod-confirm-box
 {
     box-sizing: border-box;
-    width: 640dp;
-    padding: 26dp 30dp 30dp 30dp;
+    width: 560dp;
+    max-width: 90%;
+    padding: 24dp 28dp 26dp 28dp;
     text-align: center;
-    background-color: #000000f2;
-    border: 5dp #d1caaf;
-    border-radius: 10dp;
+    background-color: #0b1019;
+    border: 1dp #d1caaf80;
+    border-radius: 8dp;
 }
 
-#confirm-title
+#confirm-title,
+#mod-confirm-title
 {
-    font-size: 34dp;
+    font-size: 23dp;
+    font-weight: bold;
+    letter-spacing: 0.3dp;
 }
 
-#confirm-text
+#confirm-text,
+#mod-confirm-text
 {
-    margin: 14dp 0 26dp 0;
-    font-size: 22dp;
-    font-weight: normal;
-    color: #e6e0c8;
+    margin: 12dp 0 22dp 0;
+    font-size: 16dp;
+    color: #c4c0ae;
 }
 
-#confirm-buttons
+#confirm-buttons,
+#mod-confirm-buttons
 {
     display: flex;
     flex-direction: row;
     justify-content: center;
 }
 
-#confirm-buttons .button
+#confirm-buttons .button,
+#mod-confirm-buttons .button
 {
-    margin: 0 12dp;
+    margin: 0 5dp;
 }
 
-/* ---- The Mods tab: a list of mods on the left, the details of the focused mod on the right ----------------- */
+/* ---- The Mods tab: a list of mods on the left, the details of the focused mod on the right ---------------------- */
 
+/* The panel is a column: the list and the details take what is left, the status line and the foot are only as tall as their text. */
 #panel-mods
 {
-    padding: 10dp 12dp;
+    display: flex;
+    flex-direction: column;
+    padding: 10dp 12dp 8dp 12dp;
+}
+
+#panel-mods.hidden
+{
+    display: none;
 }
 
 #mods-body
 {
     display: flex;
     flex-direction: row;
-    height: 296dp;
+    flex: 1 1 0;
+    min-height: 0;
 }
 
 #mods-list
 {
-    width: 330dp;
-    height: 296dp;
+    flex: none;
+    width: 28%;
+    min-width: 220dp;
+    max-width: 320dp;
+    min-height: 0;
     margin-right: 14dp;
     overflow-y: auto;
 }
 
 #mods-empty
 {
-    padding: 14dp;
-    font-size: 20dp;
-    font-weight: normal;
-    color: #e6e0c8;
+    padding: 12dp;
+    font-size: 16dp;
+    color: #c4c0ae;
 }
 
 .mod
@@ -481,18 +563,18 @@ body
     align-items: center;
     tab-index: auto;
     nav: auto;
-    height: 42dp;
-    padding: 0 8dp;
-    font-size: 21dp;
-    letter-spacing: 1dp;
+    box-sizing: border-box;
+    height: 34dp;
+    padding: 0 8dp 0 6dp;
+    font-size: 17dp;
+    border-left: 3dp #00000000;
     border-radius: 3dp;
-    border-left: 4dp #00000000;
 }
 
 .mod:hover,
 .mod:focus
 {
-    decorator: linear-gradient(180deg, #2c68a3, #3a76b2 45%, #4d8cc6);
+    decorator: linear-gradient(180deg, #3673b0, #2c68a3);
 }
 
 .mod.selected
@@ -502,39 +584,41 @@ body
 
 .mod .m-pos
 {
-    width: 30dp;
-    font-size: 16dp;
-    font-weight: normal;
-    color: #cfcbbb;
+    width: 26dp;
+    font-size: 13dp;
+    color: #aeaa98;
 }
 
 .mod .m-name
 {
     flex: 1 1 0;
-    height: 26dp;
+    height: 24dp;
     overflow: hidden;
     white-space: nowrap;
 }
 
 .mod .m-flag
 {
-    width: 18dp;
+    width: 16dp;
     text-align: center;
+    font-weight: bold;
     color: #e7bc3d;
 }
 
 .mod .m-state
 {
-    width: 50dp;
+    width: 40dp;
     text-align: right;
-    font-size: 19dp;
+    font-size: 13dp;
+    font-weight: bold;
+    letter-spacing: 0.6dp;
+    color: #8fd18f;
 }
 
 .mod.off .m-name,
 .mod.off .m-state
 {
-    color: #b3af9b;
-    font-effect: none;
+    color: #8f8c80;
 }
 
 .mod.bad .m-name,
@@ -543,66 +627,72 @@ body
     color: #ff9d8a;
 }
 
-#mod-details
+.mod:hover .m-name,
+.mod:focus .m-name,
+.mod:hover .m-state,
+.mod:focus .m-state
 {
-    flex: 1 1 0;
-    height: 296dp;
+    color: #ffffff;
 }
 
-/* Everything but the buttons scrolls (a long description, many settings); the buttons below stay in view. */
+/* The details: one column. The text and the settings scroll; the buttons below stay in view. */
+#mod-details
+{
+    display: flex;
+    flex-direction: column;
+    flex: 1 1 0;
+    min-width: 0;
+    min-height: 0;
+}
+
 #mod-info
 {
-    height: 244dp;
+    flex: 1 1 0;
+    min-height: 0;
     overflow-y: auto;
 }
 
 #mod-title
 {
-    height: 38dp;
+    height: 30dp;
     overflow: hidden;
     white-space: nowrap;
-    font-size: 29dp;
+    font-size: 23dp;
+    font-weight: bold;
 }
 
 #mod-meta
 {
-    height: 24dp;
-    margin-bottom: 6dp;
-    font-size: 16dp;
-    font-weight: normal;
-    letter-spacing: 0.5dp;
-    color: #e7bc3d;
+    height: 22dp;
     overflow: hidden;
     white-space: nowrap;
+    font-size: 14dp;
+    color: #c9b66b;
 }
 
 #mod-main
 {
     display: flex;
     flex-direction: row;
+    margin-top: 4dp;
 }
 
 #mod-text
 {
     flex: 1 1 0;
+    min-width: 0;
 }
 
 #mod-desc
 {
-    max-height: 84dp;
-    overflow: hidden;
-    font-size: 18dp;
-    font-weight: normal;
-    letter-spacing: 0.5dp;
-    color: #f2eedc;
+    font-size: 16dp;
+    color: #e6e2d2;
 }
 
 #mod-problem
 {
     margin-top: 6dp;
-    font-size: 17dp;
-    font-weight: normal;
-    letter-spacing: 0.5dp;
+    font-size: 15dp;
 }
 
 #mod-problem.bad
@@ -618,56 +708,50 @@ body
 #mod-notes
 {
     margin-top: 6dp;
-    font-size: 16dp;
-    font-weight: normal;
-    letter-spacing: 0.5dp;
+    font-size: 14dp;
     color: #e7bc3d;
 }
 
 #mod-infonotes
 {
     margin-top: 6dp;
-    font-size: 16dp;
-    font-weight: normal;
-    letter-spacing: 0.5dp;
+    font-size: 14dp;
     color: #8fd18f;
 }
 
 .mod-notes-line
 {
     margin-top: 2dp;
-    font-size: 14dp;
-    color: #f2eedc;
+    font-size: 13dp;
+    color: #e6e2d2;
 }
 
 #mod-links,
 #mod-note
 {
     margin-top: 6dp;
-    font-size: 15dp;
-    font-weight: normal;
-    letter-spacing: 0.5dp;
-    color: #cfcbbb;
+    font-size: 14dp;
+    color: #aeaa98;
 }
 
 #mod-picbox
 {
-    width: 168dp;
-    height: 94dp;
-    margin: 4dp 0 0 12dp;
+    width: 160dp;
+    height: 90dp;
+    margin: 2dp 0 0 14dp;
     overflow: hidden;
-    border: 2dp #d1caaf;
+    border: 1dp #d1caaf80;
     background-color: #000000;
 }
 
 #mod-pic
 {
-    width: 164dp;
+    width: 158dp;
 }
 
 #mod-settings
 {
-    margin-top: 6dp;
+    margin-top: 8dp;
 }
 
 .mrow
@@ -677,17 +761,19 @@ body
     align-items: center;
     tab-index: auto;
     nav: auto;
-    height: 34dp;
-    padding: 0 8dp;
-    font-size: 19dp;
-    letter-spacing: 0.8dp;
+    box-sizing: border-box;
+    height: 30dp;
+    padding: 0 8dp 0 6dp;
+    font-size: 16dp;
+    border-left: 3dp #00000000;
     border-radius: 3dp;
 }
 
 .mrow:hover,
 .mrow:focus
 {
-    decorator: linear-gradient(180deg, #2c68a3, #3a76b2 45%, #4d8cc6);
+    decorator: linear-gradient(180deg, #3673b0, #2c68a3);
+    border-left-color: #e7bc3d;
 }
 
 .mrow .label
@@ -697,16 +783,18 @@ body
 
 .mrow .value
 {
-    width: 150dp;
+    width: 140dp;
     text-align: right;
+    font-weight: bold;
 }
 
 #mod-actions
 {
     display: flex;
     flex-direction: row;
-    height: 40dp;
-    margin-top: 10dp;
+    flex: none;
+    height: 32dp;
+    margin-top: 8dp;
 }
 
 .mbtn
@@ -714,17 +802,18 @@ body
     display: block;
     tab-index: auto;
     nav: auto;
-    width: 128dp;
-    height: 38dp;
-    margin-right: 8dp;
-    padding-top: 6dp;
-    font-size: 18dp;
-    letter-spacing: 0.8dp;
+    box-sizing: border-box;
+    height: 32dp;
+    min-width: 84dp;
+    margin-right: 6dp;
+    padding: 0 12dp;
+    line-height: 30dp;
+    font-size: 15dp;
+    font-weight: bold;
     text-align: center;
-    color: #1c1a14;
-    font-effect: outline(1dp #ffffff);
-    decorator: linear-gradient(180deg, #efefef, #c3bda4 14%, #a59f89 80%, #6b6759);
-    border: 2dp #3c3b32;
+    color: #f0ede0;
+    decorator: linear-gradient(180deg, #2c3544, #252d3a);
+    border: 1dp #d1caaf55;
     border-radius: 4dp;
 }
 
@@ -732,34 +821,32 @@ body
 .mbtn:focus
 {
     color: #ffffff;
-    font-effect: shadow(2dp 2dp #000000);
-    decorator: linear-gradient(180deg, #2c68a3, #4d8cc6);
-    border-color: #d1caaf;
+    decorator: linear-gradient(180deg, #3673b0, #2c68a3);
+    border-color: #e7bc3d;
 }
 
 .mbtn.locked
 {
-    color: #6e6b60;
-    font-effect: none;
-    decorator: linear-gradient(180deg, #8d8a7c, #7a7769 14%, #67645a 80%, #4a483f);
+    color: #7d7a6e;
+    decorator: linear-gradient(180deg, #232a35, #1f252f);
 }
 
 .mbtn.locked:hover,
 .mbtn.locked:focus
 {
     color: #cfcbbb;
+    decorator: linear-gradient(180deg, #232a35, #1f252f);
     border-color: #d1caaf;
 }
 
 #mods-status
 {
-    height: 44dp;
-    margin-top: 8dp;
+    flex: none;
+    min-height: 20dp;
+    max-height: 38dp;
+    margin-top: 6dp;
     overflow: hidden;
-    white-space: normal;
-    font-size: 17dp;
-    font-weight: normal;
-    letter-spacing: 0.5dp;
+    font-size: 15dp;
     color: #e7bc3d;
 }
 
@@ -769,17 +856,17 @@ body
 #mods-foot
 {
     display: block;
+    flex: none;
+    margin-top: 4dp;
 }
 
 #mods-card
 {
-    min-height: 20dp;
-    max-height: 38dp;
+    min-height: 18dp;
+    max-height: 34dp;
     overflow: hidden;
-    font-size: 14dp;
-    font-weight: normal;
-    letter-spacing: 0.3dp;
-    color: #cfcbbb;
+    font-size: 13dp;
+    color: #c4c0ae;
 }
 
 #mods-lower
@@ -787,7 +874,8 @@ body
     display: flex;
     flex-direction: row;
     justify-content: space-between;
-    align-items: center;
+    align-items: flex-end;
+    margin-top: 2dp;
 }
 
 #mods-paths
@@ -800,13 +888,11 @@ body
 #mods-folder,
 #dev-folder
 {
-    height: 20dp;
+    height: 18dp;
     overflow: hidden;
     white-space: nowrap;
-    font-size: 14dp;
-    font-weight: normal;
-    letter-spacing: 0.3dp;
-    color: #cfcbbb;
+    font-size: 13dp;
+    color: #aeaa98;
 }
 
 #mods-tools
@@ -819,38 +905,32 @@ body
 
 .mbtn.small
 {
-    width: 116dp;
-    height: 30dp;
-    padding-top: 4dp;
+    min-width: 0;
+    height: 28dp;
     margin-right: 0;
     margin-left: 5dp;
-    font-size: 14dp;
-    letter-spacing: 0.5dp;
+    padding: 0 12dp;
+    line-height: 26dp;
+    font-size: 13dp;
 }
 
-/* Import a Save... has the longest label of the small buttons. */
-.mbtn.small.wide
-{
-    width: 140dp;
-}
-
-/* Scroll bars (a list or a details page longer than its box): a cream-framed trough with the blue thumb of the game's own lists. */
+/* Scroll bars (a list or a details page longer than its box): a thin trough and the blue thumb of the game's own lists. */
 scrollbarvertical
 {
-    width: 12dp;
+    width: 8dp;
 }
 
 scrollbarvertical slidertrack
 {
-    background-color: #000000a0;
+    background-color: #00000070;
+    border-radius: 4dp;
 }
 
 scrollbarvertical sliderbar
 {
-    width: 12dp;
+    width: 8dp;
     min-height: 24dp;
     background-color: #40a0ff;
-    border: 2dp #d1caaf;
     border-radius: 4dp;
 }
 
@@ -861,64 +941,13 @@ scrollbarvertical sliderarrowdec
     height: 0;
 }
 
-/* The uninstall question: the same layer as the Quit Game question. */
-#mod-confirm
-{
-    position: absolute;
-    top: 0;
-    left: 0;
-    right: 0;
-    bottom: 0;
-    display: flex;
-    flex-direction: row;
-    justify-content: center;
-    align-items: center;
-    background-color: #000000b4;
-}
-
-#mod-confirm-box
-{
-    box-sizing: border-box;
-    width: 700dp;
-    padding: 26dp 30dp 30dp 30dp;
-    text-align: center;
-    background-color: #000000f2;
-    border: 5dp #d1caaf;
-    border-radius: 10dp;
-}
-
-#mod-confirm-title
-{
-    font-size: 32dp;
-}
-
-#mod-confirm-text
-{
-    margin: 14dp 0 26dp 0;
-    font-size: 21dp;
-    font-weight: normal;
-    color: #e6e0c8;
-}
-
-#mod-confirm-buttons
-{
-    display: flex;
-    flex-direction: row;
-    justify-content: center;
-}
-
-#mod-confirm-buttons .button
-{
-    margin: 0 12dp;
-}
-
-/* Last, so that it wins over the display set on .panel above. */
+/* Last, so that it wins over the display set on the rules above. */
 .hidden
 {
     display: none;
 }
 
-/* An id selector outranks a class: the question sets its own display, so it needs its own rule. */
+/* An id selector outranks a class: the questions set their own display, so they need their own rule. */
 #confirm.hidden,
 #mod-confirm.hidden
 {
