@@ -43,7 +43,8 @@ namespace ps2x_settings
     };
 
     // renderer (gpu|cpu), resolution (1..4), aspect (4:3|16:9|21:9), fullscreen (on|off), vsync (on|off),
-    // filter (sharp|linear), volume (0..100), texture_tools (on|off), skip_intros (on|off: start at the title screen, task i1)
+    // filter (sharp|linear), volume (0..100), texture_tools (on|off), skip_intros (on|off: start at the title screen, task i1),
+    // strike_depth (original|wide|wider: a strike's hit box x1, x1.5, x2 front to back, task s1; read by the game while it runs)
     const std::vector<Definition> &definitions();
     const Definition *find(const std::string &key);
 

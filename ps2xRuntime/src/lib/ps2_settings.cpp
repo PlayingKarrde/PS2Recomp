@@ -30,7 +30,14 @@ namespace ps2x_settings
             {"volume", "PS2X_VOLUME", "100"},
             {"texture_tools", "PS2X_AUTHORING", "off"},
             {"skip_intros", "PS2X_SKIP_INTROS", "off"},
+            {"strike_depth", "PS2X_STRIKE_DEPTH", "original"},
         };
+
+        // strike_depth (task s1): how deep a strike's hit box is, front to back. "original" leaves the game's own test in place.
+        bool strikeDepthValue(const std::string &value)
+        {
+            return value == "original" || value == "wide" || value == "wider";
+        }
 
         std::string trim(const std::string &text)
         {
@@ -94,6 +101,8 @@ namespace ps2x_settings
                 const auto n = parseInt(value);
                 return (n && *n >= 0 && *n <= 100) ? std::optional<std::string>(std::to_string(*n)) : std::nullopt;
             }
+            if (key == "strike_depth")
+                return strikeDepthValue(value) ? std::optional<std::string>(value) : std::nullopt;
             return std::nullopt;
         }
 
@@ -236,6 +245,15 @@ namespace ps2x_settings
                 return std::nullopt;
             return std::to_string(std::clamp(*n, 0, 100));
         }
+        if (key == "strike_depth")
+        {
+            // "check" is for testing only: the game keeps its own test and the rewrite is compared with it (src/overrides).
+            if (text.empty() || text == "0" || text == "off")
+                return std::string("original");
+            if (strikeDepthValue(text) || text == "check")
+                return text;
+            return std::nullopt;
+        }
         return std::nullopt;
     }
 
@@ -251,7 +269,7 @@ namespace ps2x_settings
             return std::string("vsync");
         if (key == "filter")
             return std::string("bilinear"); // linear (sharp is the default and was filtered out above)
-        return *v; // renderer: cpu; resolution: 2..4; aspect: 16:9 or 21:9; volume: 0..99
+        return *v; // renderer: cpu; resolution: 2..4; aspect: 16:9 or 21:9; volume: 0..99; strike_depth: wide or wider
     }
 
     std::vector<Entry> parseFile(const std::string &text)
@@ -287,8 +305,9 @@ namespace ps2x_settings
                           "# fullscreen = on | off         vsync = on | off          filter = sharp | linear\n"
                           "# volume = 0..100              texture_tools = on | off (the modder's tools, docs/modding-textures.md)\n"
                           "# skip_intros = on | off      start at the title screen without the logos and the opening movie (next start)\n"
-                          "# An environment variable (PS2X_GS_BACKEND, PS2X_GS_SCALE, PS2X_GS_WIDE, PS2X_FULLSCREEN,\n"
-                          "# PS2X_GPU_PRESENT_MODE, PS2X_SCALE, PS2X_VOLUME, PS2X_AUTHORING, PS2X_SKIP_INTROS) set before the game starts wins over this file.\n";
+                          "# strike_depth = original | wide | wider   a strike's reach toward or away from the screen (x1, x1.5, x2)\n"
+                          "# An environment variable (PS2X_GS_BACKEND, PS2X_GS_SCALE, PS2X_GS_WIDE, PS2X_FULLSCREEN, PS2X_GPU_PRESENT_MODE,\n"
+                          "# PS2X_SCALE, PS2X_VOLUME, PS2X_AUTHORING, PS2X_SKIP_INTROS, PS2X_STRIKE_DEPTH) set before the game starts wins over this file.\n";
         for (const Entry &entry : entries)
             out += entry.key + " = " + entry.value + "\n";
         return out;

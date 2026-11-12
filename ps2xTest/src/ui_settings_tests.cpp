@@ -133,6 +133,18 @@ void register_ui_settings_tests()
             const ps2x_settings::Definition *intros = ps2x_settings::find("skip_intros");
             t.IsTrue(intros && std::string(intros->envName) == "PS2X_SKIP_INTROS" && std::string(intros->defaultValue) == "off",
                      "the setting is fixed by PS2X_SKIP_INTROS and is off by default");
+
+            // strike depth (task s1): original is the default and sets nothing; check exists only as an environment value
+            t.IsFalse(environmentFromValue("strike_depth", "original").has_value(), "strike depth default");
+            t.Equals(environmentFromValue("strike_depth", "Wide").value_or(""), std::string("wide"), "strike depth wide");
+            t.Equals(environmentFromValue("strike_depth", "wider").value_or(""), std::string("wider"), "strike depth wider");
+            t.IsFalse(environmentFromValue("strike_depth", "check").has_value(), "the file cannot ask for check");
+            t.Equals(valueFromEnvironment("strike_depth", "check").value_or(""), std::string("check"), "PS2X_STRIKE_DEPTH=check");
+            t.Equals(valueFromEnvironment("strike_depth", "0").value_or(""), std::string("original"), "PS2X_STRIKE_DEPTH=0 is original");
+            t.IsFalse(valueFromEnvironment("strike_depth", "huge").has_value(), "PS2X_STRIKE_DEPTH nonsense means nothing");
+            const ps2x_settings::Definition *depth = ps2x_settings::find("strike_depth");
+            t.IsTrue(depth && std::string(depth->envName) == "PS2X_STRIKE_DEPTH" && std::string(depth->defaultValue) == "original",
+                     "the setting is fixed by PS2X_STRIKE_DEPTH and is original by default");
         });
 
         tc.Run("the file's values reach the environment, an environment variable wins, and a save round-trips", [](TestCase &t)

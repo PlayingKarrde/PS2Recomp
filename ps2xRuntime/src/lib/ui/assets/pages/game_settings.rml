@@ -19,6 +19,7 @@
             <div class="tab selected" id="tab-graphics" data-tab="graphics" data-help="Picture options.">Graphics</div>
             <div class="tab" id="tab-audio" data-tab="audio" data-help="Sound options.">Audio</div>
             <div class="tab" id="tab-controls" data-tab="controls" data-help="The keys and buttons the game uses.">Controls</div>
+            <div class="tab" id="tab-gameplay" data-tab="gameplay" data-help="Changes to how matches play. Original keeps the game as it was.">Gameplay</div>
             <!-- The Mods tab (panel-mods, mod-confirm) is removed by the menu when the game has no mod manager. -->
             <div class="tab" id="tab-mods" data-tab="mods" data-help="Install, turn on and off, and order mods.">Mods</div>
         </div>
@@ -76,6 +77,15 @@
         <div class="panel hidden" id="panel-controls">
             <div id="controls-list"></div>
             <div id="controller-name"></div>
+        </div>
+
+        <div class="panel hidden" id="panel-gameplay">
+            <!-- Task s1 (src/overrides/fpwr_gameplay.cpp in the game repo): Original runs the game's own hit test, untouched. -->
+            <div class="row" data-kind="choice" data-key="strike_depth" data-name="Strike Depth" data-choices="original|wide|wider"
+                 data-labels="Original|Wide|Wider" data-value="original"
+                 data-help="How far off the target's line (toward or away from the screen) a strike still lands. Wide is 1.5x, Wider 2x. Applies at once.">
+                <span class="label">Strike Depth</span><span class="tag"></span><span class="value">[Original]</span>
+            </div>
         </div>
 
         <!-- The Mods tab: the list on the left and the details of the focused mod on the right are filled in by ui_mods.cpp. -->
