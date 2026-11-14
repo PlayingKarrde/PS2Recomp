@@ -2038,12 +2038,24 @@ namespace
     constexpr size_t kMaxQueuedPrimitives = 16384u;
 }
 
+// gpu/gpu_lighting.cpp (declared here: this file is compiled without the src/lib include directory)
+#if !defined(PLATFORM_VITA)
+namespace ps2x_lighting
+{
+    void recordingSubmit(const std::string &clipPath, uint64_t submit);
+}
+#endif
+
 void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
     if (!m_vram || batch.vertexCount == 0u)
         return;
     GSREC(submit(batch));
+#if !defined(PLATFORM_VITA)
+    if (m_recActive) // the camera side file of the clip (match lights, gpu/gpu_lighting.h): which Submit records have which camera
+        ps2x_lighting::recordingSubmit(recordConfig().path, m_recActive->stats().records[GSRec::RT_Submit] - 1u);
+#endif
     const bool census = gsCensusEnabled();
     if (census)
         GsCensus::instance().primitive(this, batch);

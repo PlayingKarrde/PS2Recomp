@@ -1,15 +1,26 @@
 #include "MiniTest.h"
 #include "gpu/gpu_lighting.h"
+#include "gpu/gpu_postfx.h"
+#include "ps2_settings.h"
+#include "runtime/gs/gs_gpu_backend.h"
+#include "runtime/gs/gs_presentation.h"
+#include "runtime/gs/ps2_gs_memory.h"
+
+#include <SDL3/SDL.h>
+#include <SDL3/SDL_gpu.h>
 
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
+#include <iostream>
 #include <string>
 #include <thread>
+#include <vector>
 
 // Tests for the first part of the match lights (task lt2-L0a): undoing the projection, face normals, the camera channel that
 // keeps a camera with its frame, and the light arithmetic. No GPU and no game data at test time.
@@ -160,6 +171,132 @@ namespace
         w = p[0] * m[3] + p[1] * m[7] + p[2] * m[11] + m[15];
         x = X / w;
         y = Y / w;
+    }
+
+    // ---- the debug views on the GPU renderer (task lt2-L0b)
+    void setEnvVar(const char *name, const char *value)
+    {
+#if defined(_WIN32)
+        _putenv_s(name, value ? value : "");
+#else
+        if (value)
+            setenv(name, value, 1);
+        else
+            unsetenv(name);
+#endif
+    }
+
+    GSContext sceneContext()
+    {
+        GSContext ctx{};
+        ctx.frame = {0, 10, GS_PSM_CT32, 0};
+        ctx.zbuf = {140, GS_PSM_Z24, false};
+        ctx.scissor = {0, 639, 0, 223};
+        ctx.xyoffset = {static_cast<uint16_t>(1728u * 16u), static_cast<uint16_t>(1936u * 16u)};
+        ctx.test = (1ull << 16) | (2ull << 17); // ZTE on, GEQUAL
+        return ctx;
+    }
+
+    // A flat triangle given by three world points, projected with `m` the way the game does: x and y cut to 1/16 pixel, Q = 1 / w.
+    void worldTriangle(GSRasterBackend &b, const float m[16], const double points[3][3], double z, uint8_t r, uint8_t g, uint8_t bl)
+    {
+        GSPrimitiveBatch p;
+        p.vertexCount = 3;
+        p.state.context = sceneContext();
+        p.state.prim.type = GS_PRIM_TRIANGLE;
+        p.state.prim.iip = false;
+        p.state.prim.fst = false;
+        for (size_t i = 0; i < 3; ++i)
+        {
+            double x, y, w;
+            project(m, points[i], x, y, w);
+            p.vertices[i].x = static_cast<float>(std::floor(x * 16.0) / 16.0);
+            p.vertices[i].y = static_cast<float>(std::floor(y * 16.0) / 16.0);
+            p.vertices[i].z = z;
+            p.vertices[i].q = static_cast<float>(1.0 / w);
+            p.vertices[i].r = r;
+            p.vertices[i].g = g;
+            p.vertices[i].b = bl;
+            p.vertices[i].a = 0x80;
+        }
+        b.Submit(p);
+    }
+
+    // One field: a clear, a floor triangle 200 units below the eye (it faces up) and a wall triangle that faces the eye (-z).
+    void drawWorldField(GSRasterBackend &b, const float m[16])
+    {
+        GSPrimitiveBatch clear;
+        clear.vertexCount = 2;
+        clear.state.context = sceneContext();
+        clear.state.context.test = (1ull << 16) | (1ull << 17);
+        clear.state.prim.type = GS_PRIM_SPRITE;
+        clear.vertices[0].x = 1728.0f;
+        clear.vertices[0].y = 1936.0f;
+        clear.vertices[1].x = 1728.0f + 640.0f;
+        clear.vertices[1].y = 1936.0f + 224.0f;
+        clear.vertices[1].r = 30;
+        clear.vertices[1].g = 40;
+        clear.vertices[1].b = 60;
+        clear.vertices[1].a = 0x80;
+        b.Submit(clear);
+        const double floorPoints[3][3] = {{-150.0, -200.0, 0.0}, {150.0, -200.0, 0.0}, {0.0, -200.0, 1000.0}};
+        const double wallPoints[3][3] = {{-100.0, -100.0, 50.0}, {100.0, -100.0, 50.0}, {0.0, 100.0, 50.0}};
+        worldTriangle(b, m, floorPoints, 1000.0, 200, 60, 20);
+        worldTriangle(b, m, wallPoints, 2000.0, 20, 60, 200);
+    }
+
+    struct Field
+    {
+        std::vector<uint8_t> px; // 640 x 448 RGBA
+        bool ok = false;
+        const uint8_t *at(uint32_t x, uint32_t y) const { return &px[(static_cast<size_t>(y) * 640u + x) * 4u]; }
+    };
+
+    // Makes a renderer with PS2X_LIGHT_DEBUG set to `view` (nullptr: unset), draws the field twice (with a camera for the frame when
+    // `camera`), and reads the second field.
+    Field renderField(SDL_GPUDevice *device, const char *view, bool camera)
+    {
+        Field out;
+        setEnvVar("PS2X_LIGHT_DEBUG", view);
+        std::vector<uint8_t> vram(GSMem::MEMORY_SIZE, 0);
+        GSGpuBackend gpu(device, 1, GSGpuBackend::FieldMode::Progressive);
+        setEnvVar("PS2X_LIGHT_DEBUG", nullptr);
+        if (!gpu.Ready() || !gpu.SetFieldPublishing(true))
+            return out;
+        gpu.Initialize(vram.data(), static_cast<uint32_t>(vram.size()));
+        GSPresentationRequest request{};
+        request.pmode = 0x8007;
+        request.smode2 = 0x3;
+        request.dispfb1 = request.dispfb2 = 0ull | (10ull << 9);
+        request.display1 = request.display2 = (636ull) | (32ull << 12) | (639ull << 32) | (223ull << 44);
+        float m[16];
+        simpleCamera(m);
+        for (uint32_t frame = 0; frame < 2; ++frame)
+        {
+            if (camera)
+                channel().post(m, 1000u + frame, frame & 1u);
+            channel().kickBegin(1000u + frame, frame & 1u);
+            drawWorldField(gpu, m);
+            channel().kickEnd(1u);
+            gpu.MarkPresentation(request);
+        }
+        PresentationFrame frame = gpu.Present(request);
+        if (frame && frame.width == 640 && frame.height == 448)
+        {
+            out.px = frame.pixels;
+            out.ok = true;
+        }
+        return out;
+    }
+
+    bool near3(const uint8_t *p, int r, int g, int b, int tolerance)
+    {
+        return std::abs(p[0] - r) <= tolerance && std::abs(p[1] - g) <= tolerance && std::abs(p[2] - b) <= tolerance;
+    }
+
+    std::string rgbText(const uint8_t *p)
+    {
+        return "(" + std::to_string(p[0]) + ", " + std::to_string(p[1]) + ", " + std::to_string(p[2]) + ")";
     }
 }
 
@@ -401,6 +538,137 @@ void register_gpu_lighting_tests()
         t.IsTrue(std::fabs(out[0] - fall * 0.25f) < 1e-5f, "the soft rule: a quarter for a surface at a right angle");
         lightAt(point, at, down, Facing::Half, out);
         t.IsTrue(out[0] == 0.0f, "the soft rule: none for a surface that faces straight away");
+    });
+
+    tc.Run("the camera side file of a recording: written at each change, read back, and played around the same Submit numbers", [](TestCase &t)
+    {
+        namespace fs = std::filesystem;
+        const fs::path path = fs::temp_directory_path() / "ps2x_light_side_test.camera";
+        float m[16];
+        simpleCamera(m);
+        {
+            // The game side: three frames of 4 Submits each; the first and third have a camera, the second (a menu) has none.
+            CameraChannel live;
+            CameraFileWriter writer;
+            t.IsTrue(writer.open(path.string()), "the side file opens");
+            uint64_t submit = 0;
+            for (uint32_t frame = 0; frame < 3; ++frame)
+            {
+                if (frame != 1u)
+                {
+                    m[15] = 1000.0f + static_cast<float>(frame);
+                    live.post(m, 50u + frame, frame & 1u);
+                }
+                live.kickBegin(50u + frame, frame & 1u);
+                for (int i = 0; i < 4; ++i)
+                    writer.note(submit++, live);
+                live.kickEnd(4u);
+            }
+            writer.note(submit, live); // a Submit outside any kick
+        }
+        std::vector<CameraFileRow> rows;
+        std::string error;
+        t.IsTrue(loadCameraFile(path.string(), rows, &error), "the side file reads back" + (error.empty() ? std::string() : ": " + error));
+        t.IsTrue(rows.size() == 4u, "four rows: on, off, on, off");
+        if (rows.size() == 4u)
+        {
+            t.IsTrue(rows[0].on && rows[0].submit == 0u && rows[0].gameFrame == 50u && rows[0].buffer == 0u && rows[0].m[15] == 1000.0f && rows[0].m[12] == 2048000.0f,
+                     "row 1: on at Submit 0 with the matrix, bit for bit");
+            t.IsTrue(!rows[1].on && rows[1].submit == 4u, "row 2: off at Submit 4");
+            t.IsTrue(rows[2].on && rows[2].submit == 8u && rows[2].gameFrame == 52u && rows[2].m[15] == 1002.0f, "row 3: on at Submit 8");
+            t.IsTrue(!rows[3].on && rows[3].submit == 12u, "row 4: off at Submit 12");
+        }
+
+        // The replay side: the same cameras are active for the same Submit numbers.
+        CameraChannel replay;
+        CameraFilePlayer player(rows);
+        bool same = true;
+        for (uint64_t submit = 0; submit < 14u; ++submit)
+        {
+            player.beforeSubmit(submit, replay);
+            Camera got;
+            const bool active = replay.activeCamera(got);
+            const bool expected = submit < 4u || (submit >= 8u && submit < 12u);
+            same = same && active == expected && (!active || got.m[15] == (submit < 4u ? 1000.0f : 1002.0f));
+        }
+        player.finish(replay);
+        Camera got;
+        t.IsTrue(same, "Submits 0-3 and 8-11 have their cameras, the others none");
+        t.IsTrue(player.camerasPlayed() == 2u && !replay.activeCamera(got), "two cameras played, none left active");
+
+        // What is not a side file is refused.
+        {
+            std::ofstream bad(path);
+            bad << "PS2XCAM 1\non 5 1 0 1 2 3\n";
+        }
+        t.IsFalse(loadCameraFile(path.string(), rows, &error) || !rows.empty(), "a row with too few numbers is refused");
+        {
+            std::ofstream bad(path);
+            bad << "something else\n";
+        }
+        t.IsFalse(loadCameraFile(path.string(), rows, &error), "a file without the first line is refused");
+        std::error_code ec;
+        fs::remove(path, ec);
+        t.IsFalse(loadCameraFile(path.string(), rows, &error), "a missing file is reported");
+    });
+
+    tc.Run("the debug views on the GPU renderer: off or without a camera the picture is the same bytes; with both, normals and heights are drawn", [](TestCase &t)
+    {
+        if (!SDL_Init(SDL_INIT_VIDEO))
+        {
+            SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "offscreen");
+            if (!SDL_Init(SDL_INIT_VIDEO))
+            {
+                std::cout << "    (skipped: no SDL video driver)" << std::endl;
+                return;
+            }
+        }
+        const SDL_GPUShaderFormat formats = SDL_GPU_SHADERFORMAT_SPIRV | SDL_GPU_SHADERFORMAT_DXIL | SDL_GPU_SHADERFORMAT_MSL;
+        SDL_GPUDevice *device = SDL_CreateGPUDevice(formats, false, nullptr);
+        if (!device)
+        {
+            std::cout << "    (skipped: no GPU device: " << SDL_GetError() << ")" << std::endl;
+            return;
+        }
+        {
+            ps2x_settings::resetForTest();
+            ps2x_postfx::Params off;
+            off.enabled = false;
+            ps2x_postfx::setLive(off);
+            GSMem::InitLookupTables();
+            const Field plain = renderField(device, nullptr, false);
+            const Field cameraOnly = renderField(device, nullptr, true);
+            const Field switchOnly = renderField(device, "normal", false);
+            const Field normals = renderField(device, "normal", true);
+            const Field heights = renderField(device, "position", true);
+            t.IsTrue(plain.ok && cameraOnly.ok && switchOnly.ok && normals.ok && heights.ok, "five fields were read back");
+            if (plain.ok && cameraOnly.ok && switchOnly.ok && normals.ok && heights.ok)
+            {
+                // The floor's centre is at GS (2048, 2131): picture (320, 390). The wall's is at GS (2048, 2065): picture (320, 258).
+                t.IsTrue(near3(plain.at(320, 390), 200, 60, 20, 1) && near3(plain.at(320, 258), 20, 60, 200, 1),
+                         "the plain picture has the two triangles in their own colours: floor " + rgbText(plain.at(320, 390)) + ", wall " + rgbText(plain.at(320, 258)));
+                t.IsTrue(plain.px == cameraOnly.px, "a camera without the switch: the same bytes");
+                t.IsTrue(plain.px == switchOnly.px, "the switch without a camera: the same bytes");
+                t.IsTrue(near3(normals.at(320, 390), 128, 255, 128, 1), "normal view: the floor faces up, (128, 255, 128); got " + rgbText(normals.at(320, 390)));
+                t.IsTrue(near3(normals.at(320, 258), 128, 128, 0, 1), "normal view: the wall faces the eye at -z, (128, 128, 0); got " + rgbText(normals.at(320, 258)));
+                t.IsTrue(near3(normals.at(40, 40), 30, 40, 60, 1), "normal view: the clear is left alone");
+                // Height view: y = -200 is below the ramp, its first colour (26, 38, 140), or that times 0.45 on a grid line; y = 0 on the
+                // wall's centre line is halfway from the first colour to the second: (26, 96, 153).
+                const uint8_t *floorPixel = heights.at(320, 390);
+                t.IsTrue(near3(floorPixel, 26, 38, 140, 2) || near3(floorPixel, 11, 17, 63, 2), "height view: the floor, 200 below the eye; got " + rgbText(floorPixel));
+                bool gridSeen = false, plainSeen = false;
+                for (uint32_t x = 250; x < 390; ++x)
+                {
+                    gridSeen = gridSeen || near3(heights.at(x, 420), 11, 17, 63, 2);
+                    plainSeen = plainSeen || near3(heights.at(x, 420), 26, 38, 140, 2);
+                }
+                t.IsTrue(gridSeen && plainSeen, "height view: the floor shows grid lines between plain squares");
+                const uint8_t *wallPixel = heights.at(325, 248); // y = 0 is GS row 2048: picture row 224; a little below it, off the x = 0 grid line
+                t.IsTrue(wallPixel[2] > wallPixel[0] && wallPixel[1] > 40 && wallPixel[1] < 110, "height view: the wall near y 0 is between the first two colours; got " + rgbText(wallPixel));
+                t.IsFalse(heights.px == normals.px, "the two views differ");
+            }
+        }
+        SDL_DestroyGPUDevice(device);
     });
 
     });

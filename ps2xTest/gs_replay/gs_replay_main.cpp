@@ -47,6 +47,16 @@
 #include "runtime/gs/gs_recording.h"
 #include "../common/png_write.h"
 
+// The camera side file of a clip (match lights; ps2xRuntime/src/lib/gpu/gpu_lighting.h, declared here because this program
+// is built without the runtime's src/lib include directory).
+namespace ps2x_lighting
+{
+    bool replayCamerasLoad(const std::string &path, std::string *error);
+    void replayCamerasBeforeSubmit(uint64_t submit);
+    void replayCamerasFinish();
+    uint64_t replayCamerasPlayed();
+}
+
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_gpu.h>
 
@@ -89,6 +99,8 @@ namespace
     struct Options
     {
         std::string file;
+        std::string cameraFile;  // --camera FILE: the camera side file to play (default: "<clip>.camera" if it exists)
+        bool noCamera = false;   // --no-camera: play no camera side file
         std::string backend = "cpu";
         std::string fields = "weave";
         std::string compareRows = "parity";
@@ -326,6 +338,16 @@ namespace
             else if (arg == "--info")
             {
                 o.info = true;
+            }
+            else if (arg == "--camera")
+            {
+                const char *v = value("--camera");
+                if (!v) return false;
+                o.cameraFile = v;
+            }
+            else if (arg == "--no-camera")
+            {
+                o.noCamera = true;
             }
             else if (arg == "--presents")
             {
@@ -1644,6 +1666,32 @@ int main(int argc, char **argv)
     std::string stopReason = "End record";
     const std::string clip = clipName(opt.file);
 
+    // The camera side file: which Submit records were drawn with which match camera (written beside a clip by the game's recorder).
+    // Without one, or with --no-camera, no primitive has a camera, as before the file existed.
+    bool camerasLoaded = false;
+    uint64_t cameraSubmit = 0; // Submit records read so far, filtered or not: the number the side file counts by
+    if (!opt.noCamera)
+    {
+        const std::string cameraPath = opt.cameraFile.empty() ? opt.file + ".camera" : opt.cameraFile;
+        std::FILE *probe = std::fopen(cameraPath.c_str(), "rb");
+        if (probe)
+        {
+            std::fclose(probe);
+            std::string error;
+            camerasLoaded = ps2x_lighting::replayCamerasLoad(cameraPath, &error);
+            if (!camerasLoaded)
+            {
+                std::fprintf(stderr, "camera side file: %s\n", error.c_str());
+                return 2;
+            }
+        }
+        else if (!opt.cameraFile.empty())
+        {
+            std::fprintf(stderr, "camera side file: cannot open %s\n", cameraPath.c_str());
+            return 2;
+        }
+    }
+
     // --vs-scale1 bookkeeping: the scaled picture averaged down by `opt.scale`, with the blocks' corners at multiples of the scale
     // (shift 0) and moved up and left by half the scale (shift scale / 2), against the scale-1 picture of the same marker.
     constexpr int kDownsampleTolerance = 8;
@@ -1691,6 +1739,12 @@ int main(int argc, char **argv)
             return 2;
         }
         ++records;
+        if (rec.type == GSRec::RT_Submit)
+        {
+            if (camerasLoaded)
+                ps2x_lighting::replayCamerasBeforeSubmit(cameraSubmit);
+            ++cameraSubmit;
+        }
         if (rec.type == GSRec::RT_Submit && ((opt.onlyState >= 0 && static_cast<int>(rec.stateId) != opt.onlyState) ||
                                              (opt.skipState >= 0 && static_cast<int>(rec.stateId) == opt.skipState)))
             continue; // debugging filter
@@ -2004,6 +2058,11 @@ int main(int argc, char **argv)
             applyRecord(gpuSide, rec);
         if (refBackend)
             applyRecord(refSide, rec);
+    }
+    if (camerasLoaded)
+    {
+        ps2x_lighting::replayCamerasFinish();
+        std::printf("camera side file: %llu cameras played\n", static_cast<unsigned long long>(ps2x_lighting::replayCamerasPlayed()));
     }
     if (useCpu)
         cpuBackend->Sync(GSSyncReason::DebugReadback);

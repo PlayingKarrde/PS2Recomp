@@ -87,9 +87,12 @@
 #include "runtime/gs/ps2_gs_memory.h"
 #include "runtime/gs/ps2_gs_transfer.h"
 
+#include "gpu/gpu_lighting.h"
 #include "gpu/gpu_postfx.h"
 #include "gpu/gpu_shaders.h"
 #include "shaders/compiled/gs_frag.h"
+#include "shaders/compiled/gs_light_debug_frag.h"
+#include "shaders/compiled/gs_light_vert.h"
 #include "shaders/compiled/gs_rep_frag.h"
 #include "shaders/compiled/gszcopy_frag.h"
 #include "shaders/compiled/gs_vert.h"
@@ -335,6 +338,7 @@ namespace
         // (job `fxJob` of Impl::fxJobs) on the frame target as it is at that point of the list.
         int32_t fxJob = -1;
         bool replay = false, replayFirst = false;
+        uint32_t lightFirst = 0; // a draw with kLightKey: its first vertex in Impl::lightVerts (as many as vertexCount, in the same order)
     };
 
     SDL_GPUBlendFactor toSdl(BlendFactor f)
@@ -378,6 +382,9 @@ namespace
     constexpr uint32_t kRepKey = 1u << 13;      // the pipeline for textures a pack replaces (gs_rep.frag.hlsl, two samplers)
     // A Draw with this key draws nothing: it marks the end of a scene, where flushLocked runs the effect chain on the frame target (tasks fx1, fx1b).
     constexpr uint32_t kBoundaryKey = 1u << 14;
+    // Match lights (task lt2-L0b): the pipeline for scene triangles that carry recovered world data in a second vertex stream
+    // (gs_light.vert.hlsl; today only the debug views draw with it, gs_light_debug.frag.hlsl).
+    constexpr uint32_t kLightKey = 1u << 15;
     // The screen effects tell scene from overlay by the Z of the last vertex (docs/hd-lighting.md, "The boundary"): the scene's is below
     // 65536 (the highest seen in a whole match: 23,772), the overlay's (clock, pause panel, popups, fades) at or above it. 65536 / 2^24 is exact in a float.
     constexpr float kOverlayZ = 65536.0f * GSGpu::kDepthScale;
@@ -623,6 +630,43 @@ struct GSGpuBackend::Impl
         uint32_t cpsm = 0, csm = 0, csa = 0, psm = 0, texa = 0;
         uint64_t hash = 0;
     } clutMemo;
+
+    // ---- match lights (tasks lt2-L0a, lt2-L0b; gpu/gpu_lighting.h, docs/hd-lighting-tier2.md). With lightRecover false none of it runs.
+    // While the game hands over a frame that has a camera (ps2x_lighting::channel().activeCamera(), true only on the kicking thread
+    // during the kick), every scene triangle (S, T, Q coordinates, Z below the overlay) gets the world position of its corners and its
+    // face normal back from x, y and Q. PS2X_LIGHT_DEBUG=position|normal draws those in place of the scene (gs_light_debug.frag.hlsl);
+    // PS2X_LIGHT_MATLOG=<file> writes, per frame, how high the recovered mat is (it should be 100); PS2X_LIGHT_TIME=1 times the recovery.
+    struct LightVertex
+    {
+        float worldQ[3]; // world position x Q (the fragment shader divides by the interpolated Q)
+        float normal[3]; // the unit face normal, turned to the camera
+    };
+    static_assert(sizeof(LightVertex) == 24, "the second vertex stream is described to SDL_GPU by offset");
+    uint32_t lightDebug = 0;   // 0 off, 1 position, 2 normal
+    bool lightRecover = false; // the debug view or the mat log wants the recovery
+    bool lightTiming = false;
+    std::FILE *lightMatLog = nullptr;
+    SDL_GPUShader *lightVertexShader = nullptr;
+    SDL_GPUShader *lightDebugShader = nullptr;
+    SDL_GPUBuffer *lightBuffer = nullptr;
+    size_t lightBufferBytes = 0;
+    SDL_GPUTransferBuffer *lightUpload = nullptr;
+    size_t lightUploadBytes = 0;
+    std::vector<LightVertex> lightVerts;        // this flush's
+    const LightVertex *lightPending = nullptr;  // set by submit for the primitive it is handing to submitSetup
+    uint64_t lightSerial = 0;                   // the camera lightUnproject was made from
+    ps2x_lighting::Unprojector lightUnproject;
+    struct LightStats
+    {
+        uint64_t triangles = 0, noNormal = 0, cameras = 0, drawn = 0, nanos = 0;
+        // the mat of the frame being handed over (PS2X_LIGHT_MATLOG)
+        uint32_t matVertices = 0, matEdgeVertices = 0;
+        double matSum = 0.0, matMin = 0.0, matMax = 0.0, matEdgeSum = 0.0, matEdgeMin = 0.0, matEdgeMax = 0.0;
+    } lightStats;
+    bool lightRecoverTriangle(const GSPrimitiveBatch &batch, const Setup &setup, LightVertex out[3]);
+    void lightMatRow();
+    bool lightEnsureBuffers(size_t bytes);
+    void lightShutdown();
 
     // ---- the draw list being recorded
     std::vector<Vertex> vertices;
@@ -1028,6 +1072,37 @@ bool GSGpuBackend::Impl::init(SDL_GPUDevice *device, uint32_t s, GSGpuBackend::F
     zcopyShader = ps2x::gpu::createShader(dev, ps2x::gpu::shaders::gszcopy_frag);
     if (!vertexShader || !fragmentShader || !zcopyShader)
         return false;
+    if (const char *view = std::getenv("PS2X_LIGHT_DEBUG"))
+    {
+        if (std::strcmp(view, "position") == 0)
+            lightDebug = 1;
+        else if (std::strcmp(view, "normal") == 0)
+            lightDebug = 2;
+        else if (*view && std::strcmp(view, "0") != 0 && std::strcmp(view, "off") != 0)
+            std::fprintf(stderr, "[light] PS2X_LIGHT_DEBUG=%s is not position or normal; the debug view is off\n", view);
+        if (lightDebug != 0)
+        {
+            lightVertexShader = ps2x::gpu::createShader(dev, ps2x::gpu::shaders::gs_light_vert);
+            lightDebugShader = ps2x::gpu::createShader(dev, ps2x::gpu::shaders::gs_light_debug_frag);
+            if (!lightVertexShader || !lightDebugShader)
+            {
+                std::fprintf(stderr, "[light] the debug view's shaders could not be created; the debug view is off\n");
+                lightDebug = 0;
+            }
+            else
+                std::fprintf(stderr, "[light] debug view: %s (scene triangles of frames that have a camera)\n", lightDebug == 1 ? "position" : "normal");
+        }
+    }
+    if (const char *file = std::getenv("PS2X_LIGHT_MATLOG"))
+    {
+        if (*file && (lightMatLog = std::fopen(file, "w")) != nullptr)
+            std::fprintf(lightMatLog, "camera_serial,game_frame,mat_vertices,y_mean,y_min,y_max,edge_vertices,edge_y_mean,edge_y_min,edge_y_max\n");
+    }
+    {
+        const char *timing = std::getenv("PS2X_LIGHT_TIME");
+        lightTiming = timing && *timing && std::strcmp(timing, "0") != 0;
+    }
+    lightRecover = lightDebug != 0 || lightMatLog != nullptr || lightTiming;
     if (packStore || fontAtlas)
     {
         repShader = ps2x::gpu::createShader(dev, ps2x::gpu::shaders::gs_rep_frag);
@@ -1252,6 +1327,7 @@ GSGpuBackend::Impl::~Impl()
             SDL_ReleaseGPUTexture(dev, slot.tex);
     if (vertexBuffer)
         SDL_ReleaseGPUBuffer(dev, vertexBuffer);
+    lightShutdown();
     if (uploadBuffer)
         SDL_ReleaseGPUTransferBuffer(dev, uploadBuffer);
     if (sampler)
@@ -1549,11 +1625,19 @@ SDL_GPUGraphicsPipeline *GSGpuBackend::Impl::pipeline(uint32_t key)
     vb.slot = 0;
     vb.pitch = sizeof(Vertex);
     vb.input_rate = SDL_GPU_VERTEXINPUTRATE_VERTEX;
-    SDL_GPUVertexAttribute attrs[4] = {};
+    SDL_GPUVertexAttribute attrs[6] = {};
     attrs[0] = {0, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2, offsetof(Vertex, x)};
     attrs[1] = {1, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT, offsetof(Vertex, z)};
     attrs[2] = {2, 0, SDL_GPU_VERTEXELEMENTFORMAT_UBYTE4_NORM, offsetof(Vertex, rgba)};
     attrs[3] = {3, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, offsetof(Vertex, u)};
+    // Match lights: a second stream with the recovered world position (x Q) and face normal of each vertex.
+    const bool lit = (key & kLightKey) != 0u;
+    SDL_GPUVertexBufferDescription vbs[2] = {vb, {}};
+    vbs[1].slot = 1;
+    vbs[1].pitch = sizeof(LightVertex);
+    vbs[1].input_rate = SDL_GPU_VERTEXINPUTRATE_VERTEX;
+    attrs[4] = {4, 1, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, offsetof(LightVertex, worldQ)};
+    attrs[5] = {5, 1, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, offsetof(LightVertex, normal)};
 
     SDL_GPUColorTargetDescription ct = {};
     ct.format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
@@ -1577,12 +1661,12 @@ SDL_GPUGraphicsPipeline *GSGpuBackend::Impl::pipeline(uint32_t key)
     }
 
     SDL_GPUGraphicsPipelineCreateInfo info = {};
-    info.vertex_shader = vertexShader;
-    info.fragment_shader = zrestore ? zcopyShader : (replaced ? repShader : fragmentShader);
-    info.vertex_input_state.vertex_buffer_descriptions = &vb;
-    info.vertex_input_state.num_vertex_buffers = 1;
+    info.vertex_shader = lit ? lightVertexShader : vertexShader;
+    info.fragment_shader = lit ? lightDebugShader : (zrestore ? zcopyShader : (replaced ? repShader : fragmentShader));
+    info.vertex_input_state.vertex_buffer_descriptions = vbs;
+    info.vertex_input_state.num_vertex_buffers = lit ? 2 : 1;
     info.vertex_input_state.vertex_attributes = attrs;
-    info.vertex_input_state.num_vertex_attributes = 4;
+    info.vertex_input_state.num_vertex_attributes = lit ? 6 : 4;
     info.primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST;
     info.rasterizer_state.fill_mode = SDL_GPU_FILLMODE_FILL;
     info.rasterizer_state.cull_mode = SDL_GPU_CULLMODE_NONE;
@@ -2681,6 +2765,16 @@ void GSGpuBackend::Impl::submitSetup(const GSDrawState &state, const Setup &setu
     const uint32_t first = static_cast<uint32_t>(vertices.size());
     vertices.insert(vertices.end(), setup.v, setup.v + setup.count);
     stats.vertices += setup.count;
+    if (lightPending)
+    {
+        // The debug view draws the recovered data, not the game's colour: a replacement texture is not needed for that (the original's
+        // alpha gives the cut-out), so the draw goes back to the plain texture path with the light bit.
+        d.rep = 0;
+        d.pipeline = (d.pipeline & ~kRepKey) | kLightKey;
+        d.lightFirst = static_cast<uint32_t>(lightVerts.size());
+        lightVerts.insert(lightVerts.end(), lightPending, lightPending + 3);
+        ++lightStats.drawn;
+    }
     if (!draws.empty())
     {
         Draw &last = draws.back();
@@ -2747,7 +2841,11 @@ void GSGpuBackend::Impl::submit(const GSPrimitiveBatch &batch)
         setup.maxX = 639 + static_cast<int32_t>(padRight);
         ++wc.filled;
     }
+    LightVertex lightOut[3];
+    if (lightRecover && setup.count == 3 && !batch.state.prim.fst && lightRecoverTriangle(batch, setup, lightOut) && lightDebug != 0)
+        lightPending = lightOut;
     submitSetup(batch.state, setup);
+    lightPending = nullptr;
     if (vertices.size() >= kMaxVerticesPerFlush || stage.size() >= kMaxStageBytes)
         flushLocked(false);
 }
@@ -2822,6 +2920,7 @@ void GSGpuBackend::Impl::flushLocked(bool wait, const FieldCopy *fieldCopies, in
         {
             draws.clear();
             vertices.clear();
+            lightVerts.clear();
             pendingUploads.clear();
             stage.clear();
             return;
@@ -2872,8 +2971,32 @@ void GSGpuBackend::Impl::flushLocked(bool wait, const FieldCopy *fieldCopies, in
         SDL_EndGPUCopyPass(copy);
     }
 
+    if (!lightVerts.empty())
+    {
+        // Match lights: the second vertex stream of this flush's lit draws, through a transfer buffer of its own.
+        const size_t bytes = lightVerts.size() * sizeof(LightVertex);
+        uint8_t *map = lightEnsureBuffers(bytes) ? static_cast<uint8_t *>(SDL_MapGPUTransferBuffer(dev, lightUpload, true)) : nullptr;
+        if (map)
+        {
+            std::memcpy(map, lightVerts.data(), bytes);
+            SDL_UnmapGPUTransferBuffer(dev, lightUpload);
+            SDL_GPUCopyPass *copy = SDL_BeginGPUCopyPass(cmd);
+            SDL_GPUTransferBufferLocation src = {lightUpload, 0};
+            SDL_GPUBufferRegion dst = {lightBuffer, 0, static_cast<Uint32>(bytes)};
+            SDL_UploadToGPUBuffer(copy, &src, &dst, true);
+            SDL_EndGPUCopyPass(copy);
+        }
+        else
+        {
+            // No buffer: draw them as the plain scene (the first stream alone is a complete vertex).
+            for (Draw &d : draws)
+                d.pipeline &= ~kLightKey;
+        }
+    }
+
     ps2x_gs::DebugPassLock passLock; // validation only: see gs_gpu_threads.h
     SDL_GPURenderPass *pass = nullptr;
+    bool litBinding = false; // the vertex buffers bound in the open pass are a lit draw's (both streams, at the draw's own offsets)
     uint32_t curFrame = ~0u, curDepth = ~0u;
     uint32_t curPipeline = ~0u;
     SDL_GPUTexture *curTexture = reinterpret_cast<SDL_GPUTexture *>(~uintptr_t(0));
@@ -2906,6 +3029,7 @@ void GSGpuBackend::Impl::flushLocked(bool wait, const FieldCopy *fieldCopies, in
         SDL_PushGPUVertexUniformData(cmd, 0, globals, sizeof(globals));
         SDL_GPUBufferBinding vb = {vertexBuffer, 0};
         SDL_BindGPUVertexBuffers(pass, 0, &vb, 1);
+        litBinding = false;
         curPipeline = ~0u;
         curTexture = reinterpret_cast<SDL_GPUTexture *>(~uintptr_t(0));
         curRepTexture = reinterpret_cast<SDL_GPUTexture *>(~uintptr_t(0));
@@ -2956,6 +3080,26 @@ void GSGpuBackend::Impl::flushLocked(bool wait, const FieldCopy *fieldCopies, in
         }
         const SDL_Rect scissor = {d.sx, d.sy, d.sw, d.sh};
         SDL_SetGPUScissor(pass, &scissor);
+        if ((d.pipeline & kLightKey) != 0u && d.pipeline != kBoundaryKey)
+        {
+            // A lit draw: its vertices sit at different places in the two streams, so each stream is bound at the draw's own start
+            // and the draw begins at vertex 0.
+            const SDL_GPUBufferBinding both[2] = {{vertexBuffer, static_cast<Uint32>(d.firstVertex * sizeof(Vertex))},
+                                                  {lightBuffer, static_cast<Uint32>(d.lightFirst * sizeof(LightVertex))}};
+            SDL_BindGPUVertexBuffers(pass, 0, both, 2);
+            litBinding = true;
+            const uint32_t mode[4] = {lightDebug, 0u, 0u, 0u};
+            SDL_PushGPUFragmentUniformData(cmd, 1, mode, sizeof(mode));
+            SDL_DrawGPUPrimitives(pass, d.vertexCount, 1, 0, 0);
+            ++stats.drawCalls;
+            return;
+        }
+        if (litBinding)
+        {
+            SDL_GPUBufferBinding vb = {vertexBuffer, 0};
+            SDL_BindGPUVertexBuffers(pass, 0, &vb, 1);
+            litBinding = false;
+        }
         SDL_DrawGPUPrimitives(pass, d.vertexCount, 1, d.firstVertex, 0);
         ++stats.drawCalls;
     };
@@ -3105,6 +3249,7 @@ void GSGpuBackend::Impl::flushLocked(bool wait, const FieldCopy *fieldCopies, in
     fxJobs.clear();
     repDraws.clear();
     vertices.clear();
+    lightVerts.clear();
     pendingUploads.clear();
     stage.clear();
     const uint64_t evictStart = nowNanos();
@@ -4084,6 +4229,162 @@ void GSGpuBackend::Impl::fxShutdown()
         std::fclose(fxTrace);
     fxTrace = nullptr;
     fx.reset();
+}
+
+// ------------------------------------------------------------------------------------------------
+// match lights: getting the arena back from projected triangles (tasks lt2-L0a, lt2-L0b; gpu/gpu_lighting.h)
+
+// One scene triangle, while the game hands over a frame that has a camera: the world position of each corner (times its Q) and
+// the face normal. False when there is no camera for this primitive, when it is not part of the scene (the overlay, by the
+// Z rule of the screen effects), or when a corner cannot be recovered. Called on the thread that makes the kick, which is the
+// only thread for which a camera is ever active.
+bool GSGpuBackend::Impl::lightRecoverTriangle(const GSPrimitiveBatch &batch, const Setup &setup, LightVertex out[3])
+{
+    if (setup.v[2].z >= kOverlayZ)
+        return false;
+    ps2x_lighting::Camera camera;
+    if (!ps2x_lighting::channel().activeCamera(camera))
+        return false;
+    const uint64_t t0 = lightTiming ? nowNanos() : 0u;
+    if (camera.serial != lightSerial)
+    {
+        if (lightMatLog && lightSerial != 0u)
+            lightMatRow(); // the frame of the previous camera is complete
+        lightSerial = camera.serial;
+        lightUnproject = ps2x_lighting::Unprojector::from(camera.m);
+        lightStats.matVertices = lightStats.matEdgeVertices = 0;
+        lightStats.matSum = lightStats.matEdgeSum = 0.0;
+        ++lightStats.cameras;
+        if (lightMatLog)
+            std::fprintf(lightMatLog, "%llu,%u,", static_cast<unsigned long long>(camera.serial), camera.gameFrame);
+    }
+    float world[3][3];
+    for (int i = 0; i < 3; ++i)
+    {
+        const GSVertex &v = batch.vertices[static_cast<size_t>(i)];
+        // The game cuts x and y to 1/16 pixel (the fraction is dropped), so the stored value is on average 1/32 below the true
+        // one. Adding that back halves the error and removes its bias (measured on the mat: docs/hd-lighting-tier2.md).
+        if (!lightUnproject.worldAt(v.x + 0.03125f, v.y + 0.03125f, v.q, world[i]))
+            return false;
+        for (int k = 0; k < 3; ++k)
+            out[i].worldQ[k] = world[i][k] * v.q;
+    }
+    float normal[3];
+    bool ok = ps2x_lighting::faceNormal(world[0], world[1], world[2], lightUnproject.eye, normal);
+    if (!ok)
+    {
+        ++lightStats.noNormal; // no area in the world (it has some on the screen, or it would not be here): face the camera's side
+        normal[0] = 0.0f;
+        normal[1] = 1.0f;
+        normal[2] = 0.0f;
+    }
+    for (int i = 0; i < 3; ++i)
+        std::memcpy(out[i].normal, normal, sizeof(normal));
+    ++lightStats.triangles;
+
+    if (lightMatLog)
+    {
+        // The mat: a triangle list with a 256 x 256 texture and no alpha test, inside the ring (docs/hd-lighting-tier2.md, run 9 of
+        // the frame table). Its edge does not move when the mat bounces, so the edge's height shows a camera that is not this frame's.
+        const GSContext &c = batch.state.context;
+        const bool inRing = std::fabs(world[0][0]) <= 401.0f && std::fabs(world[0][2]) <= 401.0f && std::fabs(world[1][0]) <= 401.0f &&
+                            std::fabs(world[1][2]) <= 401.0f && std::fabs(world[2][0]) <= 401.0f && std::fabs(world[2][2]) <= 401.0f;
+        if (batch.state.prim.type == GS_PRIM_TRIANGLE && batch.state.prim.tme && c.tex0.tw == 8 && c.tex0.th == 8 && (c.test & 1ull) == 0u && inRing)
+        {
+            for (int i = 0; i < 3; ++i)
+            {
+                const double y = world[i][1];
+                if (lightStats.matVertices == 0u)
+                    lightStats.matMin = lightStats.matMax = y;
+                lightStats.matMin = std::min(lightStats.matMin, y);
+                lightStats.matMax = std::max(lightStats.matMax, y);
+                lightStats.matSum += y;
+                ++lightStats.matVertices;
+                if (std::fabs(world[i][0]) >= 399.0f || std::fabs(world[i][2]) >= 399.0f)
+                {
+                    if (lightStats.matEdgeVertices == 0u)
+                        lightStats.matEdgeMin = lightStats.matEdgeMax = y;
+                    lightStats.matEdgeMin = std::min(lightStats.matEdgeMin, y);
+                    lightStats.matEdgeMax = std::max(lightStats.matEdgeMax, y);
+                    lightStats.matEdgeSum += y;
+                    ++lightStats.matEdgeVertices;
+                }
+            }
+        }
+    }
+    if (lightTiming)
+        lightStats.nanos += nowNanos() - t0;
+    return ok || lightDebug != 0;
+}
+
+// The rest of a PS2X_LIGHT_MATLOG row (its camera columns were written when the camera was first seen).
+void GSGpuBackend::Impl::lightMatRow()
+{
+    const LightStats &m = lightStats;
+    std::fprintf(lightMatLog, "%u,%.4f,%.4f,%.4f,%u,%.4f,%.4f,%.4f\n", m.matVertices, m.matVertices ? m.matSum / m.matVertices : 0.0, m.matMin, m.matMax,
+                 m.matEdgeVertices, m.matEdgeVertices ? m.matEdgeSum / m.matEdgeVertices : 0.0, m.matEdgeMin, m.matEdgeMax);
+}
+
+bool GSGpuBackend::Impl::lightEnsureBuffers(size_t bytes)
+{
+    if (bytes > lightBufferBytes)
+    {
+        ps2x_gs::DefragGuard defragGuard;
+        if (lightBuffer)
+            SDL_ReleaseGPUBuffer(dev, lightBuffer);
+        if (lightUpload)
+            SDL_ReleaseGPUTransferBuffer(dev, lightUpload);
+        size_t size = std::max<size_t>(1u << 18, lightBufferBytes);
+        while (size < bytes)
+            size *= 2u;
+        SDL_GPUBufferCreateInfo bi = {};
+        bi.usage = SDL_GPU_BUFFERUSAGE_VERTEX;
+        bi.size = static_cast<Uint32>(size);
+        lightBuffer = SDL_CreateGPUBuffer(dev, &bi);
+        SDL_GPUTransferBufferCreateInfo tbi = {};
+        tbi.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD;
+        tbi.size = static_cast<Uint32>(size);
+        lightUpload = SDL_CreateGPUTransferBuffer(dev, &tbi);
+        lightBufferBytes = lightUploadBytes = (lightBuffer && lightUpload) ? size : 0;
+        if (lightBufferBytes == 0)
+        {
+            std::fprintf(stderr, "[light] the buffers for %zu bytes of recovered vertices could not be made: %s\n", size, SDL_GetError());
+            return false;
+        }
+    }
+    return true;
+}
+
+void GSGpuBackend::Impl::lightShutdown()
+{
+    if (lightRecover)
+    {
+        if (lightMatLog)
+        {
+            if (lightSerial != 0u)
+                lightMatRow();
+            std::fclose(lightMatLog);
+            lightMatLog = nullptr;
+        }
+        std::fprintf(stderr, "[light] recovered %llu scene triangles in %llu frames with a camera (%llu with no area in the world), %llu drawn by the debug view",
+                     static_cast<unsigned long long>(lightStats.triangles), static_cast<unsigned long long>(lightStats.cameras),
+                     static_cast<unsigned long long>(lightStats.noNormal), static_cast<unsigned long long>(lightStats.drawn));
+        if (lightTiming && lightStats.triangles != 0u)
+            std::fprintf(stderr, "; %.1f ns a triangle, %.1f us a frame", static_cast<double>(lightStats.nanos) / static_cast<double>(lightStats.triangles),
+                         lightStats.cameras ? static_cast<double>(lightStats.nanos) / 1000.0 / static_cast<double>(lightStats.cameras) : 0.0);
+        std::fprintf(stderr, "\n");
+    }
+    if (lightBuffer)
+        SDL_ReleaseGPUBuffer(dev, lightBuffer);
+    if (lightUpload)
+        SDL_ReleaseGPUTransferBuffer(dev, lightUpload);
+    if (lightVertexShader)
+        SDL_ReleaseGPUShader(dev, lightVertexShader);
+    if (lightDebugShader)
+        SDL_ReleaseGPUShader(dev, lightDebugShader);
+    lightBuffer = nullptr;
+    lightUpload = nullptr;
+    lightVertexShader = lightDebugShader = nullptr;
 }
 
 // ------------------------------------------------------------------------------------------------

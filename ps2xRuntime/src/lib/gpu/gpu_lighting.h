@@ -83,6 +83,68 @@ namespace ps2x_lighting
         Impl *m_impl;
     };
 
+    // ---- the camera side file of a GS recording (task lt2-L0b)
+    // A GS recording (docs/formats/gs-recording.md) holds the primitives but not the camera they were projected with. When the
+    // game records a clip it also writes "<clip>.camera", a text file that says, by the number of the Submit record (0 for the
+    // first Submit of the clip), where a camera becomes active and where it stops:
+    //     PS2XCAM 1
+    //     on <submit> <game frame> <frame buffer> <16 numbers: the matrix>
+    //     off <submit>
+    // The replayer plays those rows into a channel just before the Submit they name, so the renderer finds the same camera
+    // active for the same primitives as it did in the game. The recording format itself is unchanged (version 1).
+    struct CameraFileRow
+    {
+        uint64_t submit = 0;
+        bool on = false;
+        uint32_t gameFrame = 0, buffer = 0;
+        float m[16] = {};
+    };
+
+    class CameraFileWriter
+    {
+    public:
+        ~CameraFileWriter();
+        bool open(const std::string &path);
+        bool isOpen() const { return m_file != nullptr; }
+        // Before Submit number `submit` is recorded: writes a row if what `channel` has active for this thread changed.
+        void note(uint64_t submit, const CameraChannel &channel);
+        void close();
+
+    private:
+        void *m_file = nullptr; // FILE *
+        uint64_t m_serial = 0;  // the active camera at the last note (0: none)
+    };
+
+    bool loadCameraFile(const std::string &path, std::vector<CameraFileRow> &rows, std::string *error = nullptr);
+
+    class CameraFilePlayer
+    {
+    public:
+        explicit CameraFilePlayer(std::vector<CameraFileRow> rows) : m_rows(std::move(rows)) {}
+        // Call before playing Submit number `submit` (0, 1, 2, ... in file order), on the thread that will call the renderer.
+        void beforeSubmit(uint64_t submit, CameraChannel &channel);
+        // After the last record: ends a camera that is still active.
+        void finish(CameraChannel &channel);
+        size_t rows() const { return m_rows.size(); }
+        uint64_t camerasPlayed() const { return m_played; }
+
+    private:
+        std::vector<CameraFileRow> m_rows;
+        size_t m_next = 0;
+        bool m_active = false;
+        uint64_t m_played = 0;
+    };
+
+    // For the game's recorder (GSCpuBackend::Submit, with its mutex held): Submit number `submit` of the clip at `clipPath` is
+    // about to be recorded. Opens "<clipPath>.camera" on the first call for a clip.
+    void recordingSubmit(const std::string &clipPath, uint64_t submit);
+
+    // For the replayer (it declares these itself): load a side file and play it into the game's channel around its Submit records.
+    bool replayCamerasLoad(const std::string &path, std::string *error);
+    void replayCamerasBeforeSubmit(uint64_t submit);
+    void replayCamerasFinish();
+    uint64_t replayCamerasPlayed();
+
     // The game's channel. The first use reads PS2X_LIGHT_TRACE=<file> (the trace above) and PS2X_LIGHT_STATS=1 (a line on
     // stderr every 600 kicks).
     CameraChannel &channel();

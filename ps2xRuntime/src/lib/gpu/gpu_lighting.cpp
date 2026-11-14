@@ -8,7 +8,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <memory>
 #include <mutex>
+#include <string>
 #include <thread>
 
 namespace ps2x_lighting
@@ -160,6 +162,176 @@ namespace ps2x_lighting
         });
         return instance;
     }
+
+    // ================================================================================================================
+    // The camera side file of a GS recording
+    // ================================================================================================================
+    CameraFileWriter::~CameraFileWriter() { close(); }
+
+    bool CameraFileWriter::open(const std::string &path)
+    {
+        close();
+        std::FILE *f = std::fopen(path.c_str(), "w");
+        if (!f)
+            return false;
+        std::setvbuf(f, nullptr, _IOLBF, 1024);
+        std::fprintf(f, "PS2XCAM 1\n");
+        m_file = f;
+        m_serial = 0;
+        return true;
+    }
+
+    void CameraFileWriter::note(uint64_t submit, const CameraChannel &channel)
+    {
+        if (!m_file)
+            return;
+        std::FILE *f = static_cast<std::FILE *>(m_file);
+        Camera camera;
+        if (channel.activeCamera(camera))
+        {
+            if (camera.serial == m_serial)
+                return;
+            m_serial = camera.serial;
+            std::fprintf(f, "on %llu %u %u", static_cast<unsigned long long>(submit), camera.gameFrame, camera.buffer);
+            for (float v : camera.m)
+                std::fprintf(f, " %.9g", static_cast<double>(v));
+            std::fprintf(f, "\n");
+        }
+        else if (m_serial != 0u)
+        {
+            m_serial = 0;
+            std::fprintf(f, "off %llu\n", static_cast<unsigned long long>(submit));
+        }
+    }
+
+    void CameraFileWriter::close()
+    {
+        if (m_file)
+            std::fclose(static_cast<std::FILE *>(m_file));
+        m_file = nullptr;
+    }
+
+    bool loadCameraFile(const std::string &path, std::vector<CameraFileRow> &rows, std::string *error)
+    {
+        rows.clear();
+        std::FILE *f = std::fopen(path.c_str(), "r");
+        if (!f)
+        {
+            if (error)
+                *error = "cannot open " + path;
+            return false;
+        }
+        char line[1024];
+        bool ok = std::fgets(line, sizeof(line), f) != nullptr && std::strncmp(line, "PS2XCAM 1", 9) == 0;
+        if (!ok && error)
+            *error = path + ": not a camera side file (the first line must be PS2XCAM 1)";
+        uint64_t last = 0;
+        int number = 1;
+        while (ok && std::fgets(line, sizeof(line), f))
+        {
+            ++number;
+            if (line[0] == '\n' || line[0] == '\r' || line[0] == '#')
+                continue;
+            CameraFileRow row;
+            unsigned long long submit = 0;
+            int used = 0;
+            if (std::sscanf(line, "off %llu", &submit) == 1)
+            {
+                row.on = false;
+            }
+            else if (std::sscanf(line, "on %llu %u %u%n", &submit, &row.gameFrame, &row.buffer, &used) == 3)
+            {
+                row.on = true;
+                const char *at = line + used;
+                for (int i = 0; i < 16 && ok; ++i)
+                {
+                    char *end = nullptr;
+                    row.m[i] = std::strtof(at, &end);
+                    ok = end != at;
+                    at = end;
+                }
+            }
+            else
+                ok = false;
+            row.submit = submit;
+            ok = ok && (rows.empty() || submit >= last);
+            last = submit;
+            if (ok)
+                rows.push_back(row);
+            else if (error)
+                *error = path + ": line " + std::to_string(number) + " is not a camera row in order";
+        }
+        std::fclose(f);
+        if (!ok)
+            rows.clear();
+        return ok;
+    }
+
+    void CameraFilePlayer::beforeSubmit(uint64_t submit, CameraChannel &channel)
+    {
+        while (m_next < m_rows.size() && m_rows[m_next].submit <= submit)
+        {
+            const CameraFileRow &row = m_rows[m_next++];
+            if (m_active)
+                channel.kickEnd(0u);
+            m_active = false;
+            if (row.on)
+            {
+                channel.post(row.m, row.gameFrame, row.buffer);
+                channel.kickBegin(row.gameFrame, row.buffer);
+                m_active = true;
+                ++m_played;
+            }
+        }
+    }
+
+    void CameraFilePlayer::finish(CameraChannel &channel)
+    {
+        if (m_active)
+            channel.kickEnd(0u);
+        m_active = false;
+    }
+
+    void recordingSubmit(const std::string &clipPath, uint64_t submit)
+    {
+        static CameraFileWriter writer;
+        static std::string openFor;
+        if (openFor != clipPath)
+        {
+            openFor = clipPath;
+            if (!writer.open(clipPath + ".camera"))
+                std::fprintf(stderr, "[light] cannot write the camera side file %s.camera\n", clipPath.c_str());
+        }
+        writer.note(submit, channel());
+    }
+
+    namespace
+    {
+        std::unique_ptr<CameraFilePlayer> g_replayCameras;
+    }
+
+    bool replayCamerasLoad(const std::string &path, std::string *error)
+    {
+        std::vector<CameraFileRow> rows;
+        if (!loadCameraFile(path, rows, error))
+            return false;
+        g_replayCameras = std::make_unique<CameraFilePlayer>(std::move(rows));
+        return true;
+    }
+
+    void replayCamerasBeforeSubmit(uint64_t submit)
+    {
+        if (g_replayCameras)
+            g_replayCameras->beforeSubmit(submit, channel());
+    }
+
+    void replayCamerasFinish()
+    {
+        if (g_replayCameras)
+            g_replayCameras->finish(channel());
+    }
+
+    uint64_t replayCamerasPlayed() { return g_replayCameras ? g_replayCameras->camerasPlayed() : 0u; }
 
     // ================================================================================================================
     // Undoing the projection
