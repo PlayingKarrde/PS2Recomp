@@ -35,6 +35,8 @@ namespace ps2x_settings
             // The screen effects (task fx1, src/lib/gpu/gpu_postfx.h). fx_preset picks the values, the fx_<name> rows override one of them
             // (empty: the preset's own value). The names are the table in gpu_postfx.cpp; a unit test keeps the two in step.
             {"fx", "PS2X_FX", "off"},
+            // The match lights (task lt2-L2, src/lib/gpu/gpu_lighting.h): on or off; the look itself is a file per arena (lights/arenaNN.look).
+            {"light", "PS2X_LIGHT", "off"},
             {"fx_preset", "PS2X_FX_PRESET", "subtle"},
             // Which effects are on, each on by default; a preset never sets them. An effect that is off does none of its work (fx2).
             {"fx_bloom", "PS2X_FX_BLOOM", "on"},
@@ -142,7 +144,7 @@ namespace ps2x_settings
                 return fxPresetValue(value) ? std::optional<std::string>(value) : std::nullopt;
             if (isFxNumberKey(key))
                 return fxNumber(value);
-            if (key == "fullscreen" || key == "vsync" || key == "texture_tools" || key == "skip_intros" || key == "fx" || isFxToggleKey(key))
+            if (key == "fullscreen" || key == "vsync" || key == "texture_tools" || key == "skip_intros" || key == "fx" || key == "light" || isFxToggleKey(key))
             {
                 if (value == "on" || value == "1" || value == "true" || value == "yes")
                     return std::string("on");
@@ -274,7 +276,7 @@ namespace ps2x_settings
                 return std::string("21:9");
             return text; // another shape (32:9): shown as it is
         }
-        if (key == "fullscreen" || key == "texture_tools" || key == "skip_intros" || key == "fx")
+        if (key == "fullscreen" || key == "texture_tools" || key == "skip_intros" || key == "fx" || key == "light")
         {
             if (text == "1" || text == "on" || text == "true" || text == "yes")
                 return std::string("on");
@@ -337,7 +339,7 @@ namespace ps2x_settings
         const Definition *def = find(key);
         if (!v || !def || *v == def->defaultValue)
             return std::nullopt;
-        if (key == "fullscreen" || key == "texture_tools" || key == "skip_intros" || key == "fx")
+        if (key == "fullscreen" || key == "texture_tools" || key == "skip_intros" || key == "fx" || key == "light")
             return std::string("1");
         if (isFxToggleKey(key))
             return std::string("0"); // on is the default and was filtered out above
@@ -383,9 +385,10 @@ namespace ps2x_settings
                           "# skip_intros = on | off      start at the title screen without the logos and the opening movie (next start)\n"
                           "# strike_depth = original | wide | wider   a strike's reach toward or away from the screen (x1, x1.5, x2)\n"
                           "# fx = on | off                 screen effects in matches (bloom, colour grading, tilt-shift, vignette; docs/hd-lighting.md)\n"
+                          "# light = on | off              lights in matches: the arena dimmed and lit by the look in lights/arenaNN.look (docs/hd-lighting-tier2.md)\n"
                           "# fx_preset = off | subtle | strong   fx_<name> = a number: one value of the effects instead of the preset's (blank: the preset's)\n"
                           "# An environment variable (PS2X_GS_BACKEND, PS2X_GS_SCALE, PS2X_GS_WIDE, PS2X_FULLSCREEN, PS2X_GPU_PRESENT_MODE,\n"
-                          "# PS2X_SCALE, PS2X_VOLUME, PS2X_AUTHORING, PS2X_SKIP_INTROS, PS2X_STRIKE_DEPTH, PS2X_FX, PS2X_FX_PRESET, PS2X_FX_BLOOM|GRADING|TILTSHIFT|VIGNETTE, PS2X_FX_<NAME>) set before the game starts wins over this file.\n";
+                          "# PS2X_SCALE, PS2X_VOLUME, PS2X_AUTHORING, PS2X_SKIP_INTROS, PS2X_STRIKE_DEPTH, PS2X_FX, PS2X_LIGHT, PS2X_FX_PRESET, PS2X_FX_BLOOM|GRADING|TILTSHIFT|VIGNETTE, PS2X_FX_<NAME>) set before the game starts wins over this file.\n";
         for (const Entry &entry : entries)
             if (!entry.value.empty()) // a blank value (an fx_<name> that has no override) is the default: not written
                 out += entry.key + " = " + entry.value + "\n";

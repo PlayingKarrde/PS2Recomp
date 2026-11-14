@@ -1,6 +1,7 @@
 #include "ps2_debug_panel.h"
 #include "ps2_runtime.h"
 #include "ps2_runtime_macros.h"
+#include "gpu/gpu_lighting.h"
 #include "gpu/gpu_postfx.h"
 #include "ps2_settings.h"
 #include "ps2_log.h"
@@ -2208,6 +2209,179 @@ namespace
         }
     }
 
+    // Match lights (task lt2-L2, src/lib/gpu/gpu_lighting.h, docs/hd-lighting-tier2.md): the look of the arena being played. Every slider
+    // takes effect on the next field. The sliders change the live look only; "Save" writes it as the user's look of this arena.
+    // Units are the game's: the ring is 800 x 800 around the centre (its corners are at 400 either way), the mat is at height 100.
+    void drawLightsTab()
+    {
+        using namespace ps2x_lighting;
+        Look look = currentLook();
+        bool changed = false;
+
+        bool on = ps2x_settings::get("light") == "on";
+        if (ImGui::Checkbox("Arena lighting on", &on))
+            ps2x_settings::set("light", on ? "on" : "off");
+        ImGui::SameLine();
+        LightStatus &status = lightStatus();
+        if (ps2x_settings::fixedByEnvironment("light"))
+            ImGui::TextDisabled("(fixed by PS2X_LIGHT)");
+        else if (status.unavailable.load())
+            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f), "not available: needs the progressive GPU renderer (the default)");
+        else if (status.live.load())
+            ImGui::TextDisabled("(%u lit primitives in the last field)", status.litLastField.load());
+        else
+            ImGui::TextDisabled("(off)");
+
+        const int arena = currentArena();
+        if (arena >= 0)
+            ImGui::Text("Arena %d. Look: %s", arena, lookSource().c_str());
+        else
+            ImGui::Text("No match yet. Look: %s", lookSource().c_str());
+
+        bool show = showLights();
+        if (ImGui::Checkbox("Show lights", &show))
+            setShowLights(show);
+        ImGui::SameLine();
+        ImGui::TextDisabled("a dot under each light, the outline of its cone (or range), a ring where it aims; in the light's colour below");
+
+        ImGui::TextUnformatted("Start from:");
+        for (const std::string &name : presetNames())
+        {
+            ImGui::SameLine();
+            if (ImGui::SmallButton(name.c_str()))
+            {
+                look = presetLook(name);
+                changed = true;
+            }
+        }
+        ImGui::TextDisabled("The ring is 800 x 800 around the centre: its corners are 400 either way. The mat is at height 100, the post tops at 255.");
+
+        ImGui::SeparatorText("The hall before any light (ambient)");
+        {
+            float level = std::max(look.ambient[0], std::max(look.ambient[1], look.ambient[2]));
+            float colour[3] = {1.0f, 1.0f, 1.0f};
+            if (level > 0.0f)
+                for (int i = 0; i < 3; ++i)
+                    colour[i] = look.ambient[i] / level;
+            bool edited = ImGui::SliderFloat("Level (1 = as the game draws it)", &level, 0.0f, 1.5f, "%.2f");
+            edited = ImGui::ColorEdit3("Tint", colour, ImGuiColorEditFlags_Float) || edited;
+            if (edited)
+            {
+                for (int i = 0; i < 3; ++i)
+                    look.ambient[i] = level * colour[i];
+                changed = true;
+            }
+        }
+
+        int removeAt = -1, duplicateAt = -1;
+        for (size_t i = 0; i < look.lights.size(); ++i)
+        {
+            Light &l = look.lights[i];
+            ImGui::PushID(static_cast<int>(i));
+            float marker[3];
+            markerColour(static_cast<int>(i), marker);
+            ImGui::ColorButton("##marker", ImVec4(marker[0], marker[1], marker[2], 1.0f), ImGuiColorEditFlags_NoTooltip | ImGuiColorEditFlags_NoPicker, ImVec2(14.0f, 14.0f));
+            ImGui::SameLine();
+            char title[64];
+            std::snprintf(title, sizeof(title), "Light %zu: %s%s###light", i + 1u, l.type == LightType::Spot ? "spotlight" : "point light", l.on ? "" : " (off)");
+            if (ImGui::CollapsingHeader(title, ImGuiTreeNodeFlags_DefaultOpen))
+            {
+                changed = ImGui::Checkbox("On", &l.on) || changed;
+                ImGui::SameLine();
+                int type = l.type == LightType::Spot ? 0 : 1;
+                ImGui::SetNextItemWidth(140.0f);
+                if (ImGui::Combo("Kind", &type, "Spotlight\0Point light\0"))
+                {
+                    l.type = type == 0 ? LightType::Spot : LightType::Point;
+                    changed = true;
+                }
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Duplicate") && look.lights.size() < static_cast<size_t>(kMaxLights))
+                    duplicateAt = static_cast<int>(i);
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Remove"))
+                    removeAt = static_cast<int>(i);
+
+                changed = ImGui::SliderFloat("Across (x)", &l.position[0], -2000.0f, 2000.0f, "%.0f") || changed;
+                changed = ImGui::SliderFloat("Height", &l.position[1], 100.0f, 3000.0f, "%.0f") || changed;
+                changed = ImGui::SliderFloat("Along (z)", &l.position[2], -2000.0f, 2000.0f, "%.0f") || changed;
+                if (l.type == LightType::Spot)
+                {
+                    changed = ImGui::SliderFloat("Aims at: across (x)", &l.target[0], -1000.0f, 1000.0f, "%.0f") || changed;
+                    changed = ImGui::SliderFloat("Aims at: height", &l.target[1], 0.0f, 500.0f, "%.0f") || changed;
+                    changed = ImGui::SliderFloat("Aims at: along (z)", &l.target[2], -1000.0f, 1000.0f, "%.0f") || changed;
+                    changed = ImGui::SliderFloat("Cone: full light inside (degrees)", &l.innerDegrees, 1.0f, 80.0f, "%.0f") || changed;
+                    changed = ImGui::SliderFloat("Cone: no light outside (degrees)", &l.outerDegrees, 1.0f, 85.0f, "%.0f") || changed;
+                }
+                changed = ImGui::SliderFloat("Intensity", &l.strength, 0.0f, 4.0f, "%.2f") || changed;
+                changed = ImGui::ColorEdit3("Colour", l.colour, ImGuiColorEditFlags_Float) || changed;
+                changed = ImGui::SliderFloat("Range (no light beyond)", &l.radius, 200.0f, 6000.0f, "%.0f") || changed;
+            }
+            ImGui::PopID();
+        }
+        if (duplicateAt >= 0)
+        {
+            Light copy = look.lights[static_cast<size_t>(duplicateAt)];
+            copy.position[0] += 100.0f; // beside the one it was made from, so the two can be told apart
+            look.lights.insert(look.lights.begin() + duplicateAt + 1, copy);
+            changed = true;
+        }
+        if (removeAt >= 0)
+        {
+            look.lights.erase(look.lights.begin() + removeAt);
+            changed = true;
+        }
+        const bool full = look.lights.size() >= static_cast<size_t>(kMaxLights);
+        if (full)
+            ImGui::BeginDisabled();
+        if (ImGui::Button("Add a spotlight"))
+        {
+            Light l = defaultLook().lights[0];
+            l.position[0] = 200.0f * static_cast<float>(look.lights.size() % 4u);
+            look.lights.push_back(l);
+            changed = true;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Add a point light"))
+        {
+            Light l;
+            l.type = LightType::Point;
+            l.position[0] = 0.0f;
+            l.position[1] = 400.0f;
+            l.position[2] = 0.0f;
+            l.strength = 0.8f;
+            l.radius = 1200.0f;
+            look.lights.push_back(l);
+            changed = true;
+        }
+        if (full)
+        {
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            ImGui::TextDisabled("(8 lights at most)");
+        }
+        if (changed)
+            setCurrentLook(look);
+
+        ImGui::Separator();
+        static std::string message;
+        if (ImGui::Button("Save for this arena"))
+            saveUserLook(&message);
+        ImGui::SameLine();
+        if (ImGui::Button("Reload the saved look"))
+            reloadLook(&message);
+        ImGui::SameLine();
+        if (ImGui::Button("Reset to the built-in look"))
+        {
+            resetLook();
+            message = "the built-in look (not saved: the arena's file is as it was)";
+        }
+        const std::string path = userLookPath(std::max(arena, 0));
+        ImGui::TextDisabled("File: %s", path.empty() ? "(no settings folder)" : path.c_str());
+        if (!message.empty())
+            ImGui::TextColored(ImVec4(0.7f, 1.0f, 0.7f, 1.0f), "%s", message.c_str());
+    }
+
     // Screen effects (task fx1, src/lib/gpu/gpu_postfx.h, docs/hd-lighting.md): the live look. Every slider takes effect on the next field.
     // The sliders change the live values only; "Save" writes the ones that differ from the preset into the fx_<name> settings.
     void drawEffectsTab()
@@ -2503,6 +2677,15 @@ void PS2DebugPanel::draw(PS2Runtime &runtime)
             {
                 wantedTabShown = true;
                 drawEffectsTab();
+                ImGui::EndTabItem();
+            }
+            // The match lights (PS2X_DEBUG_PANEL_TAB=Lights opens the panel on it once).
+            static bool lightsTabShown = false;
+            const ImGuiTabItemFlags lightsFlags = (wantedTab && !lightsTabShown && std::strcmp(wantedTab, "Lights") == 0) ? ImGuiTabItemFlags_SetSelected : 0;
+            if (ImGui::BeginTabItem("Lights", nullptr, lightsFlags))
+            {
+                lightsTabShown = true;
+                drawLightsTab();
                 ImGui::EndTabItem();
             }
             if (ImGui::BeginTabItem("DMA/IO"))

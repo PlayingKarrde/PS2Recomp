@@ -653,12 +653,21 @@ struct GSGpuBackend::Impl
     };
     static_assert(sizeof(LightVertex) == 24, "the second vertex stream is described to SDL_GPU by offset");
     uint32_t lightDebug = 0;   // 0 off, 1 position, 2 normal
-    // The lights themselves (task lt2-L1; PS2X_LIGHT=1 and the PS2X_LIGHT_* values, ps2x_lighting::lookFromEnvironment). `lightOn` is the
-    // switch; `lightLive` says they are being applied now (the switch, and the field tracking of the screen effects is running, which
-    // needs the progressive direct path). With lightOn false no light target exists and no draw, pass or pipeline differs.
+    // The lights themselves (tasks lt2-L1, lt2-L2). `lightOn` is the switch as the renderer has it: the setting `light` (environment
+    // PS2X_LIGHT; ps2x_lighting::lightsWanted), read at each VBlank, with the lit shaders made the first time it is on. `lightLook` is
+    // the renderer's copy of the current look (ps2x_lighting::currentLook: the built-in one, the arena's file, or what the debug panel
+    // is editing), taken again when the look's generation changes. `lightLive` says the lights are being applied now (the switch, and
+    // the field tracking of the screen effects is running, which needs the progressive direct path). With lightOn false no light
+    // target exists and no draw, pass or pipeline differs.
     bool lightOn = false, lightLive = false;
     bool fxEffects = false;    // at least one screen effect is on (fxOn is also true for the lights alone)
     ps2x_lighting::Look lightLook;
+    uint64_t lightLookGeneration = 0;
+    bool lightShow = false;       // "show lights": the lit shader draws markers of the lights
+    bool lightSetupFailed = false;
+    ps2x_lighting::LightUniforms lightBlocks[3]; // the shader's block for each facing rule, made from lightLook when it changes
+    uint32_t lightLitThisField = 0;
+    void lightRefresh();
     SDL_GPUShader *litShader = nullptr;
     SDL_GPUShader *litRepShader = nullptr;
     uint8_t lightPendingFacing = 0;
@@ -1122,34 +1131,7 @@ bool GSGpuBackend::Impl::init(SDL_GPUDevice *device, uint32_t s, GSGpuBackend::F
         const char *timing = std::getenv("PS2X_LIGHT_TIME");
         lightTiming = timing && *timing && std::strcmp(timing, "0") != 0;
     }
-    lightOn = ps2x_lighting::lookFromEnvironment(lightLook);
-    if (lightOn && lightDebug != 0)
-    {
-        std::fprintf(stderr, "[light] PS2X_LIGHT_DEBUG is set: the debug view is drawn, the lights are off\n");
-        lightOn = false;
-    }
-    if (lightOn)
-    {
-        const bool halfFloat = SDL_GPUTextureSupportsFormat(dev, SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT, SDL_GPU_TEXTURETYPE_2D,
-                                                            SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER);
-        if (!lightVertexShader)
-            lightVertexShader = ps2x::gpu::createShader(dev, ps2x::gpu::shaders::gs_light_vert);
-        litShader = ps2x::gpu::createShader(dev, ps2x::gpu::shaders::gs_lit_frag);
-        litRepShader = ps2x::gpu::createShader(dev, ps2x::gpu::shaders::gs_rep_lit_frag);
-        if (!halfFloat || !lightVertexShader || !litShader || !litRepShader)
-        {
-            std::fprintf(stderr, "[light] the lights cannot be set up (%s); they stay off\n", halfFloat ? "a shader could not be created" : "no half-float render targets");
-            lightOn = false;
-        }
-        else
-        {
-            const ps2x_lighting::Light &spot = lightLook.lights[0];
-            std::fprintf(stderr, "[light] lights on: ambient %.2f %.2f %.2f; spotlight at height %.0f, intensity %.2f, colour %.2f %.2f %.2f, cone %.0f to %.0f degrees, radius %.0f\n",
-                         lightLook.ambient[0], lightLook.ambient[1], lightLook.ambient[2], spot.position[1], spot.strength, spot.colour[0], spot.colour[1],
-                         spot.colour[2], spot.innerDegrees, spot.outerDegrees, spot.radius);
-        }
-    }
-    lightRecover = lightDebug != 0 || lightOn || lightMatLog != nullptr || lightTiming;
+    lightRecover = lightDebug != 0 || lightMatLog != nullptr || lightTiming; // (and the lights, when they are on: lightRefresh)
     if (packStore || fontAtlas)
     {
         repShader = ps2x::gpu::createShader(dev, ps2x::gpu::shaders::gs_rep_frag);
@@ -2853,6 +2835,7 @@ void GSGpuBackend::Impl::submitSetup(const GSDrawState &state, const Setup &setu
             d.lightFirst = static_cast<uint32_t>(lightVerts.size());
             lightVerts.insert(lightVerts.end(), lightPending, lightPending + 3);
             ++lightLitPrimitives;
+            ++lightLitThisField;
         }
     }
     else if (lightPending)
@@ -3227,7 +3210,7 @@ void GSGpuBackend::Impl::flushLocked(bool wait, const FieldCopy *fieldCopies, in
             }
             else
             {
-                const ps2x_lighting::LightUniforms lu = ps2x_lighting::lightUniforms(lightLook, static_cast<ps2x_lighting::Facing>(d.lightFacing));
+                const ps2x_lighting::LightUniforms &lu = lightBlocks[std::min<uint32_t>(d.lightFacing, 2u)];
                 SDL_PushGPUFragmentUniformData(cmd, 1, &lu, sizeof(lu));
             }
             SDL_DrawGPUPrimitives(pass, d.vertexCount, 1, 0, 0);
@@ -4120,6 +4103,7 @@ void GSGpuBackend::Impl::fxRefresh()
     const ps2x_postfx::Params p = ps2x_postfx::current();
     // The master switch, and at least one of the four effects (fx2): with all four off nothing is tracked or drawn twice, the field
     // takes the plain path as if the master switch were off.
+    lightRefresh();
     fxEffects = p.enabled && ps2x_postfx::anyEffectOn(p);
     // The lights use the same tracking of a field (scene, overlay, the processed picture) and the same chain, so they keep it running
     // when no effect is on; the chain then does the multiply by the light buffer and nothing else.
@@ -4169,6 +4153,14 @@ void GSGpuBackend::Impl::fxRefresh()
     if (!fxEffects)
         fxParams.bloomOn = fxParams.gradingOn = fxParams.tiltOn = fxParams.vignetteOn = false;
     lightLive = lightOn && fxOn;
+    {
+        ps2x_lighting::LightStatus &ls = ps2x_lighting::lightStatus();
+        ls.live.store(lightLive, std::memory_order_relaxed);
+        ls.unavailable.store(ps2x_lighting::lightsWanted() && !lightLive && lightDebug == 0, std::memory_order_relaxed);
+        ls.fieldsLit.store(lightFieldsLit, std::memory_order_relaxed);
+        ls.litLastField.store(lightLitThisField, std::memory_order_relaxed);
+        lightLitThisField = 0;
+    }
     if (fxOn && fxStatsOn && markerSeq % 300u == 299u)
     {
         const ps2x_postfx::Chain::Stats cs = fx->stats();
@@ -4394,6 +4386,42 @@ void GSGpuBackend::Impl::fxShutdown()
 
 // ------------------------------------------------------------------------------------------------
 // match lights: getting the arena back from projected triangles (tasks lt2-L0a, lt2-L0b; gpu/gpu_lighting.h)
+
+// The lights' switch and look, at each VBlank (from fxRefresh). The first time the lights are on, their shaders are made; a device
+// that cannot render to half-float textures cannot have them.
+void GSGpuBackend::Impl::lightRefresh()
+{
+    bool want = lightDebug == 0 && !lightSetupFailed && ps2x_lighting::lightsWanted();
+    if (want && !litShader)
+    {
+        const bool halfFloat = SDL_GPUTextureSupportsFormat(dev, SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT, SDL_GPU_TEXTURETYPE_2D,
+                                                            SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER);
+        if (!lightVertexShader)
+            lightVertexShader = ps2x::gpu::createShader(dev, ps2x::gpu::shaders::gs_light_vert);
+        litShader = ps2x::gpu::createShader(dev, ps2x::gpu::shaders::gs_lit_frag);
+        litRepShader = ps2x::gpu::createShader(dev, ps2x::gpu::shaders::gs_rep_lit_frag);
+        if (!halfFloat || !lightVertexShader || !litShader || !litRepShader)
+        {
+            std::fprintf(stderr, "[light] the lights cannot be set up (%s); they stay off\n", halfFloat ? "a shader could not be created" : "no half-float render targets");
+            lightSetupFailed = true;
+            want = false;
+        }
+    }
+    if (want != lightOn)
+        std::fprintf(stderr, "[light] lights %s\n", want ? "on" : "off");
+    lightOn = want;
+    lightRecover = lightDebug != 0 || lightOn || lightMatLog != nullptr || lightTiming;
+    const uint64_t generation = ps2x_lighting::lookGeneration();
+    if (lightOn && (generation != lightLookGeneration || lightLookGeneration == 0u))
+    {
+        lightLook = ps2x_lighting::currentLook();
+        lightShow = ps2x_lighting::showLights();
+        lightLookGeneration = generation; // (a change made while the look was being copied shows as another generation at the next VBlank)
+        lightBlocks[0] = ps2x_lighting::lightUniforms(lightLook, ps2x_lighting::Facing::Lambert, lightShow);
+        lightBlocks[1] = ps2x_lighting::lightUniforms(lightLook, ps2x_lighting::Facing::Half, lightShow);
+        lightBlocks[2] = ps2x_lighting::lightUniforms(lightLook, ps2x_lighting::Facing::PositionOnly, lightShow);
+    }
+}
 
 // One scene triangle, while the game hands over a frame that has a camera: the world position of each corner (times its Q) and
 // the face normal. False when there is no camera for this primitive, when it is not part of the scene (the overlay, by the

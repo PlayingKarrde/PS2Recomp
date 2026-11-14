@@ -45,6 +45,7 @@ namespace ps2x_settings
     // renderer (gpu|cpu), resolution (1..4), aspect (4:3|16:9|21:9), fullscreen (on|off), vsync (on|off),
     // filter (sharp|linear), volume (0..100), texture_tools (on|off), skip_intros (on|off: start at the title screen, task i1),
     // strike_depth (original|wide|wider: a strike's hit box x1, x1.5, x2 front to back, task s1; read by the game while it runs),
+    // light (on|off: the match lights of task lt2, off by default; the look is a file per arena, gpu/gpu_lighting.h),
     // fx (on|off: the screen effects of task fx1, off by default), fx_preset (off|subtle|strong), and one fx_<name> per value of the effects
     // (gpu_postfx.h: bloom_threshold ... vignette_softness; a number, or empty for "the preset's value"). The effects read them live.
     const std::vector<Definition> &definitions();

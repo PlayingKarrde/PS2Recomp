@@ -82,6 +82,12 @@
                  data-help="Darker corners. Off skips it entirely. Applies at once.">
                 <span class="label">Vignette</span><span class="tag"></span><span class="value">[ON]</span>
             </div>
+            <!-- Task lt2-L2 (src/lib/gpu/gpu_lighting.h): lights in matches, off by default, applied at once. The look (where the lights are,
+                 their colours) is tuned in the debug panel (F1, Lights tab) and saved per arena. -->
+            <div class="row" data-kind="toggle" data-key="light" data-name="Arena Lighting" data-value="off"
+                 data-help="Dims the hall and lights the ring with spotlights during matches. Menus and the clock are left alone. Applies at once.">
+                <span class="label">Arena Lighting</span><span class="tag"></span><span class="value">[OFF]</span>
+            </div>
             <div class="row" data-kind="toggle" data-key="texture_tools" data-name="Texture Tools" data-value="off" data-restart="1"
                  data-help="For modders: dump textures and see edits at once. Needs a restart.">
                 <span class="label">Texture Tools</span><span class="tag"></span><span class="value">[OFF]</span>

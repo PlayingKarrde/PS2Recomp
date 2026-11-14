@@ -346,22 +346,41 @@ namespace
         }
     }
 
-    // A renderer with the lights' environment as given (PS2X_LIGHT=1 when `lights`), the field drawn twice, the second field read.
-    Field renderLitField(SDL_GPUDevice *device, bool lights, bool camera, bool overlay)
+    // The look of the lit tests: the hall at 0.5 and a white spotlight 600 high over (0, z), pointing straight down, cone 10 to 20.
+    Look testLook(float z = 0.0f)
+    {
+        Look look;
+        look.ambient[0] = look.ambient[1] = look.ambient[2] = 0.5f;
+        Light spot;
+        spot.type = LightType::Spot;
+        spot.position[0] = 0.0f; spot.position[1] = 600.0f; spot.position[2] = z;
+        spot.target[0] = 0.0f; spot.target[1] = 100.0f; spot.target[2] = z;
+        spot.strength = 2.0f;
+        spot.innerDegrees = 10.0f;
+        spot.outerDegrees = 20.0f;
+        spot.radius = 2000.0f;
+        look.lights.push_back(spot);
+        return look;
+    }
+
+    // A renderer with the lights on or off (PS2X_LIGHT, which is the switch when there is no settings store) and `look` as the
+    // current look; the field is drawn three times and the last one read.
+    Field renderLitField(SDL_GPUDevice *device, bool lights, bool camera, bool overlay, const Look &look = testLook(), bool show = false)
     {
         Field out;
         setEnvVar("PS2X_LIGHT", lights ? "1" : nullptr);
-        setEnvVar("PS2X_LIGHT_AMBIENT", "0.5");
-        setEnvVar("PS2X_LIGHT_SPOT_INTENSITY", "2");
-        setEnvVar("PS2X_LIGHT_SPOT_COLOUR", "1,1,1");
-        setEnvVar("PS2X_LIGHT_SPOT_CONE", "10,20");
-        setEnvVar("PS2X_LIGHT_SPOT_HEIGHT", "600");
-        setEnvVar("PS2X_LIGHT_SPOT_RADIUS", "2000");
+        setCurrentLook(look);
+        setShowLights(show);
+        struct Restore
+        {
+            ~Restore()
+            {
+                setEnvVar("PS2X_LIGHT", nullptr);
+                setShowLights(false);
+            }
+        } restore;
         std::vector<uint8_t> vram(GSMem::MEMORY_SIZE, 0);
         GSGpuBackend gpu(device, 1, GSGpuBackend::FieldMode::Progressive);
-        for (const char *name : {"PS2X_LIGHT", "PS2X_LIGHT_AMBIENT", "PS2X_LIGHT_SPOT_INTENSITY", "PS2X_LIGHT_SPOT_COLOUR", "PS2X_LIGHT_SPOT_CONE",
-                                 "PS2X_LIGHT_SPOT_HEIGHT", "PS2X_LIGHT_SPOT_RADIUS"})
-            setEnvVar(name, nullptr);
         if (!gpu.Ready() || !gpu.SetFieldPublishing(true))
             return out;
         gpu.Initialize(vram.data(), static_cast<uint32_t>(vram.size()));
@@ -793,10 +812,10 @@ void register_gpu_lighting_tests()
 
         // The uniform block: the arithmetic of shaders/gs_light.hlsli, done here on the block's numbers, gives what lookAt gives.
         const LightUniforms u = lightUniforms(look, Facing::Lambert);
-        t.IsTrue(u.spotPosition[1] == 900.0f && u.spotPosition[3] == 1500.0f && u.spotAxis[1] == -1.0f && u.spotAxis[3] == 3.0f && u.spotCone[2] == 0.0f &&
-                     std::fabs(u.spotCone[0] - std::cos(30.0f * 3.14159265f / 180.0f)) < 1e-6f && std::fabs(u.spotCone[1] - std::cos(18.0f * 3.14159265f / 180.0f)) < 1e-6f,
+        t.IsTrue(u.position[0][1] == 900.0f && u.position[0][3] == 1500.0f && u.axis[0][1] == -1.0f && u.axis[0][3] == 3.0f && u.rule[0] == 0.0f && u.ambient[3] == 1.0f && u.colour[0][3] == 1.0f &&
+                     std::fabs(u.cone[0][0] - std::cos(30.0f * 3.14159265f / 180.0f)) < 1e-6f && std::fabs(u.cone[0][1] - std::cos(18.0f * 3.14159265f / 180.0f)) < 1e-6f,
                  "position and radius, axis and strength, the cosines of the cone, the rule");
-        t.IsTrue(lightUniforms(look, Facing::Half).spotCone[2] == 1.0f && lightUniforms(look, Facing::PositionOnly).spotCone[2] == 2.0f, "the three rules as numbers");
+        t.IsTrue(lightUniforms(look, Facing::Half).rule[0] == 1.0f && lightUniforms(look, Facing::PositionOnly).rule[0] == 2.0f, "the three rules as numbers");
         const float up[3] = {0.0f, 1.0f, 0.0f};
         double worst = 0.0;
         for (const float x : {0.0f, 150.0f, 280.0f, 330.0f, 420.0f, 600.0f})
@@ -804,25 +823,219 @@ void register_gpu_lighting_tests()
             const float at[3] = {x, 100.0f, 40.0f};
             float expected[3];
             lookAt(look, at, up, Facing::Lambert, expected);
-            const float toLight[3] = {u.spotPosition[0] - at[0], u.spotPosition[1] - at[1], u.spotPosition[2] - at[2]};
+            const float toLight[3] = {u.position[0][0] - at[0], u.position[0][1] - at[1], u.position[0][2] - at[2]};
             const float distance = std::sqrt(toLight[0] * toLight[0] + toLight[1] * toLight[1] + toLight[2] * toLight[2]);
             float got[3] = {u.ambient[0], u.ambient[1], u.ambient[2]};
-            if (distance < u.spotPosition[3])
+            if (distance < u.position[0][3])
             {
-                const float ratio = distance / u.spotPosition[3];
+                const float ratio = distance / u.position[0][3];
                 const float fall = (1.0f - ratio * ratio) * (1.0f - ratio * ratio);
                 const float l[3] = {toLight[0] / distance, toLight[1] / distance, toLight[2] / distance};
-                const float cosAngle = -(u.spotAxis[0] * l[0] + u.spotAxis[1] * l[1] + u.spotAxis[2] * l[2]);
-                const float e = std::fmin(1.0f, std::fmax(0.0f, (cosAngle - u.spotCone[0]) / (u.spotCone[1] - u.spotCone[0])));
+                const float cosAngle = -(u.axis[0][0] * l[0] + u.axis[0][1] * l[1] + u.axis[0][2] * l[2]);
+                const float e = std::fmin(1.0f, std::fmax(0.0f, (cosAngle - u.cone[0][0]) / (u.cone[0][1] - u.cone[0][0])));
                 const float cone = e * e * (3.0f - 2.0f * e);
                 const float face = std::fmax(up[0] * l[0] + up[1] * l[1] + up[2] * l[2], 0.0f);
                 for (int i = 0; i < 3; ++i)
-                    got[i] += u.spotColour[i] * (u.spotAxis[3] * fall * cone * face);
+                    got[i] += u.colour[0][i] * (u.axis[0][3] * fall * cone * face);
             }
             for (int i = 0; i < 3; ++i)
                 worst = std::fmax(worst, std::fabs(static_cast<double>(got[i]) - expected[i]));
         }
         t.IsTrue(worst < 1e-4, "six points across the cone: the block's arithmetic and lookAt agree (worst " + number(worst) + ")");
+    });
+
+    tc.Run("the look file: what is written reads back the same; comments, commas and missing fields are fine; numbers are clamped", [](TestCase &t)
+    {
+        for (const std::string &name : presetNames())
+        {
+            const Look look = presetLook(name);
+            Look back;
+            std::string error;
+            const std::string text = formatLook(look);
+            t.IsTrue(parseLook(text, back, &error), name + " reads back" + (error.empty() ? std::string() : ": " + error));
+            t.IsTrue(look.lights.size() <= static_cast<size_t>(kMaxLights) && formatLook(back) == text, name + ": the same text again, 8 lights at most");
+        }
+        t.IsTrue(formatLook(presetLook("centre spot")) == formatLook(defaultLook()) && defaultLook().lights.size() == 1u, "\"centre spot\" is the built-in look, one light");
+        t.IsTrue(presetLook("four corner spots").lights.size() == 4u && presetLook("house lights").lights.empty() && presetLook("house lights").ambient[0] == 1.0f,
+                 "four corner spots has four; house lights is the game's own picture");
+
+        Look look;
+        std::string error;
+        const char *text = "# a look written by hand\n"
+                           "look 1\n"
+                           "ambient 0.4   # one number\n"
+                           "\n"
+                           "light spot\n"
+                           "  position 100, 700, -50\n"
+                           "  aim 0 100 0\n"
+                           "  colour 1 0.5 0.25\n"
+                           "  intensity 99\n"
+                           "  cone 50 20\n"
+                           "light point off\n"
+                           "  range 0\n";
+        t.IsTrue(parseLook(text, look, &error), "a hand-written look parses" + (error.empty() ? std::string() : ": " + error));
+        t.IsTrue(look.ambient[0] == 0.4f && look.ambient[2] == 0.4f && look.lights.size() == 2u, "ambient as one number; two lights");
+        if (look.lights.size() == 2u)
+        {
+            const Light &a = look.lights[0], &b = look.lights[1];
+            t.IsTrue(a.type == LightType::Spot && a.on && a.position[0] == 100.0f && a.position[1] == 700.0f && a.position[2] == -50.0f && a.colour[1] == 0.5f,
+                     "the spotlight: on by default, position with commas, colour");
+            t.IsTrue(a.strength == 64.0f && a.innerDegrees == 50.0f && a.outerDegrees == 50.0f, "intensity clamped to 64; an outer angle below the inner one raised to it");
+            t.IsTrue(b.type == LightType::Point && !b.on && b.radius == 1.0f && b.position[1] == 900.0f, "the point light: off, range clamped to 1, the other fields at their defaults");
+        }
+    });
+
+    tc.Run("the look file: bad files are refused with a reason and leave the look alone", [](TestCase &t)
+    {
+        const char *bad[] = {"",
+                             "ambient 0.5\n",
+                             "look 2\nambient 0.5\n",
+                             "look 1\nambient\n",
+                             "look 1\nambient 0.5 0.5\n",
+                             "look 1\nambient nan\n",
+                             "look 1\nposition 0 0 0\n",
+                             "look 1\nlight laser\n",
+                             "look 1\nlight spot maybe\n",
+                             "look 1\nlight spot\n  position 1 2\n",
+                             "look 1\nlight spot\n  cone 20\n",
+                             "look 1\nlight spot\n  intensity 1x\n",
+                             "look 1\nlight spot\n  wattage 100\n",
+                             "look 1\nlight spot\nlight spot\nlight spot\nlight spot\nlight spot\nlight spot\nlight spot\nlight spot\nlight spot\n",
+                             "\x01\x02\xff\xfe binary rubbish \x00",
+                             "look 1\nlight spot\n  colour 1 1 inf\n"};
+        const Look before = presetLook("four corner spots");
+        int refused = 0, untouched = 0, reasons = 0;
+        for (const char *text : bad)
+        {
+            Look look = before;
+            std::string error;
+            refused += parseLook(text, look, &error) ? 0 : 1;
+            untouched += formatLook(look) == formatLook(before) ? 1 : 0;
+            reasons += error.rfind("line ", 0) == 0 ? 1 : 0;
+        }
+        const int count = static_cast<int>(sizeof(bad) / sizeof(bad[0]));
+        t.IsTrue(refused == count, "all " + std::to_string(count) + " bad texts are refused (" + std::to_string(refused) + ")");
+        t.IsTrue(untouched == count && reasons == count, "each leaves the look as it was and names a line");
+        Look eight;
+        std::string text = "look 1\n";
+        for (int i = 0; i < 8; ++i)
+            text += "light point\n";
+        t.IsTrue(parseLook(text, eight) && eight.lights.size() == 8u, "exactly 8 lights is fine");
+    });
+
+    tc.Run("the current look: an arena's saved look comes back for that arena; another arena or a bad file gets the built-in one", [](TestCase &t)
+    {
+        namespace fs = std::filesystem;
+        const fs::path folder = fs::temp_directory_path() / "ps2x_light_looks_test";
+        std::error_code ec;
+        fs::remove_all(folder, ec);
+        setLookFolder(folder.string());
+        const std::string builtIn = formatLook(defaultLook());
+
+        setArena(3);
+        t.IsTrue(currentArena() == 3 && formatLook(currentLook()) == builtIn && lookSource() == "built-in", "arena 3 with no file: the built-in look");
+        const uint64_t before = lookGeneration();
+        Look edited = presetLook("two colours");
+        edited.lights[1].position[0] = -777.0f;
+        setCurrentLook(edited);
+        t.IsTrue(lookGeneration() != before && lookSource() == "edited", "an edit changes the generation");
+        std::string message;
+        t.IsTrue(saveUserLook(&message) && fs::exists(folder / "arena03.look"), "Save writes lights/arena03.look: " + message);
+        t.IsTrue(userLookPath(3) == (folder / "arena03.look").string(), "the path the panel shows is that file");
+
+        setArena(4);
+        t.IsTrue(formatLook(currentLook()) == builtIn, "arena 4 has no file: the built-in look");
+        setArena(3);
+        t.IsTrue(formatLook(currentLook()) == formatLook(edited) && currentLook().lights[1].position[0] == -777.0f, "back in arena 3: the saved look, number for number");
+
+        resetLook();
+        t.IsTrue(formatLook(currentLook()) == builtIn && fs::exists(folder / "arena03.look"), "Reset gives the built-in look and leaves the file");
+        t.IsTrue(reloadLook(&message) && formatLook(currentLook()) == formatLook(edited), "Reload takes the file again");
+
+        {
+            std::ofstream bad(folder / "arena05.look");
+            bad << "look 1\nlight spot\n  wattage 100\n";
+        }
+        setArena(5);
+        t.IsTrue(formatLook(currentLook()) == builtIn && lookSource().find("bad") != std::string::npos, "a bad file: the built-in look, and the source says so");
+
+        Look many = defaultLook();
+        for (int i = 0; i < 12; ++i)
+            many.lights.push_back(many.lights[0]);
+        setCurrentLook(many);
+        t.IsTrue(currentLook().lights.size() == 8u, "a look with more than 8 lights is cut to 8");
+        setShowLights(true);
+        t.IsTrue(showLights(), "show lights is kept");
+        setShowLights(false);
+        resetLook();
+        fs::remove_all(folder, ec);
+    });
+
+    tc.Run("the uniform block: lights that are off or have no strength are left out; point lights; the markers' switch; lookAt agrees for many lights", [](TestCase &t)
+    {
+        Look look = presetLook("two colours");
+        Light point;
+        point.type = LightType::Point;
+        point.position[0] = 300.0f; point.position[1] = 300.0f; point.position[2] = -200.0f;
+        point.colour[0] = 0.2f; point.colour[1] = 1.0f; point.colour[2] = 0.3f;
+        point.strength = 1.5f;
+        point.radius = 900.0f;
+        look.lights.push_back(point);
+        look.lights[1].on = false;      // the blue one
+        Light none = point;
+        none.strength = 0.0f;
+        look.lights.push_back(none);
+        const LightUniforms u = lightUniforms(look, Facing::PositionOnly, true);
+        t.IsTrue(u.ambient[3] == 3.0f && u.rule[0] == 2.0f && u.rule[1] == 1.0f, "three of five lights are sent; the rule and the markers' switch");
+        t.IsTrue(u.colour[0][3] == 1.0f && u.colour[1][3] == 1.0f && u.colour[2][3] == 0.0f && u.cone[0][3] == 0.0f && u.cone[1][3] == 2.0f && u.cone[2][3] == 3.0f,
+                 "two spotlights and the point light, each with its number in the look");
+        t.IsTrue(lightUniforms(look, Facing::Lambert).rule[1] == 0.0f, "no markers unless asked");
+
+        // The shader's loop (gs_light.hlsli), done here on the block, against lookAt: surfaces facing up, at points across the ring.
+        const LightUniforms l = lightUniforms(look, Facing::Lambert);
+        const float up[3] = {0.0f, 1.0f, 0.0f};
+        double worst = 0.0;
+        for (const float x : {-380.0f, -120.0f, 0.0f, 210.0f, 390.0f})
+            for (const float z : {-300.0f, 0.0f, 250.0f})
+            {
+                const float at[3] = {x, 100.0f, z};
+                float expected[3];
+                lookAt(look, at, up, Facing::Lambert, expected);
+                float got[3] = {l.ambient[0], l.ambient[1], l.ambient[2]};
+                for (int k = 0; k < static_cast<int>(l.ambient[3]); ++k)
+                {
+                    const float toLight[3] = {l.position[k][0] - at[0], l.position[k][1] - at[1], l.position[k][2] - at[2]};
+                    const float distance = std::sqrt(toLight[0] * toLight[0] + toLight[1] * toLight[1] + toLight[2] * toLight[2]);
+                    if (distance >= l.position[k][3])
+                        continue;
+                    const float ratio = distance / l.position[k][3];
+                    const float fall = (1.0f - ratio * ratio) * (1.0f - ratio * ratio);
+                    const float dir[3] = {toLight[0] / distance, toLight[1] / distance, toLight[2] / distance};
+                    float cone = 1.0f;
+                    if (l.colour[k][3] > 0.5f)
+                    {
+                        const float cosAngle = -(l.axis[k][0] * dir[0] + l.axis[k][1] * dir[1] + l.axis[k][2] * dir[2]);
+                        const float e = std::fmin(1.0f, std::fmax(0.0f, (cosAngle - l.cone[k][0]) / (l.cone[k][1] - l.cone[k][0])));
+                        cone = e * e * (3.0f - 2.0f * e);
+                    }
+                    const float face = std::fmax(up[0] * dir[0] + up[1] * dir[1] + up[2] * dir[2], 0.0f);
+                    for (int i = 0; i < 3; ++i)
+                        got[i] += l.colour[k][i] * (l.axis[k][3] * fall * cone * face);
+                }
+                for (int i = 0; i < 3; ++i)
+                    worst = std::fmax(worst, std::fabs(static_cast<double>(got[i]) - expected[i]));
+            }
+        t.IsTrue(worst < 1e-4, "15 points on the mat, 3 lights: the block's arithmetic and lookAt agree (worst " + number(worst) + ")");
+        float out[3];
+        Light off = point;
+        off.on = false;
+        const float closeBy[3] = {300.0f, 100.0f, -200.0f};
+        lightAt(off, closeBy, up, Facing::Lambert, out);
+        t.IsTrue(out[0] == 0.0f && out[1] == 0.0f, "a light that is off adds nothing");
+        float a[3], b[3];
+        markerColour(0, a);
+        markerColour(7, b);
+        t.IsTrue(a[0] == 1.0f && a[1] == 0.25f && b[0] == 0.75f, "the markers' colours: light 1 red, light 8 grey");
     });
 
     tc.Run("the lights on the GPU renderer: off or without a camera the picture is the same bytes; on, the floor is lit under the spotlight and dimmed outside it, the overlay and unlit pixels are untouched", [](TestCase &t)
@@ -872,6 +1085,20 @@ void register_gpu_lighting_tests()
                 t.IsTrue(near3(lit.at(530, 64), 255, 16, 16, 0) && std::memcmp(lit.at(530, 64), plain.at(530, 64), 4) == 0, "the overlay box: the game's own pixels");
                 t.IsTrue(differing(lit, litNoOverlay, 0, 100, 640, 448) == 0u, "a field without an overlay is lit the same (the chain runs at the field copy)");
                 t.IsTrue(near3(litNoOverlay.at(530, 64), 30, 40, 60, 0), "and has the clear where the box was");
+
+                // "Show lights": the spotlight over (0, 300). The floor straight under it is at picture (320, 378): a dot in light 1's colour.
+                const Field marked = renderLitField(device, true, true, true, testLook(300.0f), true);
+                const Field unmarked = renderLitField(device, true, true, true, testLook(300.0f), false);
+                t.IsTrue(marked.ok && unmarked.ok, "two more fields were read back");
+                if (marked.ok && unmarked.ok)
+                {
+                    const uint8_t *dot = marked.at(320, 378);
+                    t.IsTrue(near3(dot, 247, 63, 46, 8), "show lights: a red dot under light 1, " + rgbText(dot));
+                    t.IsFalse(near3(unmarked.at(320, 378), 247, 63, 46, 8), "and none without the switch, " + rgbText(unmarked.at(320, 378)));
+                    const uint32_t changed = differing(marked, unmarked, 0, 300, 640, 448);
+                    t.IsTrue(changed > 200u && changed < 20000u, "the markers are a dot and thin outlines, not the whole floor (" + std::to_string(changed) + " pixels)");
+                    t.IsTrue(std::memcmp(marked.at(530, 64), plain.at(530, 64), 4) == 0, "the overlay box is still the game's");
+                }
             }
         }
         SDL_DestroyGPUDevice(device);

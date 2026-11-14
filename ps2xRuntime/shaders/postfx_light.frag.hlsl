@@ -37,6 +37,13 @@ float4 main(PSInput input) : SV_Target0
     const float3 light = Light.Load(int3(q, 0)).rgb;
     const bool unlit = light.r == 1.0f && light.g == 1.0f && light.b == 1.0f;
     const float3 base = SrgbToLinear(field.rgb);
+    // "Show lights": a negative light is a marker of the debug panel (gs_light.hlsli). The pixel is drawn in the marker's colour, with
+    // a little of the scene left in it.
+    if (light.r < 0.0f || light.g < 0.0f || light.b < 0.0f)
+    {
+        const float3 marked = saturate(-light) * 0.85f + field.rgb * 0.15f;
+        return float4(marked, Mode.x < 0.5f ? 1.0f : field.a);
+    }
     float3 c = base * max(light, 0.0f);
     if (Mode.x < 0.5f)
         return float4(unlit ? field.rgb : LinearToSrgbUncut(c), 1.0f);

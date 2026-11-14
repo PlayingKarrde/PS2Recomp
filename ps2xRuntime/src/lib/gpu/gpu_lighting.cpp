@@ -1,12 +1,15 @@
 // Lights for the match scene, part one: the camera channel, undoing the projection, the light types. See gpu_lighting.h.
 #include "gpu/gpu_lighting.h"
 
+#include "ps2_settings.h"
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -426,6 +429,8 @@ namespace ps2x_lighting
     void lightAt(const Light &light, const float position[3], const float normal[3], Facing facing, float out[3])
     {
         out[0] = out[1] = out[2] = 0.0f;
+        if (!light.on)
+            return;
         const float toLight[3] = {light.position[0] - position[0], light.position[1] - position[1], light.position[2] - position[2]};
         const float distance = std::sqrt(toLight[0] * toLight[0] + toLight[1] * toLight[1] + toLight[2] * toLight[2]);
         if (!(light.radius > 0.0f) || distance >= light.radius)
@@ -571,34 +576,623 @@ namespace ps2x_lighting
         return on && std::strcmp(on, "1") == 0;
     }
 
-    LightUniforms lightUniforms(const Look &look, Facing facing)
+    // ================================================================================================================
+    // The look as text, the built-in looks, the current look (task lt2-L2)
+    // ================================================================================================================
+    namespace
+    {
+        float clampNumber(float v, float lo, float hi) { return std::min(std::max(v, lo), hi); }
+
+        void clampLight(Light &l)
+        {
+            for (int i = 0; i < 3; ++i)
+            {
+                l.position[i] = clampNumber(l.position[i], -20000.0f, 20000.0f);
+                l.target[i] = clampNumber(l.target[i], -20000.0f, 20000.0f);
+                l.colour[i] = clampNumber(l.colour[i], 0.0f, 8.0f);
+            }
+            l.strength = clampNumber(l.strength, 0.0f, 64.0f);
+            l.radius = clampNumber(l.radius, 1.0f, 100000.0f);
+            l.innerDegrees = clampNumber(l.innerDegrees, 0.0f, 89.0f);
+            l.outerDegrees = clampNumber(std::max(l.outerDegrees, l.innerDegrees), 0.0f, 89.5f);
+        }
+
+        Light spotLight(float x, float y, float z, float aimX, float aimY, float aimZ, float r, float g, float b, float strength, float inner, float outer,
+                        float range)
+        {
+            Light l;
+            l.type = LightType::Spot;
+            l.position[0] = x; l.position[1] = y; l.position[2] = z;
+            l.target[0] = aimX; l.target[1] = aimY; l.target[2] = aimZ;
+            l.colour[0] = r; l.colour[1] = g; l.colour[2] = b;
+            l.strength = strength;
+            l.innerDegrees = inner;
+            l.outerDegrees = outer;
+            l.radius = range;
+            return l;
+        }
+    }
+
+    std::string formatLook(const Look &look)
+    {
+        char line[256];
+        std::string out = "# Arena look: the lights of one arena (docs/hd-lighting-tier2.md). Units: the ring is 800 x 800 around (0, 0),\n"
+                          "# the mat is at height 100, the post tops at 255. Edit it in the debug panel (F1, Lights) or by hand.\n"
+                          "look 1\n";
+        std::snprintf(line, sizeof(line), "ambient %.9g %.9g %.9g\n", look.ambient[0], look.ambient[1], look.ambient[2]);
+        out += line;
+        for (const Light &l : look.lights)
+        {
+            std::snprintf(line, sizeof(line), "light %s %s\n", l.type == LightType::Spot ? "spot" : "point", l.on ? "on" : "off");
+            out += line;
+            std::snprintf(line, sizeof(line), "  position %.9g %.9g %.9g\n", l.position[0], l.position[1], l.position[2]);
+            out += line;
+            std::snprintf(line, sizeof(line), "  aim %.9g %.9g %.9g\n", l.target[0], l.target[1], l.target[2]);
+            out += line;
+            std::snprintf(line, sizeof(line), "  colour %.9g %.9g %.9g\n", l.colour[0], l.colour[1], l.colour[2]);
+            out += line;
+            std::snprintf(line, sizeof(line), "  intensity %.9g\n  cone %.9g %.9g\n  range %.9g\n", l.strength, l.innerDegrees, l.outerDegrees, l.radius);
+            out += line;
+        }
+        return out;
+    }
+
+    bool parseLook(const std::string &text, Look &look, std::string *error)
+    {
+        Look parsed;
+        parsed.ambient[0] = parsed.ambient[1] = parsed.ambient[2] = 1.0f;
+        bool header = false;
+        Light *light = nullptr;
+        int number = 0;
+        const auto fail = [&](const std::string &why) {
+            if (error)
+                *error = "line " + std::to_string(number) + ": " + why;
+            return false;
+        };
+        size_t at = 0;
+        while (at < text.size())
+        {
+            size_t end = text.find('\n', at);
+            if (end == std::string::npos)
+                end = text.size();
+            std::string raw = text.substr(at, end - at);
+            at = end + 1;
+            ++number;
+            const size_t hash = raw.find('#');
+            if (hash != std::string::npos)
+                raw.resize(hash);
+            // words
+            std::vector<std::string> words;
+            size_t i = 0;
+            while (i < raw.size())
+            {
+                while (i < raw.size() && (raw[i] == ' ' || raw[i] == '\t' || raw[i] == '\r' || raw[i] == ','))
+                    ++i;
+                size_t j = i;
+                while (j < raw.size() && raw[j] != ' ' && raw[j] != '\t' && raw[j] != '\r' && raw[j] != ',')
+                    ++j;
+                if (j > i)
+                    words.push_back(raw.substr(i, j - i));
+                i = j;
+            }
+            if (words.empty())
+                continue;
+            const std::string &word = words[0];
+            float v[3] = {};
+            const auto numbers = [&](size_t count) {
+                if (words.size() != count + 1u)
+                    return false;
+                for (size_t k = 0; k < count; ++k)
+                {
+                    char *stop = nullptr;
+                    v[k] = std::strtof(words[k + 1u].c_str(), &stop);
+                    if (stop == words[k + 1u].c_str() || *stop != '\0' || !std::isfinite(v[k]))
+                        return false;
+                }
+                return true;
+            };
+            if (!header)
+            {
+                if (word != "look" || words.size() != 2u || words[1] != "1")
+                    return fail("the first line must be \"look 1\"");
+                header = true;
+                continue;
+            }
+            if (word == "ambient")
+            {
+                if (numbers(1))
+                    v[1] = v[2] = v[0];
+                else if (!numbers(3))
+                    return fail("ambient takes one number or three");
+                for (int k = 0; k < 3; ++k)
+                    parsed.ambient[k] = clampNumber(v[k], 0.0f, 8.0f);
+                light = nullptr;
+            }
+            else if (word == "light")
+            {
+                if (words.size() < 2u || words.size() > 3u || (words[1] != "spot" && words[1] != "point") ||
+                    (words.size() == 3u && words[2] != "on" && words[2] != "off"))
+                    return fail("a light is \"light spot|point [on|off]\"");
+                if (parsed.lights.size() >= static_cast<size_t>(kMaxLights))
+                    return fail("more than 8 lights");
+                Light l;
+                l.type = words[1] == "spot" ? LightType::Spot : LightType::Point;
+                l.on = words.size() < 3u || words[2] == "on";
+                l.position[1] = 900.0f;
+                l.target[1] = 100.0f;
+                l.radius = 2000.0f;
+                parsed.lights.push_back(l);
+                light = &parsed.lights.back();
+            }
+            else if (word == "position" || word == "aim" || word == "colour" || word == "color" || word == "intensity" || word == "cone" || word == "range")
+            {
+                if (!light)
+                    return fail("\"" + word + "\" before any light");
+                if (word == "position" || word == "aim" || word == "colour" || word == "color")
+                {
+                    if (!numbers(3))
+                        return fail(word + " takes three numbers");
+                    float *to = word == "position" ? light->position : (word == "aim" ? light->target : light->colour);
+                    std::memcpy(to, v, sizeof(v));
+                }
+                else if (word == "cone")
+                {
+                    if (!numbers(2))
+                        return fail("cone takes two numbers (inner and outer half angle, degrees)");
+                    light->innerDegrees = v[0];
+                    light->outerDegrees = v[1];
+                }
+                else
+                {
+                    if (!numbers(1))
+                        return fail(word + " takes one number");
+                    (word == "intensity" ? light->strength : light->radius) = v[0];
+                }
+            }
+            else
+                return fail("\"" + word + "\" is not a word of a look file");
+        }
+        if (!header)
+        {
+            number = 1;
+            return fail("the first line must be \"look 1\"");
+        }
+        for (Light &l : parsed.lights)
+            clampLight(l);
+        look = parsed;
+        return true;
+    }
+
+    bool loadLookFile(const std::string &path, Look &look, std::string *error)
+    {
+        std::FILE *f = std::fopen(path.c_str(), "rb");
+        if (!f)
+        {
+            if (error)
+                *error = "cannot open " + path;
+            return false;
+        }
+        std::string text;
+        char buffer[4096];
+        size_t got;
+        while ((got = std::fread(buffer, 1, sizeof(buffer), f)) != 0u && text.size() < (1u << 20))
+            text.append(buffer, got);
+        std::fclose(f);
+        std::string why;
+        if (!parseLook(text, look, &why))
+        {
+            if (error)
+                *error = path + ": " + why;
+            return false;
+        }
+        return true;
+    }
+
+    bool saveLookFile(const std::string &path, const Look &look, std::string *error)
+    {
+        std::error_code ec;
+        const std::filesystem::path target(path);
+        if (target.has_parent_path())
+            std::filesystem::create_directories(target.parent_path(), ec);
+        const std::string temporary = path + ".tmp";
+        std::FILE *f = std::fopen(temporary.c_str(), "wb");
+        const std::string text = formatLook(look);
+        bool ok = f != nullptr && std::fwrite(text.data(), 1, text.size(), f) == text.size();
+        if (f)
+            ok = std::fclose(f) == 0 && ok;
+        if (ok)
+        {
+            std::filesystem::rename(temporary, target, ec);
+            ok = !ec;
+        }
+        if (!ok && error)
+            *error = "cannot write " + path;
+        return ok;
+    }
+
+    Look defaultLook()
+    {
+        Look look;
+        look.ambient[0] = look.ambient[1] = look.ambient[2] = 0.62f;
+        look.lights.push_back(spotLight(0.0f, 900.0f, 0.0f, 0.0f, 100.0f, 0.0f, 1.0f, 0.97f, 0.9f, 0.9f, 24.0f, 38.0f, 2000.0f));
+        return look;
+    }
+
+    const std::vector<std::string> &presetNames()
+    {
+        static const std::vector<std::string> names = {"centre spot", "four corner spots", "two colours", "house lights"};
+        return names;
+    }
+
+    Look presetLook(const std::string &name)
+    {
+        Look look = defaultLook();
+        if (name == "four corner spots")
+        {
+            // A spotlight above each corner post, aimed at the middle of the mat: the cones overlap in the centre.
+            look.ambient[0] = look.ambient[1] = look.ambient[2] = 0.55f;
+            look.lights.clear();
+            for (int corner = 0; corner < 4; ++corner)
+            {
+                const float x = (corner & 1) ? 450.0f : -450.0f, z = (corner & 2) ? 450.0f : -450.0f;
+                look.lights.push_back(spotLight(x, 800.0f, z, 0.0f, 100.0f, 0.0f, 1.0f, 0.97f, 0.9f, 0.45f, 20.0f, 32.0f, 2200.0f));
+            }
+        }
+        else if (name == "two colours")
+        {
+            // The hall dark, a white spot on the ring and a blue and a magenta light from two sides, as for an entrance.
+            look.ambient[0] = 0.4f; look.ambient[1] = 0.4f; look.ambient[2] = 0.46f;
+            look.lights.clear();
+            look.lights.push_back(spotLight(0.0f, 900.0f, 0.0f, 0.0f, 100.0f, 0.0f, 1.0f, 0.97f, 0.9f, 0.8f, 22.0f, 34.0f, 2000.0f));
+            look.lights.push_back(spotLight(-1100.0f, 700.0f, 0.0f, 0.0f, 100.0f, 0.0f, 0.25f, 0.45f, 1.0f, 1.2f, 20.0f, 36.0f, 3000.0f));
+            look.lights.push_back(spotLight(1100.0f, 700.0f, 0.0f, 0.0f, 100.0f, 0.0f, 1.0f, 0.25f, 0.8f, 1.2f, 20.0f, 36.0f, 3000.0f));
+        }
+        else if (name == "house lights")
+        {
+            look.ambient[0] = look.ambient[1] = look.ambient[2] = 1.0f;
+            look.lights.clear();
+        }
+        return look;
+    }
+
+    namespace
+    {
+        struct LookStore
+        {
+            std::mutex mutex;
+            bool started = false;
+            Look look;
+            std::atomic<uint64_t> generation{1};
+            int arena = -1;
+            bool fixedByEnvironment = false; // PS2X_LIGHT_LOOK or the PS2X_LIGHT_AMBIENT / PS2X_LIGHT_SPOT_* values: an arena change keeps it
+            bool show = false;
+            std::string folder;        // of the user looks; empty: beside the settings file
+            bool folderSet = false;
+            std::string source = "built-in";
+            // lightsWanted()
+            uint64_t settingsGeneration = ~0ull;
+            bool wanted = false;
+        };
+
+        LookStore &lookStore()
+        {
+            static LookStore store;
+            return store;
+        }
+
+        std::string folderLocked(LookStore &s)
+        {
+            if (s.folderSet)
+                return s.folder;
+            const std::string settings = ps2x_settings::initialized() ? ps2x_settings::path() : std::string();
+            if (settings.empty())
+                return std::string();
+            return (std::filesystem::path(settings).parent_path() / "lights").string();
+        }
+
+        std::string pathLocked(LookStore &s, int arena)
+        {
+            const std::string folder = folderLocked(s);
+            if (folder.empty())
+                return std::string();
+            char name[32];
+            std::snprintf(name, sizeof(name), "arena%02d.look", std::clamp(arena, 0, 99));
+            return (std::filesystem::path(folder) / name).string();
+        }
+
+        // The look for an arena: the user's file if there is a good one, else the built-in. Says what it did on stderr.
+        void loadForArenaLocked(LookStore &s)
+        {
+            const std::string path = pathLocked(s, std::max(s.arena, 0));
+            std::error_code ec;
+            if (!path.empty() && std::filesystem::exists(path, ec))
+            {
+                Look loaded;
+                std::string why;
+                if (loadLookFile(path, loaded, &why))
+                {
+                    s.look = loaded;
+                    s.source = path;
+                    std::fprintf(stderr, "[light] look for arena %d from %s (%zu lights)\n", s.arena, path.c_str(), loaded.lights.size());
+                }
+                else
+                {
+                    s.look = defaultLook();
+                    s.source = "built-in (the file was bad)";
+                    std::fprintf(stderr, "[light] %s; using the built-in look\n", why.c_str());
+                }
+            }
+            else
+            {
+                s.look = defaultLook();
+                s.source = "built-in";
+            }
+            s.generation.fetch_add(1, std::memory_order_relaxed);
+        }
+
+        void startLocked(LookStore &s)
+        {
+            if (s.started)
+                return;
+            s.started = true;
+            s.look = defaultLook();
+            if (const char *show = std::getenv("PS2X_LIGHT_SHOW")) // a test aid: "show lights" on from the start, without the panel
+                s.show = std::strcmp(show, "1") == 0;
+            if (const char *file = std::getenv("PS2X_LIGHT_LOOK"))
+            {
+                if (*file)
+                {
+                    std::string why;
+                    Look loaded;
+                    if (loadLookFile(file, loaded, &why))
+                    {
+                        s.look = loaded;
+                        s.source = file;
+                        std::fprintf(stderr, "[light] look from PS2X_LIGHT_LOOK=%s (%zu lights)\n", file, loaded.lights.size());
+                    }
+                    else
+                        std::fprintf(stderr, "[light] PS2X_LIGHT_LOOK: %s; using the built-in look\n", why.c_str());
+                    s.fixedByEnvironment = true;
+                }
+            }
+            else
+            {
+                for (const char *name : {"PS2X_LIGHT_AMBIENT", "PS2X_LIGHT_SPOT_INTENSITY", "PS2X_LIGHT_SPOT_COLOUR", "PS2X_LIGHT_SPOT_CONE", "PS2X_LIGHT_SPOT_HEIGHT",
+                                         "PS2X_LIGHT_SPOT_RADIUS"})
+                    if (std::getenv(name))
+                        s.fixedByEnvironment = true;
+                if (s.fixedByEnvironment)
+                {
+                    lookFromEnvironment(s.look);
+                    s.source = "the environment";
+                }
+            }
+            s.generation.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
+    bool lightsWanted()
+    {
+        LookStore &s = lookStore();
+        if (!ps2x_settings::initialized())
+        {
+            // No settings store (the replayer, the tests): the environment, read each time.
+            const char *env = std::getenv("PS2X_LIGHT");
+            return env && (std::strcmp(env, "1") == 0 || std::strcmp(env, "on") == 0);
+        }
+        const uint64_t generation = ps2x_settings::generation();
+        std::lock_guard<std::mutex> lock(s.mutex);
+        if (generation != s.settingsGeneration)
+        {
+            s.settingsGeneration = generation;
+            s.wanted = ps2x_settings::get("light") == "on";
+        }
+        return s.wanted;
+    }
+
+    uint64_t lookGeneration() { return lookStore().generation.load(std::memory_order_relaxed); }
+
+    Look currentLook()
+    {
+        LookStore &s = lookStore();
+        std::lock_guard<std::mutex> lock(s.mutex);
+        startLocked(s);
+        return s.look;
+    }
+
+    void setCurrentLook(const Look &look)
+    {
+        LookStore &s = lookStore();
+        std::lock_guard<std::mutex> lock(s.mutex);
+        startLocked(s);
+        s.look = look;
+        if (s.look.lights.size() > static_cast<size_t>(kMaxLights))
+            s.look.lights.resize(static_cast<size_t>(kMaxLights));
+        for (Light &l : s.look.lights)
+            clampLight(l);
+        s.source = "edited";
+        s.generation.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    bool showLights()
+    {
+        LookStore &s = lookStore();
+        std::lock_guard<std::mutex> lock(s.mutex);
+        return s.show;
+    }
+
+    void setShowLights(bool show)
+    {
+        LookStore &s = lookStore();
+        std::lock_guard<std::mutex> lock(s.mutex);
+        if (s.show != show)
+        {
+            s.show = show;
+            s.generation.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
+    int currentArena()
+    {
+        LookStore &s = lookStore();
+        std::lock_guard<std::mutex> lock(s.mutex);
+        return s.arena;
+    }
+
+    void setArena(int arena)
+    {
+        LookStore &s = lookStore();
+        std::lock_guard<std::mutex> lock(s.mutex);
+        startLocked(s);
+        if (arena == s.arena)
+            return;
+        s.arena = arena;
+        if (!s.fixedByEnvironment)
+            loadForArenaLocked(s);
+        // A test aid (no panel click needed): PS2X_LIGHT_SAVE_PRESET=<a preset's name> makes that preset the look of the arena and
+        // saves it as the user's file, as the panel's preset button and Save would.
+        if (const char *preset = std::getenv("PS2X_LIGHT_SAVE_PRESET"))
+        {
+            if (*preset)
+            {
+                s.look = presetLook(preset);
+                s.generation.fetch_add(1, std::memory_order_relaxed);
+                const std::string path = pathLocked(s, std::max(s.arena, 0));
+                std::string why;
+                if (!path.empty() && saveLookFile(path, s.look, &why))
+                {
+                    s.source = path;
+                    std::fprintf(stderr, "[light] PS2X_LIGHT_SAVE_PRESET: \"%s\" saved to %s\n", preset, path.c_str());
+                }
+                else
+                    std::fprintf(stderr, "[light] PS2X_LIGHT_SAVE_PRESET: not saved (%s)\n", path.empty() ? "no settings folder" : why.c_str());
+            }
+        }
+    }
+
+    std::string userLookPath(int arena)
+    {
+        LookStore &s = lookStore();
+        std::lock_guard<std::mutex> lock(s.mutex);
+        return pathLocked(s, arena);
+    }
+
+    void setLookFolder(const std::string &folder)
+    {
+        LookStore &s = lookStore();
+        std::lock_guard<std::mutex> lock(s.mutex);
+        s.folder = folder;
+        s.folderSet = true;
+    }
+
+    bool saveUserLook(std::string *message)
+    {
+        LookStore &s = lookStore();
+        std::lock_guard<std::mutex> lock(s.mutex);
+        startLocked(s);
+        const std::string path = pathLocked(s, std::max(s.arena, 0));
+        if (path.empty())
+        {
+            if (message)
+                *message = "there is no settings folder to save the look in";
+            return false;
+        }
+        std::string why;
+        if (!saveLookFile(path, s.look, &why))
+        {
+            if (message)
+                *message = why;
+            return false;
+        }
+        s.source = path;
+        if (message)
+            *message = "saved " + path;
+        std::fprintf(stderr, "[light] look for arena %d saved to %s\n", std::max(s.arena, 0), path.c_str());
+        return true;
+    }
+
+    void resetLook()
+    {
+        LookStore &s = lookStore();
+        std::lock_guard<std::mutex> lock(s.mutex);
+        startLocked(s);
+        s.look = defaultLook();
+        s.source = "built-in";
+        s.generation.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    bool reloadLook(std::string *message)
+    {
+        LookStore &s = lookStore();
+        std::lock_guard<std::mutex> lock(s.mutex);
+        startLocked(s);
+        loadForArenaLocked(s);
+        if (message)
+            *message = "the look is now: " + s.source;
+        return true;
+    }
+
+    std::string lookSource()
+    {
+        LookStore &s = lookStore();
+        std::lock_guard<std::mutex> lock(s.mutex);
+        return s.source;
+    }
+
+    void markerColour(int index, float rgb[3])
+    {
+        static const float palette[8][3] = {{1.0f, 0.25f, 0.2f}, {0.2f, 0.9f, 0.3f}, {0.3f, 0.5f, 1.0f}, {1.0f, 0.85f, 0.2f},
+                                            {1.0f, 0.3f, 0.9f}, {0.2f, 0.9f, 0.9f}, {1.0f, 0.55f, 0.15f}, {0.75f, 0.75f, 0.75f}};
+        std::memcpy(rgb, palette[std::clamp(index, 0, 7)], sizeof(palette[0]));
+    }
+
+    LightStatus &lightStatus()
+    {
+        static LightStatus status;
+        return status;
+    }
+
+    LightUniforms lightUniforms(const Look &look, Facing facing, bool showMarkers)
     {
         LightUniforms u = {};
         for (int i = 0; i < 3; ++i)
             u.ambient[i] = look.ambient[i];
-        u.ambient[3] = 1.0f;
-        u.spotCone[2] = facing == Facing::Lambert ? 0.0f : (facing == Facing::Half ? 1.0f : 2.0f);
+        u.rule[0] = facing == Facing::Lambert ? 0.0f : (facing == Facing::Half ? 1.0f : 2.0f);
+        u.rule[1] = showMarkers ? 1.0f : 0.0f;
+        const float degrees = 3.14159265358979f / 180.0f;
+        int count = 0, index = -1;
         for (const Light &light : look.lights)
         {
-            if (light.type != LightType::Spot)
-                continue;
-            float axis[3] = {light.target[0] - light.position[0], light.target[1] - light.position[1], light.target[2] - light.position[2]};
-            const float length = std::sqrt(axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2]);
-            if (!(length > 0.0f))
+            ++index;
+            if (count >= kMaxLights)
                 break;
-            const float degrees = 3.14159265358979f / 180.0f;
+            if (!light.on || !(light.strength > 0.0f) || !(light.radius > 0.0f))
+                continue;
+            float axis[3] = {0.0f, -1.0f, 0.0f};
+            if (light.type == LightType::Spot)
+            {
+                const float d[3] = {light.target[0] - light.position[0], light.target[1] - light.position[1], light.target[2] - light.position[2]};
+                const float length = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+                if (!(length > 0.0f))
+                    continue; // (lightAt gives nothing for such a spot either)
+                for (int i = 0; i < 3; ++i)
+                    axis[i] = d[i] / length;
+            }
             for (int i = 0; i < 3; ++i)
             {
-                u.spotPosition[i] = light.position[i];
-                u.spotAxis[i] = axis[i] / length;
-                u.spotColour[i] = light.colour[i];
+                u.position[count][i] = light.position[i];
+                u.axis[count][i] = axis[i];
+                u.colour[count][i] = light.colour[i];
             }
-            u.spotPosition[3] = light.radius;
-            u.spotAxis[3] = light.strength;
-            u.spotCone[0] = std::cos(light.outerDegrees * degrees);
-            u.spotCone[1] = std::cos(light.innerDegrees * degrees);
-            break;
+            u.position[count][3] = light.radius;
+            u.axis[count][3] = light.strength;
+            u.colour[count][3] = light.type == LightType::Spot ? 1.0f : 0.0f;
+            u.cone[count][0] = std::cos(light.outerDegrees * degrees);
+            u.cone[count][1] = std::cos(light.innerDegrees * degrees);
+            u.cone[count][3] = static_cast<float>(index);
+            ++count;
         }
+        u.ambient[3] = static_cast<float>(count);
         return u;
     }
 }
@@ -614,6 +1208,11 @@ namespace ps2x_gs
     void sceneKickBegin(uint32_t gameFrame, uint32_t buffer)
     {
         ps2x_lighting::channel().kickBegin(gameFrame, buffer);
+    }
+
+    void sceneArena(int arena)
+    {
+        ps2x_lighting::setArena(arena);
     }
 
     void sceneKickEnd(uint64_t packets)

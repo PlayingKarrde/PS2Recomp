@@ -28,6 +28,7 @@
 //   - kickEnd drops both the active and the posted camera, so a camera can never be used for a later frame.
 // No guess about field boundaries or draw order is involved, and a frame without a camera (menus) has no active camera.
 
+#include <atomic>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -196,6 +197,7 @@ namespace ps2x_lighting
         float radius = 1000.0f;   // no light beyond this distance
         float innerDegrees = 20.0f; // Spot: full strength inside this half angle
         float outerDegrees = 30.0f; // Spot: nothing outside this half angle
+        bool on = true;             // a light that is off adds nothing (the debug panel's switch; kept in the look file)
     };
 
     // A look: what multiplies the game's own colours. Ambient 1 and no lights leaves the picture as the game drew it.
@@ -247,16 +249,81 @@ namespace ps2x_lighting
     // Settings, a panel and look files replace this in L2. Returns whether the lights are on; `look` gets the values either way.
     bool lookFromEnvironment(Look &look);
 
-    // The uniform block of the lit shaders (shaders/gs_light.hlsli, cbuffer Light): ambient and the look's first spotlight.
+    // The uniform block of the lit shaders (shaders/gs_light.hlsli, cbuffer Light): ambient and up to kMaxLights lights that are on.
+    constexpr int kMaxLights = 8;
     struct LightUniforms
     {
-        float ambient[4];
-        float spotPosition[4]; // xyz, radius
-        float spotAxis[4];     // unit direction, strength
-        float spotColour[4];
-        float spotCone[4];     // cos(outer), cos(inner), the facing rule (0 Lambert, 1 half, 2 position only), unused
+        float ambient[4];                // rgb, the number of lights that follow
+        float rule[4];                   // x: the facing rule of the draw (0 Lambert, 1 half, 2 position only), y: 1 = draw the markers ("show lights")
+        float position[kMaxLights][4];   // xyz, range
+        float axis[kMaxLights][4];       // spot: the unit direction it points in; w: intensity
+        float colour[kMaxLights][4];     // rgb, w: 1 spot, 0 point
+        float cone[kMaxLights][4];       // cos(outer), cos(inner), w: the light's number in the look (for the marker's colour)
     };
-    LightUniforms lightUniforms(const Look &look, Facing facing);
+    LightUniforms lightUniforms(const Look &look, Facing facing, bool showLights = false);
+
+    // ---- the look as text (task lt2-L2). One file per arena; the units are the game's: the ring is 800 x 800 around (0, 0), the mat
+    // is at height 100, the post tops at 255, the hall reaches about 2000 from the centre.
+    //     look 1
+    //     ambient 0.6 0.6 0.6
+    //     light spot on
+    //       position 0 900 0
+    //       aim 0 100 0
+    //       colour 1 0.97 0.9
+    //       intensity 0.9
+    //       cone 24 38
+    //       range 2000
+    // `#` starts a comment. A light is `light spot|point [on|off]` and the lines after it; every field is optional. Numbers out of range
+    // are clamped. Anything else (no `look 1` line, an unknown word, a missing or broken number, more than 8 lights) makes the whole
+    // text bad: parseLook returns false with a reason and leaves `look` alone.
+    std::string formatLook(const Look &look);
+    bool parseLook(const std::string &text, Look &look, std::string *error = nullptr);
+    bool loadLookFile(const std::string &path, Look &look, std::string *error = nullptr);
+    bool saveLookFile(const std::string &path, const Look &look, std::string *error = nullptr);
+
+    // The built-in look: the hall a little down and one soft warm spotlight over the ring.
+    Look defaultLook();
+    // Starting points for the debug panel: "centre spot" (the default), "four corner spots", "two colours", "house lights".
+    const std::vector<std::string> &presetNames();
+    Look presetLook(const std::string &name);
+
+    // ---- the current look (thread-safe; the renderer reads it at each VBlank, the debug panel edits it)
+    // Whether the lights are wanted: the setting `light` (environment PS2X_LIGHT), read again when a setting changes.
+    bool lightsWanted();
+    // Counts every change of the current look or of "show lights"; the renderer copies the look again when it differs.
+    uint64_t lookGeneration();
+    Look currentLook();
+    void setCurrentLook(const Look &look);
+    bool showLights();
+    void setShowLights(bool show);
+    // The arena being played (the game tells: ps2x_gs::sceneArena, from the match loader 0x17DFA0), -1 before the first match.
+    // A change of arena loads that arena's user look if there is one (a bad file: the built-in look and a log line), else the built-in.
+    int currentArena();
+    void setArena(int arena);
+    // Where the user's look for an arena is kept: <the settings file's folder>/lights/arenaNN.look. Empty when there is no settings file.
+    std::string userLookPath(int arena);
+    // The folder the user looks live in; for tests and tools (default: beside the settings file).
+    void setLookFolder(const std::string &folder);
+    // The debug panel's buttons. Save writes the current look for the current arena (arena 0 when none is known yet).
+    bool saveUserLook(std::string *message);
+    // Reset: the built-in look. Reload: the user's file for the current arena again (the built-in if there is none).
+    void resetLook();
+    bool reloadLook(std::string *message);
+    // Where the current look came from, for the panel: "built-in", a path, "the environment", "edited".
+    std::string lookSource();
+
+    // The colour of light number `index`'s markers ("show lights"): the same eight colours as shaders/gs_light.hlsli, MarkerColour.
+    void markerColour(int index, float rgb[3]);
+
+    // What the renderer did with the lights, for the panel (written by the GS thread).
+    struct LightStatus
+    {
+        std::atomic<bool> live{false};          // the lights are being applied
+        std::atomic<bool> unavailable{false};   // wanted, but the renderer cannot (no half-float targets, not the progressive direct path)
+        std::atomic<uint32_t> litLastField{0};  // lit primitives in the last field copied out
+        std::atomic<uint64_t> fieldsLit{0};
+    };
+    LightStatus &lightStatus();
 }
 
 // What the game's overrides call (they declare these themselves, as they do for ps2x_gs::widePadRight: no header that
@@ -266,4 +333,6 @@ namespace ps2x_gs
     void sceneCamera(const float *matrix16, uint32_t gameFrame, uint32_t buffer);
     void sceneKickBegin(uint32_t gameFrame, uint32_t buffer);
     void sceneKickEnd(uint64_t packets);
+    // The match loader is about to load arena `arena` (0x17DFA0): the look of that arena becomes the current one.
+    void sceneArena(int arena);
 }

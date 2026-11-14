@@ -174,6 +174,13 @@ body
     border-radius: 6dp;
 }
 
+/* The Graphics tab has more rows than fit a 720-line window (15 since the Arena Lighting row, task lt2-L2): it scrolls, and the
+   row the pad or the keys move to is brought into view. */
+#panel-graphics
+{
+    overflow-y: auto;
+}
+
 .panel.hidden
 {
     display: none;
