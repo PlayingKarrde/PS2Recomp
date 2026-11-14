@@ -209,6 +209,54 @@ namespace ps2x_lighting
     void lightAt(const Light &light, const float position[3], const float normal[3], Facing facing, float out[3]);
     // The whole look at a point: ambient plus every light.
     void lookAt(const Look &look, const float position[3], const float normal[3], Facing facing, float out[3]);
+
+    // ---- which rule a primitive gets (task lt2-L1). One table, so that later steps (materials by texture, L3) extend it in one place.
+    // What the renderer knows about a scene primitive when it decides (GSGpuBackend::Impl::submit).
+    struct PrimitiveKind
+    {
+        bool strip = false;     // a triangle strip (the game draws wrestler parts, their shadows and ring-side sprites as strips;
+                                // models, the mat and the ropes are triangle lists)
+        bool textured = false;
+        uint32_t texW = 0, texH = 0; // the declared texture size
+        uint32_t texPsm = 0;         // its GS pixel format (0 is 32-bit colour)
+        bool flatBlack = false;      // all three corners are black: the wrestlers' shadows (black, alpha 64)
+    };
+
+    struct ObjectRule
+    {
+        const char *name;   // for logs and the debug panel
+        bool lit;           // false: the primitive is drawn as the game draws it and leaves the light buffer alone
+        Facing facing;      // how its direction counts when it is lit
+    };
+
+    // The rules, in the order they are tried:
+    //   shadow     a flat black strip. Not lit: it keeps darkening what is under it, and the light under it stays (decision 5).
+    //   card       any other strip: a wrestler part or a ring-side sprite, an upright card. By position only.
+    //   rope       a triangle list with a 32 x 32 32-bit texture: flat ribbons whose normal is sideways. By position only.
+    //   surface    every other triangle list: models (hall, crowd, posts, apron) and the mat. By its face normal.
+    const ObjectRule &ruleFor(const PrimitiveKind &kind);
+
+    // ---- the look for now (task lt2-L1): ambient and one spotlight above the ring centre, pointing down, from the environment.
+    //   PS2X_LIGHT=1                    lights on (anything else, or unset: off)
+    //   PS2X_LIGHT_AMBIENT=0.6          or r,g,b: what the game's colours are multiplied by before any light (1 = as the game drew them)
+    //   PS2X_LIGHT_SPOT_INTENSITY=1.5   0 turns the spotlight off
+    //   PS2X_LIGHT_SPOT_COLOUR=1,0.96,0.88
+    //   PS2X_LIGHT_SPOT_CONE=22,34      inner and outer half angle, degrees
+    //   PS2X_LIGHT_SPOT_HEIGHT=900      how far above the floor (the mat is at 100)
+    //   PS2X_LIGHT_SPOT_RADIUS=2000     no light beyond this distance
+    // Settings, a panel and look files replace this in L2. Returns whether the lights are on; `look` gets the values either way.
+    bool lookFromEnvironment(Look &look);
+
+    // The uniform block of the lit shaders (shaders/gs_light.hlsli, cbuffer Light): ambient and the look's first spotlight.
+    struct LightUniforms
+    {
+        float ambient[4];
+        float spotPosition[4]; // xyz, radius
+        float spotAxis[4];     // unit direction, strength
+        float spotColour[4];
+        float spotCone[4];     // cos(outer), cos(inner), the facing rule (0 Lambert, 1 half, 2 position only), unused
+    };
+    LightUniforms lightUniforms(const Look &look, Facing facing);
 }
 
 // What the game's overrides call (they declare these themselves, as they do for ps2x_gs::widePadRight: no header that

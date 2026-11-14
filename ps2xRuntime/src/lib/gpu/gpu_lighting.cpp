@@ -475,6 +475,132 @@ namespace ps2x_lighting
                 out[i] += add[i];
         }
     }
+
+    // ================================================================================================================
+    // Object rules, the look from the environment, the shader's uniform block (task lt2-L1)
+    // ================================================================================================================
+    const ObjectRule &ruleFor(const PrimitiveKind &kind)
+    {
+        static const ObjectRule shadow = {"shadow", false, Facing::PositionOnly};
+        static const ObjectRule card = {"card", true, Facing::PositionOnly};
+        static const ObjectRule rope = {"rope", true, Facing::PositionOnly};
+        static const ObjectRule surface = {"surface", true, Facing::Lambert};
+        if (kind.strip)
+            return kind.flatBlack ? shadow : card;
+        if (kind.textured && kind.texW == 32u && kind.texH == 32u && kind.texPsm == 0u)
+            return rope;
+        return surface;
+    }
+
+    namespace
+    {
+        // Up to `count` numbers separated by commas; returns how many were read.
+        int parseNumbers(const char *text, float *out, int count)
+        {
+            int n = 0;
+            while (text && *text && n < count)
+            {
+                char *end = nullptr;
+                const float v = std::strtof(text, &end);
+                if (end == text)
+                    break;
+                out[n++] = v;
+                text = end;
+                while (*text == ',' || *text == ' ')
+                    ++text;
+            }
+            return n;
+        }
+    }
+
+    bool lookFromEnvironment(Look &look)
+    {
+        look = Look{};
+        float ambient[3] = {0.6f, 0.6f, 0.6f};
+        if (const char *text = std::getenv("PS2X_LIGHT_AMBIENT"))
+        {
+            float v[3];
+            const int n = parseNumbers(text, v, 3);
+            if (n == 1)
+                ambient[0] = ambient[1] = ambient[2] = v[0];
+            else if (n == 3)
+                std::memcpy(ambient, v, sizeof(v));
+        }
+        for (int i = 0; i < 3; ++i)
+            look.ambient[i] = std::clamp(ambient[i], 0.0f, 8.0f);
+
+        Light spot;
+        spot.type = LightType::Spot;
+        float height = 900.0f, cone[2] = {22.0f, 34.0f}, colour[3] = {1.0f, 0.96f, 0.88f}, one = 0.0f;
+        spot.strength = 1.5f;
+        spot.radius = 2000.0f;
+        if (const char *text = std::getenv("PS2X_LIGHT_SPOT_INTENSITY"))
+            if (parseNumbers(text, &one, 1) == 1)
+                spot.strength = std::clamp(one, 0.0f, 64.0f);
+        if (const char *text = std::getenv("PS2X_LIGHT_SPOT_HEIGHT"))
+            if (parseNumbers(text, &one, 1) == 1)
+                height = std::clamp(one, 110.0f, 20000.0f);
+        if (const char *text = std::getenv("PS2X_LIGHT_SPOT_RADIUS"))
+            if (parseNumbers(text, &one, 1) == 1)
+                spot.radius = std::clamp(one, 1.0f, 100000.0f);
+        if (const char *text = std::getenv("PS2X_LIGHT_SPOT_COLOUR"))
+        {
+            float v[3];
+            if (parseNumbers(text, v, 3) == 3)
+                std::memcpy(colour, v, sizeof(v));
+        }
+        if (const char *text = std::getenv("PS2X_LIGHT_SPOT_CONE"))
+        {
+            float v[2];
+            if (parseNumbers(text, v, 2) == 2)
+                std::memcpy(cone, v, sizeof(v));
+        }
+        spot.position[0] = 0.0f;
+        spot.position[1] = height;
+        spot.position[2] = 0.0f;
+        spot.target[0] = 0.0f;
+        spot.target[1] = 100.0f; // the mat
+        spot.target[2] = 0.0f;
+        for (int i = 0; i < 3; ++i)
+            spot.colour[i] = std::clamp(colour[i], 0.0f, 8.0f);
+        spot.innerDegrees = std::clamp(cone[0], 0.0f, 89.0f);
+        spot.outerDegrees = std::clamp(std::max(cone[1], spot.innerDegrees), 0.0f, 89.5f);
+        look.lights.push_back(spot);
+
+        const char *on = std::getenv("PS2X_LIGHT");
+        return on && std::strcmp(on, "1") == 0;
+    }
+
+    LightUniforms lightUniforms(const Look &look, Facing facing)
+    {
+        LightUniforms u = {};
+        for (int i = 0; i < 3; ++i)
+            u.ambient[i] = look.ambient[i];
+        u.ambient[3] = 1.0f;
+        u.spotCone[2] = facing == Facing::Lambert ? 0.0f : (facing == Facing::Half ? 1.0f : 2.0f);
+        for (const Light &light : look.lights)
+        {
+            if (light.type != LightType::Spot)
+                continue;
+            float axis[3] = {light.target[0] - light.position[0], light.target[1] - light.position[1], light.target[2] - light.position[2]};
+            const float length = std::sqrt(axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2]);
+            if (!(length > 0.0f))
+                break;
+            const float degrees = 3.14159265358979f / 180.0f;
+            for (int i = 0; i < 3; ++i)
+            {
+                u.spotPosition[i] = light.position[i];
+                u.spotAxis[i] = axis[i] / length;
+                u.spotColour[i] = light.colour[i];
+            }
+            u.spotPosition[3] = light.radius;
+            u.spotAxis[3] = light.strength;
+            u.spotCone[0] = std::cos(light.outerDegrees * degrees);
+            u.spotCone[1] = std::cos(light.innerDegrees * degrees);
+            break;
+        }
+        return u;
+    }
 }
 
 namespace ps2x_gs

@@ -138,6 +138,10 @@ namespace ps2x_postfx
         // Where the finished picture goes: a texture of the frame target's size (the picture at the same x, y), or null for a texture
         // of the chain's own that is just the picture's size (valid until the next call).
         SDL_GPUTexture *output = nullptr;
+        // Match lights (task lt2-L1, gpu_lighting.h): the light buffer of the frame target (half-float, linear light, the frame target's
+        // size, 1.0 where nothing lit was drawn), or null. With it the chain first multiplies the scene by it in linear light, so the
+        // bloom sees the lit highlights; when no effect is on that multiply is the only pass.
+        SDL_GPUTexture *light = nullptr;
         float aspect = 4.0f / 3.0f;          // width over height as displayed
         float scale = 1.0f;                  // target pixels per GS pixel (the internal resolution)
         Params params;

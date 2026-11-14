@@ -23,6 +23,7 @@
 #include "runtime/gs/gs_gpu_threads.h"
 #include "shaders/compiled/postfx_down_frag.h"
 #include "shaders/compiled/postfx_final_frag.h"
+#include "shaders/compiled/postfx_light_frag.h"
 #include "shaders/compiled/postfx_tilt_frag.h"
 #include "shaders/compiled/postfx_up_frag.h"
 #include "shaders/compiled/postfx_vert.h"
@@ -303,6 +304,8 @@ namespace ps2x_postfx
 
         // The white that maps to 1.0 on the highlight shoulder, in linear light (a white two stops over the picture's own white).
         constexpr float kShoulderWhite = 4.0f;
+        // Match lights: where the shoulder starts when the look has none of its own (a lit pixel can be brighter than white).
+        constexpr float kLightShoulderStart = 0.7f;
     }
 
     struct Chain::Impl
@@ -312,6 +315,16 @@ namespace ps2x_postfx
         SDL_GPUGraphicsPipeline *pipeTilt = nullptr, *pipeDown = nullptr, *pipeUp = nullptr, *pipeFinal = nullptr;
         SDL_GPUSampler *linear = nullptr, *nearest = nullptr;
         SDL_GPUTextureFormat bloomFormat = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
+        // Match lights (task lt2-L1): the multiply pass, in its two forms, and the blur for a picture brighter than white. Ready only
+        // where the device renders to half-float; without it a job's light buffer is ignored (logged once).
+        SDL_GPUShader *fsLight = nullptr;
+        SDL_GPUGraphicsPipeline *pipeLightHdr = nullptr, *pipeLightOut = nullptr, *pipeTiltHdr = nullptr;
+        bool lightReady = false, lightWarned = false;
+        uint32_t litW = 0, litH = 0;
+        SDL_GPUTexture *lit = nullptr;        // the lit scene: half-float, the display encoding carried on above 1 (postfx_hdr.hlsli)
+        SDL_GPUTexture *scratchHdr = nullptr; // the blur's two steps for such a picture
+        SDL_GPUTexture *tiltOutHdr = nullptr;
+        bool ensureLitTextures(uint32_t w, uint32_t h, bool blur);
 
         // Sized for the picture (texW x texH); made again when the picture's size changes.
         uint32_t texW = 0, texH = 0;
@@ -376,6 +389,17 @@ namespace ps2x_postfx
         pipeFinal = makePipeline(dev, vs, fsFinal, SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM);
         if (!pipeTilt || !pipeDown || !pipeUp || !pipeFinal)
             return false;
+        if (bloomFormat == SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT)
+        {
+            fsLight = ps2x::gpu::createShader(dev, ps2x::gpu::shaders::postfx_light_frag);
+            if (fsLight)
+            {
+                pipeLightHdr = makePipeline(dev, vs, fsLight, SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT);
+                pipeLightOut = makePipeline(dev, vs, fsLight, SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM);
+                pipeTiltHdr = makePipeline(dev, vs, fsTilt, SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT);
+            }
+            lightReady = pipeLightHdr && pipeLightOut && pipeTiltHdr;
+        }
 
         SDL_GPUSamplerCreateInfo si = {};
         si.min_filter = SDL_GPU_FILTER_LINEAR;
@@ -421,6 +445,10 @@ namespace ps2x_postfx
         };
         drop(tiltOut);
         drop(scratch);
+        drop(lit);
+        drop(scratchHdr);
+        drop(tiltOutHdr);
+        litW = litH = 0;
         for (int i = 0; i <= kMaxLevels; ++i)
         {
             drop(down[i]);
@@ -473,6 +501,33 @@ namespace ps2x_postfx
         texW = w;
         texH = h;
         return true;
+    }
+
+    // The textures of a lit scene, made when a job first brings a light buffer (and the two for the blur when the blur first runs on one).
+    bool Chain::Impl::ensureLitTextures(uint32_t w, uint32_t h, bool blur)
+    {
+        if (lit && (w != litW || h != litH))
+        {
+            ps2x_gs::DefragGuard guard;
+            for (SDL_GPUTexture **t : {&lit, &scratchHdr, &tiltOutHdr})
+            {
+                if (*t)
+                {
+                    SDL_ReleaseGPUTexture(dev, *t);
+                    bytes -= static_cast<uint64_t>(litW) * litH * 8u;
+                }
+                *t = nullptr;
+            }
+        }
+        if (!lit)
+            lit = makeTexture(w, h, SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT);
+        litW = w;
+        litH = h;
+        if (blur && !scratchHdr)
+            scratchHdr = makeTexture(w, h, SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT);
+        if (blur && !tiltOutHdr)
+            tiltOutHdr = makeTexture(w, h, SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT);
+        return lit && (!blur || (scratchHdr && tiltOutHdr));
     }
 
     void Chain::Impl::pass(SDL_GPUCommandBuffer *cmd, SDL_GPUGraphicsPipeline *pipeline, SDL_GPUTexture *target,
@@ -528,25 +583,70 @@ namespace ps2x_postfx
         base.v[kVig][3] = job.aspect;
         // The shoulder belongs to the light: it runs when the glow adds light or the grading scales it, not for a vignette or a blur alone.
         base.v[kMode][2] = (p.gradingOn || bloom) ? p.highlightStart : 1.0f;
+
+        // Match lights: the scene times its light buffer, in linear light, before anything else.
+        bool hdr = false; // the picture the passes below read is a lit scene in a half-float texture
+        SDL_GPUTexture *litScene = nullptr;
+        if (job.light && !lightReady && !lightWarned)
+        {
+            lightWarned = true;
+            std::fprintf(stderr, "[light] this device cannot render to half-float textures: the lights are not applied\n");
+        }
+        if (job.light && lightReady)
+        {
+            PassParams l = base;
+            l.v[kSrc][0] = static_cast<float>(job.x); l.v[kSrc][1] = static_cast<float>(job.y); l.v[kSrc][2] = w; l.v[kSrc][3] = h;
+            const SDL_GPUTextureSamplerBinding bl[2] = {{job.field, nearest}, {job.light, nearest}};
+            if (!tilt && !bloom && !p.gradingOn && !p.vignetteOn)
+            {
+                // No effect is on: this is the only pass, and it writes the finished picture (postfx_light.frag.hlsl, form 1).
+                l.v[kMode][0] = 1.0f;
+                l.v[kMode][2] = kLightShoulderStart;
+                l.v[kMode][3] = kShoulderWhite;
+                if (job.output)
+                {
+                    l.v[kAux][2] = static_cast<float>(job.x); l.v[kAux][3] = static_cast<float>(job.y);
+                    const SDL_GPUViewport viewport = {static_cast<float>(job.x), static_cast<float>(job.y), w, h, 0.0f, 1.0f};
+                    pass(cmd, pipeLightOut, job.output, bl, 2, l, stats, &viewport);
+                    return job.output;
+                }
+                pass(cmd, pipeLightOut, scratch, bl, 2, l, stats);
+                return scratch;
+            }
+            if (ensureLitTextures(job.w, job.h, tilt))
+            {
+                pass(cmd, pipeLightHdr, lit, bl, 2, l, stats);
+                litScene = lit;
+                hdr = true;
+                // Light can push a pixel over white: it needs the shoulder even when the look has none.
+                if (base.v[kMode][2] >= 0.999f)
+                    base.v[kMode][2] = kLightShoulderStart;
+            }
+        }
         base.v[kMode][3] = kShoulderWhite;
 
-        SDL_GPUTexture *source = job.field;
+        SDL_GPUTexture *source = litScene ? litScene : job.field;
         SDL_GPUTexture *input = source; // what the later passes read as "the scene"
-        float inX = static_cast<float>(job.x), inY = static_cast<float>(job.y);
+        float inX = litScene ? 0.0f : static_cast<float>(job.x), inY = litScene ? 0.0f : static_cast<float>(job.y);
 
         if (tilt)
         {
             PassParams a = base;
             a.v[kSrc][0] = inX; a.v[kSrc][1] = inY; a.v[kSrc][2] = w; a.v[kSrc][3] = h;
             a.v[kAux][0] = 1.0f; a.v[kAux][1] = 0.0f;
+            a.v[kAux][2] = hdr ? 1.0f : 0.0f; // a lit scene stays brighter than white through the blur (half-float textures)
+            SDL_GPUTexture *const blurA = hdr ? scratchHdr : scratch;
+            SDL_GPUTexture *const blurB = hdr ? tiltOutHdr : tiltOut;
+            SDL_GPUGraphicsPipeline *const pipeBlur = hdr ? pipeTiltHdr : pipeTilt;
             SDL_GPUTextureSamplerBinding b0 = {source, linear};
-            pass(cmd, pipeTilt, scratch, &b0, 1, a, stats);
+            pass(cmd, pipeBlur, blurA, &b0, 1, a, stats);
             PassParams b = base;
             b.v[kSrc][0] = 0.0f; b.v[kSrc][1] = 0.0f; b.v[kSrc][2] = w; b.v[kSrc][3] = h;
             b.v[kAux][0] = 0.0f; b.v[kAux][1] = 1.0f;
-            SDL_GPUTextureSamplerBinding b1 = {scratch, linear};
-            pass(cmd, pipeTilt, tiltOut, &b1, 1, b, stats);
-            input = tiltOut;
+            b.v[kAux][2] = hdr ? 1.0f : 0.0f;
+            SDL_GPUTextureSamplerBinding b1 = {blurA, linear};
+            pass(cmd, pipeBlur, blurB, &b1, 1, b, stats);
+            input = blurB;
             inX = inY = 0.0f;
         }
 
@@ -604,10 +704,10 @@ namespace ps2x_postfx
     {
         releaseTextures();
         ps2x_gs::DefragGuard guard;
-        for (SDL_GPUGraphicsPipeline *p : {pipeTilt, pipeDown, pipeUp, pipeFinal})
+        for (SDL_GPUGraphicsPipeline *p : {pipeTilt, pipeDown, pipeUp, pipeFinal, pipeLightHdr, pipeLightOut, pipeTiltHdr})
             if (p)
                 SDL_ReleaseGPUGraphicsPipeline(dev, p);
-        for (SDL_GPUShader *s : {vs, fsTilt, fsDown, fsUp, fsFinal})
+        for (SDL_GPUShader *s : {vs, fsTilt, fsDown, fsUp, fsFinal, fsLight})
             if (s)
                 SDL_ReleaseGPUShader(dev, s);
         if (linear)

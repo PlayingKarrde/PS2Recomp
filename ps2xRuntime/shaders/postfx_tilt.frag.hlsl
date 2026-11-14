@@ -15,6 +15,7 @@
 // @uniform_buffers 1
 
 #include "postfx_common.hlsli"
+#include "postfx_hdr.hlsli"
 
 COMBINED Texture2D<float4> Tex : register(t0, space2);
 COMBINED SamplerState Samp : register(s0, space2);
@@ -42,5 +43,8 @@ float4 main(PSInput input) : SV_Target0
         sum += SrgbToLinear(Tex.SampleLevel(Samp, q / texSize, 0.0f).rgb) * w;
         total += w;
     }
+    // Aux.z = 1: the picture is a lit scene that may be brighter than white, in a half-float texture (postfx_hdr.hlsli): keep it so.
+    if (Aux.z > 0.5f)
+        return float4(LinearToSrgbUncut(sum / total), 1.0f);
     return float4(LinearToSrgb(sum / total), 1.0f);
 }

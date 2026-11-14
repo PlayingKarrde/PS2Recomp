@@ -93,6 +93,8 @@
 #include "shaders/compiled/gs_frag.h"
 #include "shaders/compiled/gs_light_debug_frag.h"
 #include "shaders/compiled/gs_light_vert.h"
+#include "shaders/compiled/gs_lit_frag.h"
+#include "shaders/compiled/gs_rep_lit_frag.h"
 #include "shaders/compiled/gs_rep_frag.h"
 #include "shaders/compiled/gszcopy_frag.h"
 #include "shaders/compiled/gs_vert.h"
@@ -277,6 +279,11 @@ namespace
         // copied out (`shown`).
         SDL_GPUTexture *proc = nullptr;
         SDL_GPUTexture *procDepth = nullptr;
+        // Match lights (task lt2-L1): the light buffer, a half-float texture of this target's size that the lit draws of a field write
+        // as a second colour target (made at the first lit draw). 1.0 means "as the game drew it".
+        SDL_GPUTexture *light = nullptr;
+        bool lightPending = true; // the field's next lit draw is its first: the buffer is cleared to 1.0 before it
+        bool lightValid = false;  // this field has lit draws, so `light` is its light
         bool procValid = false;        // `proc` holds this field's processed scene (and its overlay so far); nothing scene-like came after
         bool replayPending = false;    // the next overlay draw is the field's first: it clears procDepth
         uint32_t procX = 0, procY = 0, procW = 0, procH = 0; // the picture in `proc`, as the chain was told
@@ -338,6 +345,8 @@ namespace
         // (job `fxJob` of Impl::fxJobs) on the frame target as it is at that point of the list.
         int32_t fxJob = -1;
         bool replay = false, replayFirst = false;
+        uint8_t lightFacing = 0; // a lit draw: how its direction counts (ps2x_lighting::Facing, from the object rules)
+        bool lightClear = false; // a lit draw that is the first of its field: the light buffer starts again at 1.0 before it
         uint32_t lightFirst = 0; // a draw with kLightKey: its first vertex in Impl::lightVerts (as many as vertexCount, in the same order)
     };
 
@@ -383,7 +392,8 @@ namespace
     // A Draw with this key draws nothing: it marks the end of a scene, where flushLocked runs the effect chain on the frame target (tasks fx1, fx1b).
     constexpr uint32_t kBoundaryKey = 1u << 14;
     // Match lights (task lt2-L0b): the pipeline for scene triangles that carry recovered world data in a second vertex stream
-    // (gs_light.vert.hlsl; today only the debug views draw with it, gs_light_debug.frag.hlsl).
+    // (gs_light.vert.hlsl). With the lights on (lt2-L1) such a draw has two colour targets, the frame and the frame's light buffer
+    // (gs_lit.frag.hlsl, gs_rep_lit.frag.hlsl); with a debug view it has one and draws the recovered data (gs_light_debug.frag.hlsl).
     constexpr uint32_t kLightKey = 1u << 15;
     // The screen effects tell scene from overlay by the Z of the last vertex (docs/hd-lighting.md, "The boundary"): the scene's is below
     // 65536 (the highest seen in a whole match: 23,772), the overlay's (clock, pause panel, popups, fades) at or above it. 65536 / 2^24 is exact in a float.
@@ -643,6 +653,16 @@ struct GSGpuBackend::Impl
     };
     static_assert(sizeof(LightVertex) == 24, "the second vertex stream is described to SDL_GPU by offset");
     uint32_t lightDebug = 0;   // 0 off, 1 position, 2 normal
+    // The lights themselves (task lt2-L1; PS2X_LIGHT=1 and the PS2X_LIGHT_* values, ps2x_lighting::lookFromEnvironment). `lightOn` is the
+    // switch; `lightLive` says they are being applied now (the switch, and the field tracking of the screen effects is running, which
+    // needs the progressive direct path). With lightOn false no light target exists and no draw, pass or pipeline differs.
+    bool lightOn = false, lightLive = false;
+    bool fxEffects = false;    // at least one screen effect is on (fxOn is also true for the lights alone)
+    ps2x_lighting::Look lightLook;
+    SDL_GPUShader *litShader = nullptr;
+    SDL_GPUShader *litRepShader = nullptr;
+    uint8_t lightPendingFacing = 0;
+    uint64_t lightLitPrimitives = 0, lightUnlitByRule = 0, lightFieldsLit = 0;
     bool lightRecover = false; // the debug view or the mat log wants the recovery
     bool lightTiming = false;
     std::FILE *lightMatLog = nullptr;
@@ -1102,7 +1122,34 @@ bool GSGpuBackend::Impl::init(SDL_GPUDevice *device, uint32_t s, GSGpuBackend::F
         const char *timing = std::getenv("PS2X_LIGHT_TIME");
         lightTiming = timing && *timing && std::strcmp(timing, "0") != 0;
     }
-    lightRecover = lightDebug != 0 || lightMatLog != nullptr || lightTiming;
+    lightOn = ps2x_lighting::lookFromEnvironment(lightLook);
+    if (lightOn && lightDebug != 0)
+    {
+        std::fprintf(stderr, "[light] PS2X_LIGHT_DEBUG is set: the debug view is drawn, the lights are off\n");
+        lightOn = false;
+    }
+    if (lightOn)
+    {
+        const bool halfFloat = SDL_GPUTextureSupportsFormat(dev, SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT, SDL_GPU_TEXTURETYPE_2D,
+                                                            SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER);
+        if (!lightVertexShader)
+            lightVertexShader = ps2x::gpu::createShader(dev, ps2x::gpu::shaders::gs_light_vert);
+        litShader = ps2x::gpu::createShader(dev, ps2x::gpu::shaders::gs_lit_frag);
+        litRepShader = ps2x::gpu::createShader(dev, ps2x::gpu::shaders::gs_rep_lit_frag);
+        if (!halfFloat || !lightVertexShader || !litShader || !litRepShader)
+        {
+            std::fprintf(stderr, "[light] the lights cannot be set up (%s); they stay off\n", halfFloat ? "a shader could not be created" : "no half-float render targets");
+            lightOn = false;
+        }
+        else
+        {
+            const ps2x_lighting::Light &spot = lightLook.lights[0];
+            std::fprintf(stderr, "[light] lights on: ambient %.2f %.2f %.2f; spotlight at height %.0f, intensity %.2f, colour %.2f %.2f %.2f, cone %.0f to %.0f degrees, radius %.0f\n",
+                         lightLook.ambient[0], lightLook.ambient[1], lightLook.ambient[2], spot.position[1], spot.strength, spot.colour[0], spot.colour[1],
+                         spot.colour[2], spot.innerDegrees, spot.outerDegrees, spot.radius);
+        }
+    }
+    lightRecover = lightDebug != 0 || lightOn || lightMatLog != nullptr || lightTiming;
     if (packStore || fontAtlas)
     {
         repShader = ps2x::gpu::createShader(dev, ps2x::gpu::shaders::gs_rep_frag);
@@ -1313,6 +1360,8 @@ GSGpuBackend::Impl::~Impl()
     for (auto &f : frames)
     {
         SDL_ReleaseGPUTexture(dev, f.color);
+        if (f.light)
+            SDL_ReleaseGPUTexture(dev, f.light);
         if (f.proc)
             SDL_ReleaseGPUTexture(dev, f.proc);
         if (f.procDepth)
@@ -1662,7 +1711,12 @@ SDL_GPUGraphicsPipeline *GSGpuBackend::Impl::pipeline(uint32_t key)
 
     SDL_GPUGraphicsPipelineCreateInfo info = {};
     info.vertex_shader = lit ? lightVertexShader : vertexShader;
-    info.fragment_shader = lit ? lightDebugShader : (zrestore ? zcopyShader : (replaced ? repShader : fragmentShader));
+    // A lit draw: with a debug view, the debug shader into the frame alone; with the lights, the plain shader's lit variant into the
+    // frame and the light buffer. The light buffer blends as the frame does (its alpha is the same coefficient).
+    const bool litTwo = lit && lightDebug == 0;
+    SDL_GPUColorTargetDescription cts[2] = {ct, ct};
+    cts[1].format = SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT;
+    info.fragment_shader = litTwo ? (replaced ? litRepShader : litShader) : (lit ? lightDebugShader : (zrestore ? zcopyShader : (replaced ? repShader : fragmentShader)));
     info.vertex_input_state.vertex_buffer_descriptions = vbs;
     info.vertex_input_state.num_vertex_buffers = lit ? 2 : 1;
     info.vertex_input_state.vertex_attributes = attrs;
@@ -1676,8 +1730,8 @@ SDL_GPUGraphicsPipeline *GSGpuBackend::Impl::pipeline(uint32_t key)
     info.depth_stencil_state.enable_depth_test = true; // ALWAYS is a test that passes: writes still happen
     info.depth_stencil_state.enable_depth_write = depthWrite;
     info.depth_stencil_state.compare_op = toSdlCompare(compare);
-    info.target_info.color_target_descriptions = &ct;
-    info.target_info.num_color_targets = 1;
+    info.target_info.color_target_descriptions = cts;
+    info.target_info.num_color_targets = litTwo ? 2 : 1;
     info.target_info.has_depth_stencil_target = true;
     info.target_info.depth_stencil_format = SDL_GPU_TEXTUREFORMAT_D32_FLOAT;
     SDL_GPUGraphicsPipeline *p = SDL_CreateGPUGraphicsPipeline(dev, &info);
@@ -2765,7 +2819,43 @@ void GSGpuBackend::Impl::submitSetup(const GSDrawState &state, const Setup &setu
     const uint32_t first = static_cast<uint32_t>(vertices.size());
     vertices.insert(vertices.end(), setup.v, setup.v + setup.count);
     stats.vertices += setup.count;
-    if (lightPending)
+    if (lightPending && lightDebug == 0)
+    {
+        // A lit draw: the game's colour as always (replacement textures included) into the frame, and the light into the frame's light
+        // buffer, which is made here on first use. Without the buffer the draw stays a plain one.
+        FrameTarget &ft = frames[frame];
+        if (!ft.light)
+        {
+            SDL_GPUTextureCreateInfo ci = {};
+            ci.type = SDL_GPU_TEXTURETYPE_2D;
+            ci.format = SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT;
+            ci.usage = SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER;
+            ci.width = ft.w;
+            ci.height = ft.h;
+            ci.layer_count_or_depth = 1;
+            ci.num_levels = 1;
+            ci.sample_count = SDL_GPU_SAMPLECOUNT_1;
+            ft.light = SDL_CreateGPUTexture(dev, &ci);
+            if (ft.light)
+                frameTargetBytes += static_cast<uint64_t>(ft.w) * ft.h * 8u;
+            else
+                std::fprintf(stderr, "[light] cannot create the %ux%u light buffer of a frame target: %s\n", ft.w, ft.h, SDL_GetError());
+        }
+        if (ft.light)
+        {
+            d.pipeline |= kLightKey;
+            d.lightFacing = lightPendingFacing;
+            d.lightClear = ft.lightPending;
+            if (ft.lightPending)
+                ++lightFieldsLit;
+            ft.lightPending = false;
+            ft.lightValid = true;
+            d.lightFirst = static_cast<uint32_t>(lightVerts.size());
+            lightVerts.insert(lightVerts.end(), lightPending, lightPending + 3);
+            ++lightLitPrimitives;
+        }
+    }
+    else if (lightPending)
     {
         // The debug view draws the recovered data, not the game's colour: a replacement texture is not needed for that (the original's
         // alpha gives the cut-out), so the draw goes back to the plain texture path with the light bit.
@@ -2779,7 +2869,7 @@ void GSGpuBackend::Impl::submitSetup(const GSDrawState &state, const Setup &setu
     {
         Draw &last = draws.back();
         if (last.frame == d.frame && last.depth == d.depth && last.pipeline == d.pipeline && last.texture == d.texture && last.rep == d.rep &&
-            last.replay == d.replay && !d.replayFirst && last.sx == d.sx && last.sy == d.sy && last.sw == d.sw && last.sh == d.sh && last.uniforms == d.uniforms)
+            last.replay == d.replay && !d.replayFirst && last.lightFacing == d.lightFacing && !d.lightClear && last.sx == d.sx && last.sy == d.sy && last.sw == d.sw && last.sh == d.sh && last.uniforms == d.uniforms)
         {
             last.vertexCount += setup.count;
             return;
@@ -2842,8 +2932,36 @@ void GSGpuBackend::Impl::submit(const GSPrimitiveBatch &batch)
         ++wc.filled;
     }
     LightVertex lightOut[3];
-    if (lightRecover && setup.count == 3 && !batch.state.prim.fst && lightRecoverTriangle(batch, setup, lightOut) && lightDebug != 0)
-        lightPending = lightOut;
+    if (lightRecover && setup.count == 3 && !batch.state.prim.fst && lightRecoverTriangle(batch, setup, lightOut))
+    {
+        if (lightDebug != 0)
+            lightPending = lightOut;
+        else if (lightLive)
+        {
+            // Which rule this primitive gets (ps2x_lighting::ruleFor, the one table): lit by its face normal, lit by position only, or left
+            // as the game draws it (the wrestlers' shadows).
+            ps2x_lighting::PrimitiveKind kind;
+            kind.strip = batch.state.prim.type != GS_PRIM_TRIANGLE;
+            kind.textured = batch.state.prim.tme;
+            kind.texW = 1u << batch.state.context.tex0.tw;
+            kind.texH = 1u << batch.state.context.tex0.th;
+            kind.texPsm = batch.state.context.tex0.psm;
+            kind.flatBlack = true;
+            for (int i = 0; i < 3; ++i)
+            {
+                const GSVertex &v = batch.vertices[static_cast<size_t>(i)];
+                kind.flatBlack = kind.flatBlack && v.r == 0u && v.g == 0u && v.b == 0u;
+            }
+            const ps2x_lighting::ObjectRule &rule = ps2x_lighting::ruleFor(kind);
+            if (rule.lit)
+            {
+                lightPending = lightOut;
+                lightPendingFacing = static_cast<uint8_t>(rule.facing);
+            }
+            else
+                ++lightUnlitByRule;
+        }
+    }
     submitSetup(batch.state, setup);
     lightPending = nullptr;
     if (vertices.size() >= kMaxVerticesPerFlush || stage.size() >= kMaxStageBytes)
@@ -2990,7 +3108,10 @@ void GSGpuBackend::Impl::flushLocked(bool wait, const FieldCopy *fieldCopies, in
         {
             // No buffer: draw them as the plain scene (the first stream alone is a complete vertex).
             for (Draw &d : draws)
+            {
                 d.pipeline &= ~kLightKey;
+                d.lightClear = false;
+            }
         }
     }
 
@@ -2998,6 +3119,7 @@ void GSGpuBackend::Impl::flushLocked(bool wait, const FieldCopy *fieldCopies, in
     SDL_GPURenderPass *pass = nullptr;
     bool litBinding = false; // the vertex buffers bound in the open pass are a lit draw's (both streams, at the draw's own offsets)
     uint32_t curFrame = ~0u, curDepth = ~0u;
+    bool curLit = false; // the open pass has the frame's light buffer as its second colour target
     uint32_t curPipeline = ~0u;
     SDL_GPUTexture *curTexture = reinterpret_cast<SDL_GPUTexture *>(~uintptr_t(0));
     SDL_GPUTexture *curRepTexture = reinterpret_cast<SDL_GPUTexture *>(~uintptr_t(0));
@@ -3010,12 +3132,22 @@ void GSGpuBackend::Impl::flushLocked(bool wait, const FieldCopy *fieldCopies, in
         curDepth = ~0u;
     };
     // Begins a render pass into `colorTex` / `depthTex` (the frame's own, or its processed picture's).
-    auto beginPass = [&](uint32_t frame, SDL_GPUTexture *colorTex, SDL_GPUTexture *depthTex, SDL_GPULoadOp depthLoad)
+    auto beginPass = [&](uint32_t frame, SDL_GPUTexture *colorTex, SDL_GPUTexture *depthTex, SDL_GPULoadOp depthLoad, SDL_GPUTexture *lightTex = nullptr,
+                         bool lightClear = false)
     {
-        SDL_GPUColorTargetInfo color = {};
+        SDL_GPUColorTargetInfo colors[2] = {};
+        SDL_GPUColorTargetInfo &color = colors[0];
         color.texture = colorTex;
         color.load_op = SDL_GPU_LOADOP_LOAD;
         color.store_op = SDL_GPU_STOREOP_STORE;
+        if (lightTex)
+        {
+            // Match lights: the light buffer beside the frame. A field's first lit draw starts it at 1.0, "as the game drew it".
+            colors[1].texture = lightTex;
+            colors[1].load_op = lightClear ? SDL_GPU_LOADOP_CLEAR : SDL_GPU_LOADOP_LOAD;
+            colors[1].store_op = SDL_GPU_STOREOP_STORE;
+            colors[1].clear_color = SDL_FColor{1.0f, 1.0f, 1.0f, 1.0f};
+        }
         SDL_GPUDepthStencilTargetInfo depth = {};
         depth.texture = depthTex;
         depth.clear_depth = 0.0f; // the GS clears Z to 0 and keeps the larger value
@@ -3023,7 +3155,7 @@ void GSGpuBackend::Impl::flushLocked(bool wait, const FieldCopy *fieldCopies, in
         depth.store_op = SDL_GPU_STOREOP_STORE;
         depth.stencil_load_op = SDL_GPU_LOADOP_DONT_CARE;
         depth.stencil_store_op = SDL_GPU_STOREOP_DONT_CARE;
-        pass = SDL_BeginGPURenderPass(cmd, &color, 1, &depth);
+        pass = SDL_BeginGPURenderPass(cmd, colors, lightTex ? 2 : 1, &depth);
         ++stats.renderPasses;
         const float globals[4] = {static_cast<float>(frames[frame].w), static_cast<float>(frames[frame].h), 0.0f, 0.0f};
         SDL_PushGPUVertexUniformData(cmd, 0, globals, sizeof(globals));
@@ -3088,8 +3220,16 @@ void GSGpuBackend::Impl::flushLocked(bool wait, const FieldCopy *fieldCopies, in
                                                   {lightBuffer, static_cast<Uint32>(d.lightFirst * sizeof(LightVertex))}};
             SDL_BindGPUVertexBuffers(pass, 0, both, 2);
             litBinding = true;
-            const uint32_t mode[4] = {lightDebug, 0u, 0u, 0u};
-            SDL_PushGPUFragmentUniformData(cmd, 1, mode, sizeof(mode));
+            if (lightDebug != 0)
+            {
+                const uint32_t mode[4] = {lightDebug, 0u, 0u, 0u};
+                SDL_PushGPUFragmentUniformData(cmd, 1, mode, sizeof(mode));
+            }
+            else
+            {
+                const ps2x_lighting::LightUniforms lu = ps2x_lighting::lightUniforms(lightLook, static_cast<ps2x_lighting::Facing>(d.lightFacing));
+                SDL_PushGPUFragmentUniformData(cmd, 1, &lu, sizeof(lu));
+            }
             SDL_DrawGPUPrimitives(pass, d.vertexCount, 1, 0, 0);
             ++stats.drawCalls;
             return;
@@ -3124,10 +3264,14 @@ void GSGpuBackend::Impl::flushLocked(bool wait, const FieldCopy *fieldCopies, in
         }
         if (d.replay)
             anyReplay = true;
-        if (!pass || d.frame != curFrame || d.depth != curDepth)
+        // A lit draw (the lights, not a debug view) needs the light buffer in its pass, and a plain draw must not have it.
+        const bool litDraw = lightDebug == 0 && (d.pipeline & kLightKey) != 0u;
+        if (!pass || d.frame != curFrame || d.depth != curDepth || litDraw != curLit || d.lightClear)
         {
             endPass();
-            beginPass(d.frame, frames[d.frame].color, depths[d.depth].depth, depths[d.depth].needsClear ? SDL_GPU_LOADOP_CLEAR : SDL_GPU_LOADOP_LOAD);
+            beginPass(d.frame, frames[d.frame].color, depths[d.depth].depth, depths[d.depth].needsClear ? SDL_GPU_LOADOP_CLEAR : SDL_GPU_LOADOP_LOAD,
+                      litDraw ? frames[d.frame].light : nullptr, d.lightClear);
+            curLit = litDraw;
             depths[d.depth].needsClear = false;
             curFrame = d.frame;
             curDepth = d.depth;
@@ -3151,6 +3295,7 @@ void GSGpuBackend::Impl::flushLocked(bool wait, const FieldCopy *fieldCopies, in
             {
                 endPass();
                 beginPass(d.frame, ft.proc, ft.procDepth, d.replayFirst ? SDL_GPU_LOADOP_CLEAR : SDL_GPU_LOADOP_LOAD);
+                curLit = false;
                 curFrame = d.frame;
             }
             drawOne(d);
@@ -3541,8 +3686,10 @@ GSGpuBackend::MarkResult GSGpuBackend::Impl::produceField(const GSPresentationRe
                         if (fxTarget->procValid && fxTarget->proc && fxTarget->procX == copyX && fxTarget->procY == copyY &&
                             fxTarget->procW == copyWidth && fxTarget->procH == copyHeight)
                             fxMode = 1;
-                        else if (!fxTarget->overlaySeen)
+                        else if (!fxTarget->overlaySeen && (fxEffects || (lightLive && fxTarget->lightValid && fxTarget->light)))
                             fxMode = 2;
+                        else if (!fxTarget->overlaySeen)
+                            ++fxStats.fieldsPlain; // the lights alone, and no lit draw in this field
                         else
                             ++fxStats.fieldsNoSnapshot;
                     }
@@ -3563,6 +3710,7 @@ GSGpuBackend::MarkResult GSGpuBackend::Impl::produceField(const GSPresentationRe
                         fxJob.aspect = static_cast<float>(640u + padLeft + padRight) / 480.0f;
                         fxJob.scale = static_cast<float>(scaleX);
                         fxJob.params = fxParams;
+                        fxJob.light = (lightLive && fxTarget->lightValid) ? fxTarget->light : nullptr;
                         copies[0].fx = &fxJob;
                         ++fxStats.fieldsDirect;
                     }
@@ -3972,7 +4120,10 @@ void GSGpuBackend::Impl::fxRefresh()
     const ps2x_postfx::Params p = ps2x_postfx::current();
     // The master switch, and at least one of the four effects (fx2): with all four off nothing is tracked or drawn twice, the field
     // takes the plain path as if the master switch were off.
-    bool want = p.enabled && ps2x_postfx::anyEffectOn(p);
+    fxEffects = p.enabled && ps2x_postfx::anyEffectOn(p);
+    // The lights use the same tracking of a field (scene, overlay, the processed picture) and the same chain, so they keep it running
+    // when no effect is on; the chain then does the multiply by the light buffer and nothing else.
+    bool want = fxEffects || lightOn;
     if (want && !(progressive() && fields))
     {
         if (!fxLoggedWeave)
@@ -3994,7 +4145,8 @@ void GSGpuBackend::Impl::fxRefresh()
         }
         else
         {
-            std::fprintf(stderr, "[fx] screen effects on (%s)\n", p.bloomIntensity > 0.0f || p.tiltStrength > 0.0f ? "bloom, grade, tilt-shift, vignette" : "grade");
+            if (fxEffects)
+                std::fprintf(stderr, "[fx] screen effects on (%s)\n", p.bloomIntensity > 0.0f || p.tiltStrength > 0.0f ? "bloom, grade, tilt-shift, vignette" : "grade");
             if (const char *file = std::getenv("PS2X_FX_TRACE"))
                 if (file[0] != '\0' && !fxTrace)
                 {
@@ -4014,6 +4166,9 @@ void GSGpuBackend::Impl::fxRefresh()
             fxResetTarget(t); // counters from before the effects were off must not leak in
     fxOn = want;
     fxParams = p;
+    if (!fxEffects)
+        fxParams.bloomOn = fxParams.gradingOn = fxParams.tiltOn = fxParams.vignetteOn = false;
+    lightLive = lightOn && fxOn;
     if (fxOn && fxStatsOn && markerSeq % 300u == 299u)
     {
         const ps2x_postfx::Chain::Stats cs = fx->stats();
@@ -4034,6 +4189,8 @@ void GSGpuBackend::Impl::fxResetTarget(FrameTarget &t)
     t.replayPending = false;
     t.overlaySeen = false;
     t.shown = false;
+    t.lightPending = true;
+    t.lightValid = false;
     t.sceneTris = 0;
     t.scenePrims = t.overlayPrims = 0;
     t.sceneZMax = t.sceneAnyZMax = 0;
@@ -4066,6 +4223,9 @@ void GSGpuBackend::Impl::fxBoundary(uint32_t frameIndex)
 {
     FrameTarget &t = frames[frameIndex];
     ps2x_postfx::Job job;
+    const bool lit = lightLive && t.lightValid && t.light;
+    if (!fxEffects && !lit)
+        return; // the lights alone are on and this field has no lit draw (no camera): nothing to do, the field is copied as before
     if (!fxPictureRegion(t.w, t.h, job.x, job.y, job.w, job.h))
         return;
     if (!t.proc)
@@ -4097,6 +4257,7 @@ void GSGpuBackend::Impl::fxBoundary(uint32_t frameIndex)
     }
     job.field = t.color;
     job.output = t.proc;
+    job.light = lit ? t.light : nullptr;
     job.aspect = static_cast<float>(640u + padLeft + padRight) / 480.0f;
     job.scale = static_cast<float>(scaleX);
     job.params = fxParams;
@@ -4366,6 +4527,9 @@ void GSGpuBackend::Impl::lightShutdown()
             std::fclose(lightMatLog);
             lightMatLog = nullptr;
         }
+        if (lightOn)
+            std::fprintf(stderr, "[light] lit %llu primitives in %llu fields; %llu left unlit by rule (shadows)\n", static_cast<unsigned long long>(lightLitPrimitives),
+                         static_cast<unsigned long long>(lightFieldsLit), static_cast<unsigned long long>(lightUnlitByRule));
         std::fprintf(stderr, "[light] recovered %llu scene triangles in %llu frames with a camera (%llu with no area in the world), %llu drawn by the debug view",
                      static_cast<unsigned long long>(lightStats.triangles), static_cast<unsigned long long>(lightStats.cameras),
                      static_cast<unsigned long long>(lightStats.noNormal), static_cast<unsigned long long>(lightStats.drawn));
@@ -4382,6 +4546,11 @@ void GSGpuBackend::Impl::lightShutdown()
         SDL_ReleaseGPUShader(dev, lightVertexShader);
     if (lightDebugShader)
         SDL_ReleaseGPUShader(dev, lightDebugShader);
+    if (litShader)
+        SDL_ReleaseGPUShader(dev, litShader);
+    if (litRepShader)
+        SDL_ReleaseGPUShader(dev, litRepShader);
+    litShader = litRepShader = nullptr;
     lightBuffer = nullptr;
     lightUpload = nullptr;
     lightVertexShader = lightDebugShader = nullptr;

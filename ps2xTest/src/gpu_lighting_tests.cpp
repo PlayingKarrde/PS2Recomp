@@ -298,6 +298,121 @@ namespace
     {
         return "(" + std::to_string(p[0]) + ", " + std::to_string(p[1]) + ", " + std::to_string(p[2]) + ")";
     }
+
+    // ---- the lights on the GPU renderer (task lt2-L1)
+    // A match field in the made-up camera: the clear, a floor of 16 x 16 squares (512 triangle-list triangles, which makes it a match
+    // field for the screen effects' tracking) 200 units below the eye, and optionally an opaque overlay box (the clock's Z).
+    void drawLitField(GSRasterBackend &b, const float m[16], bool overlay)
+    {
+        GSPrimitiveBatch clear;
+        clear.vertexCount = 2;
+        clear.state.context = sceneContext();
+        clear.state.context.test = (1ull << 16) | (1ull << 17);
+        clear.state.prim.type = GS_PRIM_SPRITE;
+        clear.vertices[0].x = 1728.0f;
+        clear.vertices[0].y = 1936.0f;
+        clear.vertices[1].x = 1728.0f + 640.0f;
+        clear.vertices[1].y = 1936.0f + 224.0f;
+        clear.vertices[1].r = 30;
+        clear.vertices[1].g = 40;
+        clear.vertices[1].b = 60;
+        clear.vertices[1].a = 0x80;
+        b.Submit(clear);
+        for (int row = 0; row < 16; ++row)
+            for (int col = 0; col < 16; ++col)
+            {
+                const double x0 = -300.0 + 37.5 * col, x1 = x0 + 37.5, z0 = 75.0 * row, z1 = z0 + 75.0;
+                const double a[3][3] = {{x0, -200.0, z0}, {x1, -200.0, z0}, {x0, -200.0, z1}};
+                const double c[3][3] = {{x1, -200.0, z0}, {x1, -200.0, z1}, {x0, -200.0, z1}};
+                worldTriangle(b, m, a, 1000.0, 200, 60, 20);
+                worldTriangle(b, m, c, 1000.0, 200, 60, 20);
+            }
+        if (overlay)
+        {
+            GSPrimitiveBatch box;
+            box.vertexCount = 2;
+            box.state.context = sceneContext();
+            box.state.prim.type = GS_PRIM_SPRITE;
+            box.vertices[0].x = 1728.0f + 500.0f;
+            box.vertices[0].y = 1936.0f + 20.0f;
+            box.vertices[1].x = 1728.0f + 560.0f;
+            box.vertices[1].y = 1936.0f + 45.0f;
+            box.vertices[1].z = 65536.0;
+            box.vertices[1].r = 0xFF;
+            box.vertices[1].g = 0x10;
+            box.vertices[1].b = 0x10;
+            box.vertices[1].a = 0x80;
+            b.Submit(box);
+        }
+    }
+
+    // A renderer with the lights' environment as given (PS2X_LIGHT=1 when `lights`), the field drawn twice, the second field read.
+    Field renderLitField(SDL_GPUDevice *device, bool lights, bool camera, bool overlay)
+    {
+        Field out;
+        setEnvVar("PS2X_LIGHT", lights ? "1" : nullptr);
+        setEnvVar("PS2X_LIGHT_AMBIENT", "0.5");
+        setEnvVar("PS2X_LIGHT_SPOT_INTENSITY", "2");
+        setEnvVar("PS2X_LIGHT_SPOT_COLOUR", "1,1,1");
+        setEnvVar("PS2X_LIGHT_SPOT_CONE", "10,20");
+        setEnvVar("PS2X_LIGHT_SPOT_HEIGHT", "600");
+        setEnvVar("PS2X_LIGHT_SPOT_RADIUS", "2000");
+        std::vector<uint8_t> vram(GSMem::MEMORY_SIZE, 0);
+        GSGpuBackend gpu(device, 1, GSGpuBackend::FieldMode::Progressive);
+        for (const char *name : {"PS2X_LIGHT", "PS2X_LIGHT_AMBIENT", "PS2X_LIGHT_SPOT_INTENSITY", "PS2X_LIGHT_SPOT_COLOUR", "PS2X_LIGHT_SPOT_CONE",
+                                 "PS2X_LIGHT_SPOT_HEIGHT", "PS2X_LIGHT_SPOT_RADIUS"})
+            setEnvVar(name, nullptr);
+        if (!gpu.Ready() || !gpu.SetFieldPublishing(true))
+            return out;
+        gpu.Initialize(vram.data(), static_cast<uint32_t>(vram.size()));
+        GSPresentationRequest request{};
+        request.pmode = 0x8007;
+        request.smode2 = 0x3;
+        request.dispfb1 = request.dispfb2 = 0ull | (10ull << 9);
+        request.display1 = request.display2 = (636ull) | (32ull << 12) | (639ull << 32) | (223ull << 44);
+        float m[16];
+        simpleCamera(m);
+        // Three fields: the renderer reads its switches at a VBlank, so the first field is drawn before the lights are live.
+        for (uint32_t frame = 0; frame < 3; ++frame)
+        {
+            if (camera)
+                channel().post(m, 2000u + frame, frame & 1u);
+            channel().kickBegin(2000u + frame, frame & 1u);
+            drawLitField(gpu, m, overlay);
+            channel().kickEnd(1u);
+            gpu.MarkPresentation(request);
+        }
+        PresentationFrame frame = gpu.Present(request);
+        if (frame && frame.width == 640 && frame.height == 448)
+        {
+            out.px = frame.pixels;
+            out.ok = true;
+        }
+        return out;
+    }
+
+    // How many pixels of the box differ (any channel) between two fields.
+    uint32_t differing(const Field &a, const Field &b, uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1)
+    {
+        uint32_t n = 0;
+        for (uint32_t y = y0; y < y1; ++y)
+            for (uint32_t x = x0; x < x1; ++x)
+                if (std::memcmp(a.at(x, y), b.at(x, y), 4) != 0)
+                    ++n;
+        return n;
+    }
+
+    double srgbToLinear(double c)
+    {
+        return c <= 0.04045 ? c / 12.92 : std::pow((c + 0.055) / 1.055, 2.4);
+    }
+
+    int linearToSrgb8(double c)
+    {
+        c = std::fmin(1.0, std::fmax(0.0, c));
+        const double e = c <= 0.0031308 ? c * 12.92 : 1.055 * std::pow(c, 1.0 / 2.4) - 0.055;
+        return static_cast<int>(e * 255.0 + 0.5);
+    }
 }
 
 void register_gpu_lighting_tests()
@@ -610,6 +725,156 @@ void register_gpu_lighting_tests()
         std::error_code ec;
         fs::remove(path, ec);
         t.IsFalse(loadCameraFile(path.string(), rows, &error), "a missing file is reported");
+    });
+
+    tc.Run("object rules: shadows are left alone, cards and ropes are lit by position, surfaces by their normal", [](TestCase &t)
+    {
+        PrimitiveKind shadow;
+        shadow.strip = true;
+        shadow.textured = true;
+        shadow.texW = shadow.texH = 256;
+        shadow.texPsm = 0x13;
+        shadow.flatBlack = true;
+        t.IsTrue(!ruleFor(shadow).lit && std::string(ruleFor(shadow).name) == "shadow", "a flat black strip is a shadow: not lit");
+        PrimitiveKind part = shadow;
+        part.flatBlack = false;
+        part.texW = part.texH = 64;
+        t.IsTrue(ruleFor(part).lit && ruleFor(part).facing == Facing::PositionOnly && std::string(ruleFor(part).name) == "card", "any other strip is a card: by position only");
+        PrimitiveKind rope;
+        rope.textured = true;
+        rope.texW = rope.texH = 32;
+        rope.texPsm = 0;
+        t.IsTrue(ruleFor(rope).lit && ruleFor(rope).facing == Facing::PositionOnly && std::string(ruleFor(rope).name) == "rope", "a triangle list with a 32 x 32 32-bit texture is a rope: by position only");
+        PrimitiveKind mat;
+        mat.textured = true;
+        mat.texW = mat.texH = 256;
+        mat.texPsm = 0x13;
+        t.IsTrue(ruleFor(mat).lit && ruleFor(mat).facing == Facing::Lambert && std::string(ruleFor(mat).name) == "surface", "other triangle lists are surfaces: by the face normal");
+        PrimitiveKind blackModel = mat;
+        blackModel.flatBlack = true;
+        t.IsTrue(ruleFor(blackModel).lit, "a black triangle of a model is still a surface (only strips can be shadows)");
+        PrimitiveKind small = rope;
+        small.texPsm = 0x13;
+        t.IsTrue(ruleFor(small).facing == Facing::Lambert, "a 32 x 32 texture with a palette is not a rope");
+    });
+
+    tc.Run("the look from the environment: defaults, values, clamps; and the shader's uniform block agrees with lightAt", [](TestCase &t)
+    {
+        for (const char *name : {"PS2X_LIGHT", "PS2X_LIGHT_AMBIENT", "PS2X_LIGHT_SPOT_INTENSITY", "PS2X_LIGHT_SPOT_COLOUR", "PS2X_LIGHT_SPOT_CONE",
+                                 "PS2X_LIGHT_SPOT_HEIGHT", "PS2X_LIGHT_SPOT_RADIUS"})
+            setEnvVar(name, nullptr);
+        Look look;
+        t.IsFalse(lookFromEnvironment(look), "off unless PS2X_LIGHT=1");
+        t.IsTrue(look.lights.size() == 1u && look.ambient[0] == 0.6f && look.lights[0].type == LightType::Spot && look.lights[0].position[1] == 900.0f &&
+                     look.lights[0].target[1] == 100.0f && look.lights[0].strength == 1.5f && look.lights[0].innerDegrees == 22.0f && look.lights[0].outerDegrees == 34.0f,
+                 "the defaults: ambient 0.6, one spotlight 900 high over the ring centre aimed at the mat, 1.5, cone 22 to 34");
+        setEnvVar("PS2X_LIGHT", "1");
+        setEnvVar("PS2X_LIGHT_AMBIENT", "0.2,0.3,0.4");
+        setEnvVar("PS2X_LIGHT_SPOT_INTENSITY", "3");
+        setEnvVar("PS2X_LIGHT_SPOT_COLOUR", "1,0.5,0.25");
+        setEnvVar("PS2X_LIGHT_SPOT_CONE", "40,30"); // the outer angle below the inner one
+        setEnvVar("PS2X_LIGHT_SPOT_HEIGHT", "50");  // below the mat
+        setEnvVar("PS2X_LIGHT_SPOT_RADIUS", "1500");
+        t.IsTrue(lookFromEnvironment(look), "PS2X_LIGHT=1 turns them on");
+        t.IsTrue(look.ambient[0] == 0.2f && look.ambient[1] == 0.3f && look.ambient[2] == 0.4f, "ambient as three numbers");
+        const Light &spot = look.lights[0];
+        t.IsTrue(spot.strength == 3.0f && spot.colour[1] == 0.5f && spot.radius == 1500.0f, "intensity, colour and radius");
+        t.IsTrue(spot.innerDegrees == 40.0f && spot.outerDegrees == 40.0f, "an outer angle below the inner one is raised to it");
+        t.IsTrue(spot.position[1] == 110.0f, "a height below the mat is raised above it");
+        setEnvVar("PS2X_LIGHT", "yes");
+        setEnvVar("PS2X_LIGHT_AMBIENT", "0.8");
+        setEnvVar("PS2X_LIGHT_SPOT_CONE", "18,30");
+        setEnvVar("PS2X_LIGHT_SPOT_HEIGHT", "900");
+        t.IsFalse(lookFromEnvironment(look), "anything but 1 is off");
+        t.IsTrue(look.ambient[0] == 0.8f && look.ambient[2] == 0.8f, "ambient as one number");
+        for (const char *name : {"PS2X_LIGHT", "PS2X_LIGHT_AMBIENT", "PS2X_LIGHT_SPOT_INTENSITY", "PS2X_LIGHT_SPOT_COLOUR", "PS2X_LIGHT_SPOT_CONE",
+                                 "PS2X_LIGHT_SPOT_HEIGHT", "PS2X_LIGHT_SPOT_RADIUS"})
+            setEnvVar(name, nullptr);
+
+        // The uniform block: the arithmetic of shaders/gs_light.hlsli, done here on the block's numbers, gives what lookAt gives.
+        const LightUniforms u = lightUniforms(look, Facing::Lambert);
+        t.IsTrue(u.spotPosition[1] == 900.0f && u.spotPosition[3] == 1500.0f && u.spotAxis[1] == -1.0f && u.spotAxis[3] == 3.0f && u.spotCone[2] == 0.0f &&
+                     std::fabs(u.spotCone[0] - std::cos(30.0f * 3.14159265f / 180.0f)) < 1e-6f && std::fabs(u.spotCone[1] - std::cos(18.0f * 3.14159265f / 180.0f)) < 1e-6f,
+                 "position and radius, axis and strength, the cosines of the cone, the rule");
+        t.IsTrue(lightUniforms(look, Facing::Half).spotCone[2] == 1.0f && lightUniforms(look, Facing::PositionOnly).spotCone[2] == 2.0f, "the three rules as numbers");
+        const float up[3] = {0.0f, 1.0f, 0.0f};
+        double worst = 0.0;
+        for (const float x : {0.0f, 150.0f, 280.0f, 330.0f, 420.0f, 600.0f})
+        {
+            const float at[3] = {x, 100.0f, 40.0f};
+            float expected[3];
+            lookAt(look, at, up, Facing::Lambert, expected);
+            const float toLight[3] = {u.spotPosition[0] - at[0], u.spotPosition[1] - at[1], u.spotPosition[2] - at[2]};
+            const float distance = std::sqrt(toLight[0] * toLight[0] + toLight[1] * toLight[1] + toLight[2] * toLight[2]);
+            float got[3] = {u.ambient[0], u.ambient[1], u.ambient[2]};
+            if (distance < u.spotPosition[3])
+            {
+                const float ratio = distance / u.spotPosition[3];
+                const float fall = (1.0f - ratio * ratio) * (1.0f - ratio * ratio);
+                const float l[3] = {toLight[0] / distance, toLight[1] / distance, toLight[2] / distance};
+                const float cosAngle = -(u.spotAxis[0] * l[0] + u.spotAxis[1] * l[1] + u.spotAxis[2] * l[2]);
+                const float e = std::fmin(1.0f, std::fmax(0.0f, (cosAngle - u.spotCone[0]) / (u.spotCone[1] - u.spotCone[0])));
+                const float cone = e * e * (3.0f - 2.0f * e);
+                const float face = std::fmax(up[0] * l[0] + up[1] * l[1] + up[2] * l[2], 0.0f);
+                for (int i = 0; i < 3; ++i)
+                    got[i] += u.spotColour[i] * (u.spotAxis[3] * fall * cone * face);
+            }
+            for (int i = 0; i < 3; ++i)
+                worst = std::fmax(worst, std::fabs(static_cast<double>(got[i]) - expected[i]));
+        }
+        t.IsTrue(worst < 1e-4, "six points across the cone: the block's arithmetic and lookAt agree (worst " + number(worst) + ")");
+    });
+
+    tc.Run("the lights on the GPU renderer: off or without a camera the picture is the same bytes; on, the floor is lit under the spotlight and dimmed outside it, the overlay and unlit pixels are untouched", [](TestCase &t)
+    {
+        if (!SDL_Init(SDL_INIT_VIDEO))
+        {
+            SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "offscreen");
+            if (!SDL_Init(SDL_INIT_VIDEO))
+            {
+                std::cout << "    (skipped: no SDL video driver)" << std::endl;
+                return;
+            }
+        }
+        const SDL_GPUShaderFormat formats = SDL_GPU_SHADERFORMAT_SPIRV | SDL_GPU_SHADERFORMAT_DXIL | SDL_GPU_SHADERFORMAT_MSL;
+        SDL_GPUDevice *device = SDL_CreateGPUDevice(formats, false, nullptr);
+        if (!device)
+        {
+            std::cout << "    (skipped: no GPU device: " << SDL_GetError() << ")" << std::endl;
+            return;
+        }
+        {
+            ps2x_settings::resetForTest();
+            ps2x_postfx::Params off;
+            off.enabled = false;
+            ps2x_postfx::setLive(off);
+            GSMem::InitLookupTables();
+            const Field plain = renderLitField(device, false, true, true);
+            const Field noCamera = renderLitField(device, true, false, true);
+            const Field lit = renderLitField(device, true, true, true);
+            const Field litNoOverlay = renderLitField(device, true, true, false);
+            t.IsTrue(plain.ok && noCamera.ok && lit.ok && litNoOverlay.ok, "four fields were read back");
+            if (plain.ok && noCamera.ok && lit.ok && litNoOverlay.ok)
+            {
+                // The floor is 200 below the eye. (0, -200, 60) is under the spotlight (4 degrees off its axis): picture (320, 412).
+                // (0, -200, 900) is 48 degrees off, outside the 20 degree cone: picture (320, 329). The clear shows at (40, 40).
+                const uint8_t *under = lit.at(320, 412), *outside = lit.at(320, 329);
+                t.IsTrue(near3(plain.at(320, 412), 200, 60, 20, 1) && near3(plain.at(320, 329), 200, 60, 20, 1), "lights off: the floor in its own colour");
+                t.IsTrue(plain.px == noCamera.px, "lights on but no camera: the same bytes as lights off");
+                const int r = linearToSrgb8(srgbToLinear(200 / 255.0) * 0.5), g = linearToSrgb8(srgbToLinear(60 / 255.0) * 0.5), b = linearToSrgb8(srgbToLinear(20 / 255.0) * 0.5);
+                t.IsTrue(near3(outside, r, g, b, 2), "outside the cone: the colour times the ambient 0.5 in linear light, " + rgbText(outside) + " for (" + std::to_string(r) + ", " +
+                                                         std::to_string(g) + ", " + std::to_string(b) + ")");
+                // Under the spot the light is 0.5 + 2 x falloff x facing, about 1.9: brighter than the game's colour, the hue kept.
+                t.IsTrue(under[0] > 225 && under[0] > under[1] && under[1] > under[2] && under[1] > 60, "under the spotlight: brighter than the game drew it, " + rgbText(under));
+                const int red = linearToSrgb8(srgbToLinear(200 / 255.0) * 1.9);
+                t.IsTrue(under[0] <= 255 && red == 255, "(the light would take the red past white: the shoulder holds it in range)");
+                t.IsTrue(std::memcmp(lit.at(40, 40), plain.at(40, 40), 4) == 0, "the clear, where nothing lit was drawn: the same bytes");
+                t.IsTrue(near3(lit.at(530, 64), 255, 16, 16, 0) && std::memcmp(lit.at(530, 64), plain.at(530, 64), 4) == 0, "the overlay box: the game's own pixels");
+                t.IsTrue(differing(lit, litNoOverlay, 0, 100, 640, 448) == 0u, "a field without an overlay is lit the same (the chain runs at the field copy)");
+                t.IsTrue(near3(litNoOverlay.at(530, 64), 30, 40, 60, 0), "and has the clear where the box was");
+            }
+        }
+        SDL_DestroyGPUDevice(device);
     });
 
     tc.Run("the debug views on the GPU renderer: off or without a camera the picture is the same bytes; with both, normals and heights are drawn", [](TestCase &t)
