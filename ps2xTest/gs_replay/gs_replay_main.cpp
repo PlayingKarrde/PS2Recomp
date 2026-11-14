@@ -43,6 +43,7 @@
 #include "runtime/gs/gs_gpu_backend.h"
 #include "runtime/gs/gs_gpu_math.h"
 #include "runtime/gs/gs_gpu_present.h"
+#include "runtime/gs/gs_gpu_threads.h"
 #include "runtime/gs/gs_recording.h"
 #include "../common/png_write.h"
 
@@ -1323,6 +1324,13 @@ namespace
             return nullptr;
         }
         driverName = SDL_GetGPUDeviceDriver(device);
+        // The two guards the game's host turns on (ps2_host_gpu.cpp, gs_gpu_threads.h): validation records every render pass under one mutex,
+        // and on Vulkan a DefragGuard keeps SDL's texture defragmentation from running while another thread has a command buffer in the
+        // making (the validation layer reports it as "expects SHADER_READ_ONLY_OPTIMAL ... current layout is TRANSFER_SRC_OPTIMAL").
+        // PS2X_GPU_DEFRAG_GUARD=0 turns the second off, as in the game, for comparing.
+        ps2x_gs::debugPassSerialization().store(opt.gpuDebug);
+        const char *guardEnv = std::getenv("PS2X_GPU_DEFRAG_GUARD");
+        ps2x_gs::defragGuardEnabled().store(driverName == "vulkan" && !(guardEnv && guardEnv[0] == '0'));
         const SDL_PropertiesID props = SDL_GetGPUDeviceProperties(device);
         deviceName = SDL_GetStringProperty(props, SDL_PROP_GPU_DEVICE_NAME_STRING, "(unknown)");
         return device;
@@ -2363,6 +2371,8 @@ int main(int argc, char **argv)
     if (gpuDevice)
     {
         SDL_DestroyGPUDevice(gpuDevice);
+        ps2x_gs::debugPassSerialization().store(false);
+        ps2x_gs::defragGuardEnabled().store(false);
         SDL_Quit();
     }
     return (failed || !pictureOk) ? 1 : 0;
