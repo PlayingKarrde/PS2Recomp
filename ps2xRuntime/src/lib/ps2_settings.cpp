@@ -6,6 +6,7 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cmath>
 #include <cstdio>
@@ -31,7 +32,53 @@ namespace ps2x_settings
             {"texture_tools", "PS2X_AUTHORING", "off"},
             {"skip_intros", "PS2X_SKIP_INTROS", "off"},
             {"strike_depth", "PS2X_STRIKE_DEPTH", "original"},
+            // The screen effects (task fx1, src/lib/gpu/gpu_postfx.h). fx_preset picks the values, the fx_<name> rows override one of them
+            // (empty: the preset's own value). The names are the table in gpu_postfx.cpp; a unit test keeps the two in step.
+            {"fx", "PS2X_FX", "off"},
+            {"fx_preset", "PS2X_FX_PRESET", "subtle"},
+            {"fx_bloom_threshold", "PS2X_FX_BLOOM_THRESHOLD", ""},
+            {"fx_bloom_knee", "PS2X_FX_BLOOM_KNEE", ""},
+            {"fx_bloom_intensity", "PS2X_FX_BLOOM_INTENSITY", ""},
+            {"fx_exposure", "PS2X_FX_EXPOSURE", ""},
+            {"fx_contrast", "PS2X_FX_CONTRAST", ""},
+            {"fx_saturation", "PS2X_FX_SATURATION", ""},
+            {"fx_temperature", "PS2X_FX_TEMPERATURE", ""},
+            {"fx_lift", "PS2X_FX_LIFT", ""},
+            {"fx_gamma", "PS2X_FX_GAMMA", ""},
+            {"fx_gain", "PS2X_FX_GAIN", ""},
+            {"fx_tilt_centre", "PS2X_FX_TILT_CENTRE", ""},
+            {"fx_tilt_width", "PS2X_FX_TILT_WIDTH", ""},
+            {"fx_tilt_falloff", "PS2X_FX_TILT_FALLOFF", ""},
+            {"fx_tilt_strength", "PS2X_FX_TILT_STRENGTH", ""},
+            {"fx_vignette_strength", "PS2X_FX_VIGNETTE_STRENGTH", ""},
+            {"fx_vignette_radius", "PS2X_FX_VIGNETTE_RADIUS", ""},
+            {"fx_vignette_softness", "PS2X_FX_VIGNETTE_SOFTNESS", ""},
         };
+
+        // The settings of the screen effects that hold a number (every fx_ key but the preset). Empty means "the preset's value".
+        bool isFxNumberKey(const std::string &key)
+        {
+            return key.size() > 3 && key.compare(0, 3, "fx_") == 0 && key != "fx_preset";
+        }
+        // A finite number, written back in its shortest form; the empty text for "unset". nullopt for anything else.
+        std::optional<std::string> fxNumber(const std::string &text)
+        {
+            if (text.empty())
+                return std::string();
+            char *end = nullptr;
+            const double value = std::strtod(text.c_str(), &end);
+            if (end == text.c_str() || *end != '\0' || !std::isfinite(value))
+                return std::nullopt;
+            char buffer[32];
+            std::snprintf(buffer, sizeof(buffer), "%g", value);
+            return std::string(buffer);
+        }
+        bool fxPresetValue(const std::string &value)
+        {
+            return value == "off" || value == "subtle" || value == "strong";
+        }
+
+        std::atomic<uint64_t> gGeneration{1};
 
         // strike_depth (task s1): how deep a strike's hit box is, front to back. "original" leaves the game's own test in place.
         bool strikeDepthValue(const std::string &value)
@@ -80,7 +127,11 @@ namespace ps2x_settings
             }
             if (key == "aspect")
                 return (value == "4:3" || value == "16:9" || value == "21:9") ? std::optional<std::string>(value) : std::nullopt;
-            if (key == "fullscreen" || key == "vsync" || key == "texture_tools" || key == "skip_intros")
+            if (key == "fx_preset")
+                return fxPresetValue(value) ? std::optional<std::string>(value) : std::nullopt;
+            if (isFxNumberKey(key))
+                return fxNumber(value);
+            if (key == "fullscreen" || key == "vsync" || key == "texture_tools" || key == "skip_intros" || key == "fx")
             {
                 if (value == "on" || value == "1" || value == "true" || value == "yes")
                     return std::string("on");
@@ -212,7 +263,7 @@ namespace ps2x_settings
                 return std::string("21:9");
             return text; // another shape (32:9): shown as it is
         }
-        if (key == "fullscreen" || key == "texture_tools" || key == "skip_intros")
+        if (key == "fullscreen" || key == "texture_tools" || key == "skip_intros" || key == "fx")
         {
             if (text == "1" || text == "on" || text == "true" || text == "yes")
                 return std::string("on");
@@ -220,6 +271,10 @@ namespace ps2x_settings
                 return std::string("off");
             return std::nullopt;
         }
+        if (key == "fx_preset")
+            return fxPresetValue(text) ? std::optional<std::string>(text) : std::nullopt;
+        if (isFxNumberKey(key))
+            return fxNumber(text);
         if (key == "vsync")
         {
             if (text == "vsync")
@@ -263,7 +318,7 @@ namespace ps2x_settings
         const Definition *def = find(key);
         if (!v || !def || *v == def->defaultValue)
             return std::nullopt;
-        if (key == "fullscreen" || key == "texture_tools" || key == "skip_intros")
+        if (key == "fullscreen" || key == "texture_tools" || key == "skip_intros" || key == "fx")
             return std::string("1");
         if (key == "vsync")
             return std::string("vsync");
@@ -306,10 +361,13 @@ namespace ps2x_settings
                           "# volume = 0..100              texture_tools = on | off (the modder's tools, docs/modding-textures.md)\n"
                           "# skip_intros = on | off      start at the title screen without the logos and the opening movie (next start)\n"
                           "# strike_depth = original | wide | wider   a strike's reach toward or away from the screen (x1, x1.5, x2)\n"
+                          "# fx = on | off                 screen effects in matches (bloom, colour grading, tilt-shift, vignette; docs/hd-lighting.md)\n"
+                          "# fx_preset = off | subtle | strong   fx_<name> = a number: one value of the effects instead of the preset's (blank: the preset's)\n"
                           "# An environment variable (PS2X_GS_BACKEND, PS2X_GS_SCALE, PS2X_GS_WIDE, PS2X_FULLSCREEN, PS2X_GPU_PRESENT_MODE,\n"
-                          "# PS2X_SCALE, PS2X_VOLUME, PS2X_AUTHORING, PS2X_SKIP_INTROS, PS2X_STRIKE_DEPTH) set before the game starts wins over this file.\n";
+                          "# PS2X_SCALE, PS2X_VOLUME, PS2X_AUTHORING, PS2X_SKIP_INTROS, PS2X_STRIKE_DEPTH, PS2X_FX, PS2X_FX_PRESET, PS2X_FX_<NAME>) set before the game starts wins over this file.\n";
         for (const Entry &entry : entries)
-            out += entry.key + " = " + entry.value + "\n";
+            if (!entry.value.empty()) // a blank value (an fx_<name> that has no override) is the default: not written
+                out += entry.key + " = " + entry.value + "\n";
         return out;
     }
 
@@ -390,6 +448,7 @@ namespace ps2x_settings
             s.items.push_back(std::move(item));
         }
 
+        gGeneration.fetch_add(1, std::memory_order_relaxed);
         std::printf("[settings] file %s%s; from the file: %s; fixed by the environment: %s\n", path.empty() ? "(none)" : path.c_str(),
                     fileRead ? "" : " (not there yet)", applied.empty() ? "nothing set" : applied.c_str(),
                     fixed.empty() ? "nothing" : fixed.c_str());
@@ -462,6 +521,7 @@ namespace ps2x_settings
             item->current = *normal;
             item->fileValue = *normal;
             s.dirty = true;
+            gGeneration.fetch_add(1, std::memory_order_relaxed);
         }
         return true;
     }
@@ -520,8 +580,14 @@ namespace ps2x_settings
         return true;
     }
 
+    uint64_t generation()
+    {
+        return gGeneration.load(std::memory_order_relaxed);
+    }
+
     void resetForTest()
     {
+        gGeneration.fetch_add(1, std::memory_order_relaxed);
         Store &s = store();
         std::lock_guard<std::mutex> lock(s.mutex);
         s.initialized = false;

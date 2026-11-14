@@ -44,7 +44,9 @@ namespace ps2x_settings
 
     // renderer (gpu|cpu), resolution (1..4), aspect (4:3|16:9|21:9), fullscreen (on|off), vsync (on|off),
     // filter (sharp|linear), volume (0..100), texture_tools (on|off), skip_intros (on|off: start at the title screen, task i1),
-    // strike_depth (original|wide|wider: a strike's hit box x1, x1.5, x2 front to back, task s1; read by the game while it runs)
+    // strike_depth (original|wide|wider: a strike's hit box x1, x1.5, x2 front to back, task s1; read by the game while it runs),
+    // fx (on|off: the screen effects of task fx1, off by default), fx_preset (off|subtle|strong), and one fx_<name> per value of the effects
+    // (gpu_postfx.h: bloom_threshold ... vignette_softness; a number, or empty for "the preset's value"). The effects read them live.
     const std::vector<Definition> &definitions();
     const Definition *find(const std::string &key);
 
@@ -86,6 +88,10 @@ namespace ps2x_settings
     // True when an environment variable fixed the setting at start-up; envName() is its name.
     bool fixedByEnvironment(const std::string &key);
     std::string envName(const std::string &key);
+
+    // Counts every change of a setting's value (set() that changed something, initialize(), resetForTest()). Code that reads settings while
+    // the game runs (the screen effects) compares it with the number it last saw and reads again when it differs. Any thread.
+    uint64_t generation();
 
     // Changes a setting in the store (the file is written by save()). Ignored for a setting the environment fixes.
     // Returns false for an unknown key or a setting that is fixed.

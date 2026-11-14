@@ -87,6 +87,7 @@
 #include "runtime/gs/ps2_gs_memory.h"
 #include "runtime/gs/ps2_gs_transfer.h"
 
+#include "gpu/gpu_postfx.h"
 #include "gpu/gpu_shaders.h"
 #include "shaders/compiled/gs_frag.h"
 #include "shaders/compiled/gs_rep_frag.h"
@@ -266,6 +267,25 @@ namespace
         SDL_GPUTexture *color = nullptr;
         uint32_t fbp = 0, fbw = 0, psm = 0;
         uint32_t w = 0, h = 0; // texture size in pixels (scale applied)
+        // Screen effects (task fx1 and fx1b, gpu_postfx.h). All of this is idle unless they are on. `proc` is a texture of this target's size
+        // (with a depth target of its own, `procDepth`) that holds the processed scene and then the overlay drawn over it: the chain writes
+        // it at the first overlay primitive of a field and the overlay primitives are drawn into it a second time. The counters describe
+        // the field being drawn into this target, and are cleared by its clear sprite and by the first primitive drawn after the field was
+        // copied out (`shown`).
+        SDL_GPUTexture *proc = nullptr;
+        SDL_GPUTexture *procDepth = nullptr;
+        bool procValid = false;        // `proc` holds this field's processed scene (and its overlay so far); nothing scene-like came after
+        bool replayPending = false;    // the next overlay draw is the field's first: it clears procDepth
+        uint32_t procX = 0, procY = 0, procW = 0, procH = 0; // the picture in `proc`, as the chain was told
+        bool overlaySeen = false;      // an overlay primitive (Z of 65536 or more) came in this field
+        bool overlaySeenBefore() const { return overlayPrims > 1u; } // (counted before this primitive: the boundary is tried at the first only)
+        bool shown = false;            // this field has been copied out; the next primitive drawn into the target starts a new one
+        uint32_t sceneTris = 0;        // triangle-list primitives of the scene so far (the match-field test)
+        uint32_t scenePrims = 0, overlayPrims = 0;
+        uint32_t sceneZMax = 0, sceneAnyZMax = 0, overlayZMin = 0xFFFFFFFFu; // raw 24-bit Z: last vertex, any vertex, and the overlay's lowest
+        int32_t overlayX0 = 0x7FFFFFFF, overlayX1 = -1, overlayY0 = 0x7FFFFFFF, overlayY1 = -1; // the box the overlay primitives cover together (GS pixels)
+        // The overlay covers (nearly) the whole screen: a fade or a flash, as opposed to the clock, the pause panel or a popup.
+        bool overlayCoversScreen() const { return overlayX1 - overlayX0 >= 575 && overlayY1 - overlayY0 >= 200; }
     };
     struct DepthTarget
     {
@@ -286,6 +306,7 @@ namespace
         SDL_GPUTexture *src = nullptr;
         uint32_t x = 0, y = 0, w = 0, h = 0;
         SDL_GPUTexture *dst = nullptr;
+        const ps2x_postfx::Job *fx = nullptr; // screen effects: the picture to copy is the chain's output for this job, not `src`
     };
 
     bool slotUsedBy(const GSGpuBackend::FieldInfo &f, int slot)
@@ -309,6 +330,11 @@ namespace
         SDL_GPUTexture *texture = nullptr; // nullptr: the 1x1 white dummy
         int32_t sx = 0, sy = 0, sw = 0, sh = 0; // scissor, in target pixels
         uint32_t rep = 0;                  // 1 + the index of the draw's RepDraw in Impl::repDraws; 0: not replaced (gs.frag.hlsl)
+        // Screen effects: an overlay draw is made a second time into the target's processed picture (FrameTarget::proc); the first of a
+        // field starts that picture's depth buffer afresh. A draw with the key kBoundaryKey draws nothing: it runs the effect chain
+        // (job `fxJob` of Impl::fxJobs) on the frame target as it is at that point of the list.
+        int32_t fxJob = -1;
+        bool replay = false, replayFirst = false;
     };
 
     SDL_GPUBlendFactor toSdl(BlendFactor f)
@@ -350,6 +376,14 @@ namespace
     // Pipeline state packed into 16 bits: blend factors and op, whether blending is on, depth compare, depth write.
     constexpr uint32_t kZRestoreKey = 1u << 12; // the pipeline that copies decoded Z pages into the depth target
     constexpr uint32_t kRepKey = 1u << 13;      // the pipeline for textures a pack replaces (gs_rep.frag.hlsl, two samplers)
+    // A Draw with this key draws nothing: it marks the end of a scene, where flushLocked runs the effect chain on the frame target (tasks fx1, fx1b).
+    constexpr uint32_t kBoundaryKey = 1u << 14;
+    // The screen effects tell scene from overlay by the Z of the last vertex (docs/hd-lighting.md, "The boundary"): the scene's is below
+    // 65536 (the highest seen in a whole match: 23,772), the overlay's (clock, pause panel, popups, fades) at or above it. 65536 / 2^24 is exact in a float.
+    constexpr float kOverlayZ = 65536.0f * GSGpu::kDepthScale;
+    // A field is a match field when its scene has this many triangle-list primitives. The game draws its 3D with triangle lists
+    // (model_queue) and everything 2D with sprites and strips: match fields have 790 (octagon) to 2,558, every other clip none.
+    constexpr uint32_t kSceneTriangles = 200u;
 
     uint32_t pipelineKey(const BlendState &blend, uint32_t compare, bool depthWrite)
     {
@@ -606,6 +640,43 @@ struct GSGpuBackend::Impl
 
     std::deque<SDL_GPUFence *> frameFences; // one per submitted marker, oldest first
 
+    // ---- screen effects (task fx1; gpu_postfx.h, docs/hd-lighting.md). Off by default; with fxOn false nothing below runs.
+    std::unique_ptr<ps2x_postfx::Chain> fx;
+    ps2x_postfx::Params fxParams;
+    bool fxOn = false;          // effects wanted and the chain is ready (set at each marker from the live parameters)
+    bool fxFailed = false;      // the chain could not be made: stay off
+    bool fxLoggedWeave = false;
+    std::vector<ps2x_postfx::Job> fxJobs; // the chain runs recorded in `draws` (a Draw with kBoundaryKey names one), cleared with it
+    bool fxCurOverlay = false;            // the primitive being submitted is an overlay primitive of a field whose scene has been processed
+    ps2x_postfx::Job fxTimeJob;           // the last chain run, for PS2X_FX_TIME
+    bool fxTimeJobValid = false;
+    // The overlay primitives seen, by the state that decides how they are drawn: how many of each (printed at exit).
+    std::unordered_map<uint64_t, uint64_t> fxOverlayModes;
+    struct FxStats
+    {
+        uint64_t fieldsSnapshot = 0;   // fields run through the chain with the overlay drawn over the processed scene
+        uint64_t fieldsDirect = 0;     // ... and with no overlay in them (the chain ran at the field copy)
+        uint64_t fieldsPlain = 0;      // fields copied as before: not a match field
+        uint64_t fieldsNoSnapshot = 0; // match fields that had an overlay but no usable processed picture (copied as before)
+        uint64_t snapshots = 0;        // chain runs recorded at the end of a scene
+        uint64_t staleSnapshots = 0;   // scene primitives after the end of the scene (the processed picture was dropped)
+        uint64_t zDisagree = 0;        // primitives whose last-vertex Z and highest-vertex Z fall on different sides of the overlay Z
+        uint32_t sceneZMax = 0, sceneAnyZMax = 0, overlayZMin = 0xFFFFFFFFu;
+    } fxStats;
+    std::FILE *fxTrace = nullptr;   // PS2X_FX_TRACE=<file>: one row per field copied out, for checking the boundary rule
+    bool fxTiming = false;          // PS2X_FX_TIME=1: time the chain on an idle GPU for each field and print a summary
+    std::vector<double> fxTimes, fxEmptyTimes; // microseconds: the chain, and an empty submit and wait
+    bool fxStatsOn = false;         // PS2X_FX_STATS=1: a line every 300 markers
+    bool fxDropOverlay = false;     // PS2X_FX_DROP_OVERLAY=1 (a test aid, works with the effects off): overlay primitives are not drawn, so the picture
+                                    // is the scene alone; comparing it with the normal picture gives the pixels the overlay covers
+    void fxRefresh();
+    void fxNote(const GSPrimitiveBatch &batch, const Setup &setup);
+    void fxBoundary(uint32_t frameIndex);
+    bool fxPictureRegion(uint32_t targetW, uint32_t targetH, uint32_t &x, uint32_t &y, uint32_t &w, uint32_t &h) const;
+    void fxResetTarget(FrameTarget &t);
+    void fxTraceRow(const FrameTarget &t, int mode);
+    void fxShutdown();
+
     // ---- field publishing (paths A and B); see "Field ring" at the top
     std::atomic<bool> fields{false};
     bool directConsumer = false;
@@ -843,6 +914,8 @@ bool GSGpuBackend::Impl::init(SDL_GPUDevice *device, uint32_t s, GSGpuBackend::F
         if (const char *fill = std::getenv("PS2X_GS_WIDE_FILL"))
             wideFills = !(fill[0] == '0');
     }
+    if (const char *drop = std::getenv("PS2X_FX_DROP_OVERLAY"))
+        fxDropOverlay = drop[0] == '1';
     if (const char *path = std::getenv("PS2X_GS_W1_PRIMS"))
         if (path[0] != '\0')
         {
@@ -1150,6 +1223,7 @@ GSGpuBackend::Impl::~Impl()
     if (!dev)
         return;
     SDL_WaitForGPUIdle(dev);
+    fxShutdown();
     for (SDL_GPUFence *fence : frameFences)
         SDL_ReleaseGPUFence(dev, fence);
     for (auto &p : pipelines)
@@ -1162,7 +1236,13 @@ GSGpuBackend::Impl::~Impl()
         for (const PooledTexture &p : bucket.second)
             SDL_ReleaseGPUTexture(dev, p.tex);
     for (auto &f : frames)
+    {
         SDL_ReleaseGPUTexture(dev, f.color);
+        if (f.proc)
+            SDL_ReleaseGPUTexture(dev, f.proc);
+        if (f.procDepth)
+            SDL_ReleaseGPUTexture(dev, f.procDepth);
+    }
     for (auto &d : depths)
         SDL_ReleaseGPUTexture(dev, d.depth);
     if (dummy)
@@ -2580,6 +2660,12 @@ void GSGpuBackend::Impl::submitSetup(const GSDrawState &state, const Setup &setu
             noteTextureUse(d.texture, state, setup);
     }
     const FrameTarget &target = frames[frame];
+    if (fxCurOverlay)
+    {
+        d.replay = true; // an overlay primitive of a processed field: also drawn over the processed scene (flushLocked)
+        d.replayFirst = frames[frame].replayPending;
+        frames[frame].replayPending = false;
+    }
     const int32_t mx = static_cast<int32_t>(scaleX), my = static_cast<int32_t>(scaleY);
     const int32_t padL = static_cast<int32_t>(padLeft);
     d.sx = std::min<int32_t>((scX0 + padL) * mx, static_cast<int32_t>(target.w));
@@ -2599,7 +2685,7 @@ void GSGpuBackend::Impl::submitSetup(const GSDrawState &state, const Setup &setu
     {
         Draw &last = draws.back();
         if (last.frame == d.frame && last.depth == d.depth && last.pipeline == d.pipeline && last.texture == d.texture && last.rep == d.rep &&
-            last.sx == d.sx && last.sy == d.sy && last.sw == d.sw && last.sh == d.sh && last.uniforms == d.uniforms)
+            last.replay == d.replay && !d.replayFirst && last.sx == d.sx && last.sy == d.sy && last.sw == d.sw && last.sh == d.sh && last.uniforms == d.uniforms)
         {
             last.vertexCount += setup.count;
             return;
@@ -2638,6 +2724,11 @@ void GSGpuBackend::Impl::submit(const GSPrimitiveBatch &batch)
     }
     if (wideLog)
         noteWide(batch, setup);
+    fxCurOverlay = false;
+    if (fxOn)
+        fxNote(batch, setup);
+    if (fxDropOverlay && setup.count != 0 && setup.v[setup.count - 1].z >= kOverlayZ)
+        return;
     if (wide() && wideFills && !batch.state.prim.tme && setup.minX <= 1 && setup.maxX >= 638)
     {
         // An untextured primitive that spans the screen is a clear or a fade: push the vertices on the screen's edges out to
@@ -2787,41 +2878,46 @@ void GSGpuBackend::Impl::flushLocked(bool wait, const FieldCopy *fieldCopies, in
     uint32_t curPipeline = ~0u;
     SDL_GPUTexture *curTexture = reinterpret_cast<SDL_GPUTexture *>(~uintptr_t(0));
     SDL_GPUTexture *curRepTexture = reinterpret_cast<SDL_GPUTexture *>(~uintptr_t(0));
-    for (const Draw &d : draws)
+    auto endPass = [&]()
     {
-        if (!pass || d.frame != curFrame || d.depth != curDepth)
-        {
-            if (pass)
-                SDL_EndGPURenderPass(pass);
-            SDL_GPUColorTargetInfo color = {};
-            color.texture = frames[d.frame].color;
-            color.load_op = SDL_GPU_LOADOP_LOAD;
-            color.store_op = SDL_GPU_STOREOP_STORE;
-            SDL_GPUDepthStencilTargetInfo depth = {};
-            depth.texture = depths[d.depth].depth;
-            depth.clear_depth = 0.0f; // the GS clears Z to 0 and keeps the larger value
-            depth.load_op = depths[d.depth].needsClear ? SDL_GPU_LOADOP_CLEAR : SDL_GPU_LOADOP_LOAD;
-            depths[d.depth].needsClear = false;
-            depth.store_op = SDL_GPU_STOREOP_STORE;
-            depth.stencil_load_op = SDL_GPU_LOADOP_DONT_CARE;
-            depth.stencil_store_op = SDL_GPU_STOREOP_DONT_CARE;
-            pass = SDL_BeginGPURenderPass(cmd, &color, 1, &depth);
-            ++stats.renderPasses;
-            const float globals[4] = {static_cast<float>(frames[d.frame].w), static_cast<float>(frames[d.frame].h), 0.0f, 0.0f};
-            SDL_PushGPUVertexUniformData(cmd, 0, globals, sizeof(globals));
-            SDL_GPUBufferBinding vb = {vertexBuffer, 0};
-            SDL_BindGPUVertexBuffers(pass, 0, &vb, 1);
-            curFrame = d.frame;
-            curDepth = d.depth;
-            curPipeline = ~0u;
-            curTexture = reinterpret_cast<SDL_GPUTexture *>(~uintptr_t(0));
-            curRepTexture = reinterpret_cast<SDL_GPUTexture *>(~uintptr_t(0));
-        }
+        if (pass)
+            SDL_EndGPURenderPass(pass);
+        pass = nullptr;
+        curFrame = ~0u;
+        curDepth = ~0u;
+    };
+    // Begins a render pass into `colorTex` / `depthTex` (the frame's own, or its processed picture's).
+    auto beginPass = [&](uint32_t frame, SDL_GPUTexture *colorTex, SDL_GPUTexture *depthTex, SDL_GPULoadOp depthLoad)
+    {
+        SDL_GPUColorTargetInfo color = {};
+        color.texture = colorTex;
+        color.load_op = SDL_GPU_LOADOP_LOAD;
+        color.store_op = SDL_GPU_STOREOP_STORE;
+        SDL_GPUDepthStencilTargetInfo depth = {};
+        depth.texture = depthTex;
+        depth.clear_depth = 0.0f; // the GS clears Z to 0 and keeps the larger value
+        depth.load_op = depthLoad;
+        depth.store_op = SDL_GPU_STOREOP_STORE;
+        depth.stencil_load_op = SDL_GPU_LOADOP_DONT_CARE;
+        depth.stencil_store_op = SDL_GPU_STOREOP_DONT_CARE;
+        pass = SDL_BeginGPURenderPass(cmd, &color, 1, &depth);
+        ++stats.renderPasses;
+        const float globals[4] = {static_cast<float>(frames[frame].w), static_cast<float>(frames[frame].h), 0.0f, 0.0f};
+        SDL_PushGPUVertexUniformData(cmd, 0, globals, sizeof(globals));
+        SDL_GPUBufferBinding vb = {vertexBuffer, 0};
+        SDL_BindGPUVertexBuffers(pass, 0, &vb, 1);
+        curPipeline = ~0u;
+        curTexture = reinterpret_cast<SDL_GPUTexture *>(~uintptr_t(0));
+        curRepTexture = reinterpret_cast<SDL_GPUTexture *>(~uintptr_t(0));
+    };
+    // One draw call in the open pass.
+    auto drawOne = [&](const Draw &d)
+    {
         if (d.pipeline != curPipeline)
         {
             SDL_GPUGraphicsPipeline *p = pipeline(d.pipeline);
             if (!p)
-                continue;
+                return;
             SDL_BindGPUGraphicsPipeline(pass, p);
             curPipeline = d.pipeline;
         }
@@ -2862,11 +2958,76 @@ void GSGpuBackend::Impl::flushLocked(bool wait, const FieldCopy *fieldCopies, in
         SDL_SetGPUScissor(pass, &scissor);
         SDL_DrawGPUPrimitives(pass, d.vertexCount, 1, d.firstVertex, 0);
         ++stats.drawCalls;
+    };
+    bool anyReplay = false;
+    for (const Draw &d : draws)
+    {
+        if (d.pipeline == kBoundaryKey)
+        {
+            // Screen effects: the scene of this target is complete. Run the chain on it, into the target's processed picture; the overlay
+            // primitives that follow are drawn into that picture a second time (below). The chain takes its own render passes, outside ours.
+            endPass();
+            if (fx && d.fxJob >= 0 && static_cast<size_t>(d.fxJob) < fxJobs.size())
+            {
+                fx->record(cmd, fxJobs[static_cast<size_t>(d.fxJob)], true);
+                if (fxTiming)
+                {
+                    fxTimeJob = fxJobs[static_cast<size_t>(d.fxJob)];
+                    fxTimeJobValid = true;
+                }
+            }
+            continue;
+        }
+        if (d.replay)
+            anyReplay = true;
+        if (!pass || d.frame != curFrame || d.depth != curDepth)
+        {
+            endPass();
+            beginPass(d.frame, frames[d.frame].color, depths[d.depth].depth, depths[d.depth].needsClear ? SDL_GPU_LOADOP_CLEAR : SDL_GPU_LOADOP_LOAD);
+            depths[d.depth].needsClear = false;
+            curFrame = d.frame;
+            curDepth = d.depth;
+        }
+        drawOne(d);
     }
-    if (pass)
-        SDL_EndGPURenderPass(pass);
+    endPass();
+    if (anyReplay)
+    {
+        // The overlay a second time, over the processed scene: the same draws, the same pipelines, into the target's processed picture and
+        // its own depth buffer (cleared at the field's first overlay draw; the overlay's Z is above every Z of the scene, so a depth buffer
+        // that holds only the overlay gives the same tests).
+        for (const Draw &d : draws)
+        {
+            if (!d.replay)
+                continue;
+            FrameTarget &ft = frames[d.frame];
+            if (!ft.proc || !ft.procDepth)
+                continue;
+            if (!pass || d.frame != curFrame || d.replayFirst)
+            {
+                endPass();
+                beginPass(d.frame, ft.proc, ft.procDepth, d.replayFirst ? SDL_GPU_LOADOP_CLEAR : SDL_GPU_LOADOP_LOAD);
+                curFrame = d.frame;
+            }
+            drawOne(d);
+        }
+        endPass();
+    }
     passLock.Unlock();
 
+    // Screen effects: a field with no overlay is processed here, at the field copy, and the chain's picture goes into the field in place of
+    // the frame target's pixels (the chain reads the frame target and writes only textures of its own). A field with an overlay was
+    // processed at the end of its scene and its picture is the copy's source already (produceField).
+    SDL_GPUTexture *fxPicture = nullptr;
+    if (fieldCopyCount > 0 && fieldCopies[0].fx && fx)
+    {
+        fxPicture = fx->record(cmd, *fieldCopies[0].fx);
+        if (fxTiming)
+        {
+            fxTimeJob = *fieldCopies[0].fx;
+            fxTimeJobValid = true;
+        }
+    }
     if (fieldCopyCount > 0)
     {
         SDL_GPUCopyPass *copy = SDL_BeginGPUCopyPass(cmd);
@@ -2877,6 +3038,12 @@ void GSGpuBackend::Impl::flushLocked(bool wait, const FieldCopy *fieldCopies, in
             from.texture = fc.src;
             from.x = fc.x;
             from.y = fc.y;
+            if (i == 0 && fxPicture)
+            {
+                from.texture = fxPicture;
+                from.x = 0;
+                from.y = 0;
+            }
             SDL_GPUTextureLocation to = {};
             to.texture = fc.dst;
             SDL_CopyGPUTextureToTexture(copy, &from, &to, fc.w, fc.h, 1, false);
@@ -2895,6 +3062,17 @@ void GSGpuBackend::Impl::flushLocked(bool wait, const FieldCopy *fieldCopies, in
         SDL_SubmitGPUCommandBuffer(cmd);
     window.Unlock();
     stats.flushSubmitNanos += nowNanos() - recordDone;
+    if (fxTiming && fxTimeJobValid && fx)
+    {
+        // Measuring: the chain again, alone, on an idle GPU (its input is the frame target as it was; nothing else is recorded meanwhile).
+        fxTimeJobValid = false;
+        const double us = fx->timeOnce(fxTimeJob);
+        if (us >= 0.0)
+            fxTimes.push_back(us);
+        const double empty = fx->timeEmpty();
+        if (empty >= 0.0)
+            fxEmptyTimes.push_back(empty);
+    }
     if (fieldCopyCount > 0)
     {
         // The fence keeps the GPU from falling more than kMaxFramesInFlight markers behind.
@@ -2924,6 +3102,7 @@ void GSGpuBackend::Impl::flushLocked(bool wait, const FieldCopy *fieldCopies, in
         SDL_WaitForGPUIdle(dev);
 
     draws.clear();
+    fxJobs.clear();
     repDraws.clear();
     vertices.clear();
     pendingUploads.clear();
@@ -3201,7 +3380,56 @@ GSGpuBackend::MarkResult GSGpuBackend::Impl::produceField(const GSPresentationRe
                 copies[0] = {target->color, copyX, copyY, copyWidth, copyHeight, slots[static_cast<size_t>(got[0])].tex};
                 for (int i = 0; i < candidateCount; ++i)
                     copies[1 + i] = {candidates[i]->color, wideRegion ? 0u : padLeft * scaleX, 0u, copyWidth, copyHeight, slots[static_cast<size_t>(got[1 + i])].tex};
+                // Screen effects: a match field (its scene had triangle lists) goes through the chain. If it had an overlay, the chain ran
+                // where the scene ended and the overlay was drawn over its picture (FrameTarget::proc): that picture is the field. A
+                // field with no overlay is processed here. Anything else is copied as it always was.
+                ps2x_postfx::Job fxJob;
+                FrameTarget *fxTarget = nullptr;
+                int fxMode = 0; // 0 plain, 1 processed scene with the overlay over it, 2 the whole field is scene
+                if (fxOn)
+                {
+                    for (FrameTarget &f : frames)
+                        if (f.color == target->color)
+                            fxTarget = &f;
+                    if (fxTarget && fxTarget->sceneTris >= kSceneTriangles)
+                    {
+                        if (fxTarget->procValid && fxTarget->proc && fxTarget->procX == copyX && fxTarget->procY == copyY &&
+                            fxTarget->procW == copyWidth && fxTarget->procH == copyHeight)
+                            fxMode = 1;
+                        else if (!fxTarget->overlaySeen)
+                            fxMode = 2;
+                        else
+                            ++fxStats.fieldsNoSnapshot;
+                    }
+                    else
+                        ++fxStats.fieldsPlain;
+                    if (fxMode == 1)
+                    {
+                        copies[0].src = fxTarget->proc; // the same place in a texture of the frame target's size
+                        ++fxStats.fieldsSnapshot;
+                    }
+                    else if (fxMode == 2)
+                    {
+                        fxJob.field = fxTarget->color;
+                        fxJob.x = copyX;
+                        fxJob.y = copyY;
+                        fxJob.w = copyWidth;
+                        fxJob.h = copyHeight;
+                        fxJob.aspect = static_cast<float>(640u + padLeft + padRight) / 480.0f;
+                        fxJob.scale = static_cast<float>(scaleX);
+                        fxJob.params = fxParams;
+                        copies[0].fx = &fxJob;
+                        ++fxStats.fieldsDirect;
+                    }
+                    ps2x_postfx::Status &status = ps2x_postfx::status();
+                    status.lastMode.store(fxMode, std::memory_order_relaxed);
+                    (fxMode != 0 ? status.fieldsWithEffects : status.fieldsPlain).fetch_add(1, std::memory_order_relaxed);
+                    if (fxTrace && fxTarget)
+                        fxTraceRow(*fxTarget, fxMode);
+                }
                 flushLocked(false, copies, 1 + candidateCount);
+                if (fxTarget)
+                    fxTarget->shown = true; // the next primitive drawn into this target starts from nothing (fxNote)
                 ++stats.fieldsFast;
                 if (candidateCount != 0)
                     ++stats.fieldsWithCandidates;
@@ -3590,6 +3818,273 @@ void GSGpuBackend::Impl::writeMissLog()
 }
 
 // ------------------------------------------------------------------------------------------------
+// screen effects (task fx1; docs/hd-lighting.md "Tier 1")
+
+// Called at each marker: reads the live parameters, makes the chain the first time they ask for it, and says whether the draw path
+// has to track scenes and overlays. Effects need progressive fields (a 448-line picture per field) and the direct picture path.
+void GSGpuBackend::Impl::fxRefresh()
+{
+    const ps2x_postfx::Params p = ps2x_postfx::current();
+    bool want = p.enabled;
+    if (want && !(progressive() && fields))
+    {
+        if (!fxLoggedWeave)
+        {
+            fxLoggedWeave = true;
+            std::fprintf(stderr, "[fx] the screen effects need the progressive GPU renderer (PS2X_GS_FIELDS=progressive) and the direct picture path; staying off\n");
+        }
+        want = false;
+        ps2x_postfx::status().unavailable.store(true, std::memory_order_relaxed);
+    }
+    if (want && !fx && !fxFailed)
+    {
+        fx = std::make_unique<ps2x_postfx::Chain>(dev);
+        if (!fx->ready())
+        {
+            fx.reset();
+            fxFailed = true;
+            ps2x_postfx::status().unavailable.store(true, std::memory_order_relaxed);
+        }
+        else
+        {
+            std::fprintf(stderr, "[fx] screen effects on (%s)\n", p.bloomIntensity > 0.0f || p.tiltStrength > 0.0f ? "bloom, grade, tilt-shift, vignette" : "grade");
+            if (const char *file = std::getenv("PS2X_FX_TRACE"))
+                if (file[0] != '\0' && !fxTrace)
+                {
+                    fxTrace = std::fopen(file, "w");
+                    if (fxTrace)
+                        std::fprintf(fxTrace, "marker,fbp,mode,scene_prims,scene_tris,overlay_prims,scene_z_max,scene_any_z_max,overlay_z_min,proc_valid,overlay_seen\n");
+                }
+            const char *timing = std::getenv("PS2X_FX_TIME");
+            fxTiming = timing && timing[0] == '1';
+            const char *statsFlag = std::getenv("PS2X_FX_STATS");
+            fxStatsOn = statsFlag && statsFlag[0] == '1';
+        }
+    }
+    want = want && fx;
+    if (want && !fxOn)
+        for (FrameTarget &t : frames)
+            fxResetTarget(t); // counters from before the effects were off must not leak in
+    fxOn = want;
+    fxParams = p;
+    if (fxOn && fxStatsOn && markerSeq % 300u == 299u)
+    {
+        const ps2x_postfx::Chain::Stats cs = fx->stats();
+        std::fprintf(stderr,
+                     "[fx:stats] fields: %llu with snapshot, %llu direct, %llu plain, %llu no usable snapshot; snapshots %llu (%llu stale); picture %ux%u; "
+                     "chain: %llu passes, %.1f MB; scene Z max %u (any vertex %u), overlay Z min %u, Z disagreements %llu\n",
+                     static_cast<unsigned long long>(fxStats.fieldsSnapshot), static_cast<unsigned long long>(fxStats.fieldsDirect),
+                     static_cast<unsigned long long>(fxStats.fieldsPlain), static_cast<unsigned long long>(fxStats.fieldsNoSnapshot),
+                     static_cast<unsigned long long>(fxStats.snapshots), static_cast<unsigned long long>(fxStats.staleSnapshots), cs.pictureW, cs.pictureH,
+                     static_cast<unsigned long long>(cs.passes), static_cast<double>(cs.textureBytes) / 1048576.0, fxStats.sceneZMax, fxStats.sceneAnyZMax,
+                     fxStats.overlayZMin, static_cast<unsigned long long>(fxStats.zDisagree));
+    }
+}
+
+void GSGpuBackend::Impl::fxResetTarget(FrameTarget &t)
+{
+    t.procValid = false;
+    t.replayPending = false;
+    t.overlaySeen = false;
+    t.shown = false;
+    t.sceneTris = 0;
+    t.scenePrims = t.overlayPrims = 0;
+    t.sceneZMax = t.sceneAnyZMax = 0;
+    t.overlayZMin = 0xFFFFFFFFu;
+    t.overlayX0 = t.overlayY0 = 0x7FFFFFFF;
+    t.overlayX1 = t.overlayY1 = -1;
+}
+
+// The picture the display shows, in texels of a frame target of the given size: where the effects work. False when the display is not a
+// plain frame region of a match (then the field is copied as before). The same rule as produceField's copy.
+bool GSGpuBackend::Impl::fxPictureRegion(uint32_t targetW, uint32_t targetH, uint32_t &x, uint32_t &y, uint32_t &w, uint32_t &h) const
+{
+    if (!hasMarker)
+        return false;
+    const GSPresent::Plan plan = GSPresent::MakePlan(lastMarker);
+    if (plan.kind != GSPresent::Plan::Kind::DisplayFrame || plan.width == 0u || plan.height == 0u)
+        return false;
+    const bool wideRegion = wide() && plan.originX == 0u && plan.width == 640u;
+    w = (plan.width + (wideRegion ? padLeft + padRight : 0u)) * scaleX;
+    h = plan.height * scaleY;
+    x = (wideRegion ? 0u : plan.originX + padLeft) * scaleX;
+    y = plan.originY * scaleY;
+    return w <= fieldTexW && h <= fieldTexH && x + w <= targetW && y + h <= targetH;
+}
+
+// The scene of a target is complete (the first overlay primitive of a field is about to be drawn): records the chain run on the frame target
+// here in the draw list, into the target's processed picture (made on first use), and prepares the overlay primitives that follow to be drawn
+// into that picture too. The Draw is a marker in the list, so the chain runs between the draws on either side of it.
+void GSGpuBackend::Impl::fxBoundary(uint32_t frameIndex)
+{
+    FrameTarget &t = frames[frameIndex];
+    ps2x_postfx::Job job;
+    if (!fxPictureRegion(t.w, t.h, job.x, job.y, job.w, job.h))
+        return;
+    if (!t.proc)
+    {
+        SDL_GPUTextureCreateInfo ci = {};
+        ci.type = SDL_GPU_TEXTURETYPE_2D;
+        ci.format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
+        ci.usage = SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER;
+        ci.width = t.w;
+        ci.height = t.h;
+        ci.layer_count_or_depth = 1;
+        ci.num_levels = 1;
+        ci.sample_count = SDL_GPU_SAMPLECOUNT_1;
+        t.proc = SDL_CreateGPUTexture(dev, &ci);
+        ci.format = SDL_GPU_TEXTUREFORMAT_D32_FLOAT;
+        ci.usage = SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET;
+        t.procDepth = SDL_CreateGPUTexture(dev, &ci);
+        if (!t.proc || !t.procDepth)
+        {
+            std::fprintf(stderr, "[fx] cannot create the %ux%u processed picture of a frame target: %s\n", t.w, t.h, SDL_GetError());
+            if (t.proc)
+                SDL_ReleaseGPUTexture(dev, t.proc);
+            if (t.procDepth)
+                SDL_ReleaseGPUTexture(dev, t.procDepth);
+            t.proc = t.procDepth = nullptr;
+            return;
+        }
+        frameTargetBytes += static_cast<uint64_t>(t.w) * t.h * 8u;
+    }
+    job.field = t.color;
+    job.output = t.proc;
+    job.aspect = static_cast<float>(640u + padLeft + padRight) / 480.0f;
+    job.scale = static_cast<float>(scaleX);
+    job.params = fxParams;
+    Draw d;
+    d.frame = frameIndex;
+    d.pipeline = kBoundaryKey;
+    d.fxJob = static_cast<int32_t>(fxJobs.size());
+    fxJobs.push_back(job);
+    draws.push_back(d);
+    t.procValid = true;
+    t.replayPending = true;
+    t.procX = job.x;
+    t.procY = job.y;
+    t.procW = job.w;
+    t.procH = job.h;
+    ++fxStats.snapshots;
+}
+
+// Every primitive that may be drawn, before it is: tells the scene from the overlay (the Z rule) and follows each target's field.
+void GSGpuBackend::Impl::fxNote(const GSPrimitiveBatch &batch, const Setup &setup)
+{
+    const GSContext &c = batch.state.context;
+    const uint32_t fbw = std::max<uint32_t>(c.frame.fbw, 1u);
+    FrameTarget *t = nullptr;
+    for (FrameTarget &f : frames)
+        if (f.fbp == c.frame.fbp && f.fbw == fbw && f.psm == c.frame.psm)
+        {
+            t = &f;
+            break;
+        }
+    if (!t || setup.count == 0)
+        return; // a target that does not exist yet is made by this field's first drawn primitive; its counters start at zero
+    if (t->shown)
+        fxResetTarget(*t); // the field in this target was shown; this primitive begins another (a field that is shown again, because the game did not finish a
+                           // new one, keeps its snapshot and its counters, so it comes out processed again and does not flicker)
+    const float lastZ = setup.v[setup.count - 1].z;
+    float anyZ = lastZ;
+    for (uint32_t i = 0; i + 1 < setup.count; ++i)
+        anyZ = std::max(anyZ, setup.v[i].z);
+    const uint32_t rawLast = static_cast<uint32_t>(lastZ * 16777216.0f + 0.5f);
+    const uint32_t rawAny = static_cast<uint32_t>(anyZ * 16777216.0f + 0.5f);
+    const bool overlay = lastZ >= kOverlayZ;
+    if ((anyZ >= kOverlayZ) != overlay)
+        ++fxStats.zDisagree;
+    if (overlay)
+    {
+        ++t->overlayPrims;
+        t->overlayZMin = std::min(t->overlayZMin, rawLast);
+        t->overlayX0 = std::min(t->overlayX0, setup.minX);
+        t->overlayX1 = std::max(t->overlayX1, setup.maxX);
+        t->overlayY0 = std::min(t->overlayY0, setup.minY);
+        t->overlayY1 = std::max(t->overlayY1, setup.maxY);
+        fxStats.overlayZMin = std::min(fxStats.overlayZMin, rawLast);
+        t->overlaySeen = true;
+        if (!t->procValid && !t->overlaySeenBefore() && t->sceneTris >= kSceneTriangles)
+            fxBoundary(static_cast<uint32_t>(t - frames.data())); // the scene is complete: process it before the first overlay primitive draws
+        fxCurOverlay = t->procValid;
+        {
+            // What the overlay is made of, by the state that decides how a primitive is drawn (printed at exit)
+            const GSContext &oc = batch.state.context;
+            const uint64_t key = (batch.state.prim.abe ? 1ull : 0ull) | (batch.state.prim.tme ? 2ull : 0ull) | (((oc.test >> 16) & 1ull) << 2) |
+                                 (((oc.test >> 17) & 3ull) << 3) | (oc.zbuf.zmask ? 32ull : 0ull) | ((oc.test & 1ull) << 6) | (((oc.test >> 1) & 7ull) << 7) |
+                                 (oc.frame.fbmsk != 0u ? 1024ull : 0ull) | ((oc.alpha & 0xFFull) << 16) | (((oc.alpha >> 32) & 0xFFull) << 24) |
+                                 (static_cast<uint64_t>(batch.state.prim.type) << 32);
+            ++fxOverlayModes[key];
+        }
+        return;
+    }
+    // The clear that starts a field is a full-screen flat sprite at Z 0 (idx 0 of every match field in the primitive dumps, docs/hd-lighting.md).
+    if (batch.state.prim.type == GS_PRIM_SPRITE && !batch.state.prim.tme && rawLast == 0 && setup.minX <= 1 && setup.maxX >= 638)
+    {
+        fxResetTarget(*t);
+        return;
+    }
+    if (t->procValid)
+    {
+        t->procValid = false; // something scene-like after the end of the scene: the processed picture is not this field's scene any more
+        ++fxStats.staleSnapshots;
+    }
+    ++t->scenePrims;
+    if (batch.state.prim.type == GS_PRIM_TRIANGLE)
+        ++t->sceneTris;
+    t->sceneZMax = std::max(t->sceneZMax, rawLast);
+    t->sceneAnyZMax = std::max(t->sceneAnyZMax, rawAny);
+    fxStats.sceneZMax = std::max(fxStats.sceneZMax, rawLast);
+    fxStats.sceneAnyZMax = std::max(fxStats.sceneAnyZMax, rawAny);
+}
+
+void GSGpuBackend::Impl::fxTraceRow(const FrameTarget &t, int mode)
+{
+    std::fprintf(fxTrace, "%llu,%u,%d,%u,%u,%u,%u,%u,%u,%d,%d\n", static_cast<unsigned long long>(markerSeq), t.fbp, mode, t.scenePrims, t.sceneTris, t.overlayPrims,
+                 t.sceneZMax, t.sceneAnyZMax, t.overlayPrims ? t.overlayZMin : 0u, t.procValid ? 1 : 0, t.overlaySeen ? 1 : 0);
+    if (markerSeq % 60u == 0u)
+        std::fflush(fxTrace);
+}
+
+void GSGpuBackend::Impl::fxShutdown()
+{
+    if (!fxTimes.empty())
+    {
+        std::vector<double> sorted = fxTimes;
+        std::sort(sorted.begin(), sorted.end());
+        double sum = 0.0;
+        for (double v : sorted)
+            sum += v;
+        std::vector<double> empty = fxEmptyTimes;
+        std::sort(empty.begin(), empty.end());
+        std::fprintf(stderr, "[fx:time] an empty submit and wait: min %.0f us, median %.0f us\n", empty.empty() ? 0.0 : empty.front(), empty.empty() ? 0.0 : empty[empty.size() / 2]);
+        std::fprintf(stderr, "[fx:time] chain on an idle GPU, %zu fields at %ux%u texels: min %.0f us, median %.0f us, mean %.0f us, max %.0f us (one submit and wait included)\n",
+                     sorted.size(), fx ? fx->stats().pictureW : 0u, fx ? fx->stats().pictureH : 0u, sorted.front(), sorted[sorted.size() / 2],
+                     sum / static_cast<double>(sorted.size()), sorted.back());
+    }
+    if (fxOn || fxStats.fieldsSnapshot + fxStats.fieldsDirect + fxStats.fieldsPlain != 0)
+        std::fprintf(stderr, "[fx:stats] at exit: fields %llu with snapshot, %llu direct, %llu plain, %llu no usable snapshot; snapshots %llu (%llu stale); scene Z max %u (any vertex %u), overlay Z min %u, Z disagreements %llu\n",
+                     static_cast<unsigned long long>(fxStats.fieldsSnapshot), static_cast<unsigned long long>(fxStats.fieldsDirect),
+                     static_cast<unsigned long long>(fxStats.fieldsPlain), static_cast<unsigned long long>(fxStats.fieldsNoSnapshot),
+                     static_cast<unsigned long long>(fxStats.snapshots), static_cast<unsigned long long>(fxStats.staleSnapshots), fxStats.sceneZMax,
+                     fxStats.sceneAnyZMax, fxStats.overlayZMin, static_cast<unsigned long long>(fxStats.zDisagree));
+    for (const auto &entry : fxOverlayModes)
+    {
+        const uint64_t k = entry.first;
+        std::fprintf(stderr, "[fx:overlay] %llu primitives: type %llu, abe %llu, tme %llu, alpha reg A=%llu B=%llu C=%llu D=%llu FIX=%llu, ZTE %llu ZTST %llu zmask %llu, ATE %llu ATST %llu, fbmsk %llu\n",
+                     static_cast<unsigned long long>(entry.second), static_cast<unsigned long long>(k >> 32), static_cast<unsigned long long>(k & 1ull),
+                     static_cast<unsigned long long>((k >> 1) & 1ull), static_cast<unsigned long long>(((k >> 16) & 3ull)), static_cast<unsigned long long>(((k >> 18) & 3ull)),
+                     static_cast<unsigned long long>(((k >> 20) & 3ull)), static_cast<unsigned long long>(((k >> 22) & 3ull)), static_cast<unsigned long long>((k >> 24) & 0xFFull),
+                     static_cast<unsigned long long>((k >> 2) & 1ull), static_cast<unsigned long long>((k >> 3) & 3ull), static_cast<unsigned long long>((k >> 5) & 1ull),
+                     static_cast<unsigned long long>((k >> 6) & 1ull), static_cast<unsigned long long>((k >> 7) & 7ull), static_cast<unsigned long long>((k >> 10) & 1ull));
+    }
+    if (fxTrace)
+        std::fclose(fxTrace);
+    fxTrace = nullptr;
+    fx.reset();
+}
+
+// ------------------------------------------------------------------------------------------------
 // the widescreen investigation log (PS2X_GS_W1_LOG)
 
 // Called for every drawable primitive with its Setup (screen-space box, before any widening): counts where it lies against the
@@ -3974,6 +4469,7 @@ GSGpuBackend::MarkResult GSGpuBackend::MarkPresentation(const GSPresentationRequ
     const uint64_t markStart = nowNanos();
     s.lastMarker = request;
     s.hasMarker = true;
+    s.fxRefresh();
     if (s.fields)
         result = s.produceField(request);
     else

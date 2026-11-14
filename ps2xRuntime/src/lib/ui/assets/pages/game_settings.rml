@@ -53,6 +53,17 @@
                  data-help="Sharp keeps pixels crisp, Linear smooths them.">
                 <span class="label">Picture Filter</span><span class="tag"></span><span class="value">[Sharp]</span>
             </div>
+            <!-- Task fx1 (src/lib/gpu/gpu_postfx.h): screen effects in matches, off by default, applied at once. Every value of the look can be
+                 tuned in the debug panel (F1, Effects tab); these two rows are the on/off switch and the preset. -->
+            <div class="row" data-kind="toggle" data-key="fx" data-name="Screen Effects" data-value="off"
+                 data-help="Soft glow, colour grading, a miniature-style blur and a vignette on the match picture. Menus and the clock are left alone. Applies at once.">
+                <span class="label">Screen Effects</span><span class="tag"></span><span class="value">[OFF]</span>
+            </div>
+            <div class="row" data-kind="choice" data-key="fx_preset" data-name="Effects Look" data-choices="subtle|strong|off"
+                 data-labels="Subtle|Strong|Off" data-value="subtle"
+                 data-help="How strong the screen effects are when they are on. Applies at once.">
+                <span class="label">Effects Look</span><span class="tag"></span><span class="value">[Subtle]</span>
+            </div>
             <div class="row" data-kind="toggle" data-key="texture_tools" data-name="Texture Tools" data-value="off" data-restart="1"
                  data-help="For modders: dump textures and see edits at once. Needs a restart.">
                 <span class="label">Texture Tools</span><span class="tag"></span><span class="value">[OFF]</span>

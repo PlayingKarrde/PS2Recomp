@@ -459,8 +459,10 @@ if(NOT PS2X_IS_VITA)
     # M3: the main-thread presenter of the direct picture path (its compiled shaders) and the code that chooses and
     # wires up the GPU renderer for the game (it asks the host presenter for its device).
     target_sources(ps2_runtime PRIVATE src/lib/gs/gs_gpu_present.cpp src/lib/gs/gs_gpu_host.cpp)
+    # The screen effects (task fx1): the chain of passes on SDL_GPU and the settings that drive it. Same two include directories, for the same reason.
+    target_sources(ps2_runtime PRIVATE src/lib/gpu/gpu_postfx.cpp)
     set_source_files_properties(src/lib/ps2_host_gpu.cpp src/lib/gs/gs_gpu_backend.cpp src/lib/gs/gs_gpu_present.cpp
-        src/lib/gs/gs_gpu_host.cpp PROPERTIES
+        src/lib/gs/gs_gpu_host.cpp src/lib/gpu/gpu_postfx.cpp PROPERTIES
         INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/src/lib;${CMAKE_CURRENT_SOURCE_DIR}")
 endif()
 

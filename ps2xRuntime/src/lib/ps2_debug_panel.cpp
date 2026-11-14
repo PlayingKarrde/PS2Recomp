@@ -1,6 +1,8 @@
 #include "ps2_debug_panel.h"
 #include "ps2_runtime.h"
 #include "ps2_runtime_macros.h"
+#include "gpu/gpu_postfx.h"
+#include "ps2_settings.h"
 #include "ps2_log.h"
 #include "runtime/ee_scheduler.h"
 #include "runtime/gs/gs_gpu_host.h"
@@ -2206,6 +2208,90 @@ namespace
         }
     }
 
+    // Screen effects (task fx1, src/lib/gpu/gpu_postfx.h, docs/hd-lighting.md): the live look. Every slider takes effect on the next field.
+    // The sliders change the live values only; "Save" writes the ones that differ from the preset into the fx_<name> settings.
+    void drawEffectsTab()
+    {
+        using namespace ps2x_postfx;
+        Params live = current();
+        Params edited = live;
+        bool changed = false;
+
+        bool on = edited.enabled;
+        if (ImGui::Checkbox("Screen effects on", &on))
+        {
+            edited.enabled = on;
+            changed = true;
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("(setting fx = %s, preset %s)", ps2x_settings::get("fx").c_str(), ps2x_settings::get("fx_preset").c_str());
+
+        ImGui::TextUnformatted("Preset:");
+        for (Preset preset : {Preset::Off, Preset::Subtle, Preset::Strong})
+        {
+            ImGui::SameLine();
+            if (ImGui::SmallButton(presetName(preset)))
+            {
+                edited = presetParams(preset);
+                changed = true;
+            }
+        }
+
+        Status &status = ps2x_postfx::status();
+        if (status.unavailable.load())
+            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f), "Not available: the effects need the progressive GPU renderer (the default) and its direct picture path.");
+        else
+        {
+            static const char *kModes[] = {"copied as it is (not a match field, or the overlay could not be kept apart)",
+                                           "on, with the scene kept apart from the overlay (clock, pause panel, popups)",
+                                           "on, the whole field is scene (no overlay in it)"};
+            const int mode = std::clamp(status.lastMode.load(), 0, 2);
+            ImGui::Text("Last field: %s", kModes[mode]);
+            ImGui::TextDisabled("%llu fields with effects, %llu copied as they are",
+                                static_cast<unsigned long long>(status.fieldsWithEffects.load()), static_cast<unsigned long long>(status.fieldsPlain.load()));
+        }
+        ImGui::Separator();
+
+        const char *group = "";
+        for (const Value &value : values())
+        {
+            // A heading where the name's first word changes (bloom, tilt, vignette; the grading values have no common word).
+            const std::string name = value.name;
+            const std::string head = name.substr(0, name.find('_'));
+            const char *shown = head == "bloom" ? "Bloom" : head == "tilt" ? "Tilt-shift" : head == "vignette" ? "Vignette" : "Colour grading";
+            if (std::strcmp(shown, group) != 0)
+            {
+                group = shown;
+                ImGui::SeparatorText(shown);
+            }
+            float v = edited.*(value.member);
+            if (ImGui::SliderFloat(value.label, &v, value.min, value.max, "%.3f"))
+            {
+                edited.*(value.member) = v;
+                changed = true;
+            }
+        }
+        if (changed)
+            setLive(edited);
+
+        ImGui::Separator();
+        static std::string saved;
+        if (ImGui::Button("Save to settings"))
+        {
+            const int n = saveToSettings(edited);
+            saved = "wrote " + std::to_string(n) + " fx_ value(s) that differ from the preset into " + ps2x_settings::path();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Reset to settings"))
+        {
+            setLive(fromSettings());
+            saved.clear();
+        }
+        if (!saved.empty())
+            ImGui::TextColored(ImVec4(0.7f, 1.0f, 0.7f, 1.0f), "%s", saved.c_str());
+        ImGui::TextDisabled("Environment: PS2X_FX=0|1, PS2X_FX_PRESET, PS2X_FX_<NAME> (for example PS2X_FX_BLOOM_INTENSITY=0.4) fix a value over the settings.");
+    }
+
 #endif
 }
 void PS2DebugPanel::initialize()
@@ -2387,6 +2473,16 @@ void PS2DebugPanel::draw(PS2Runtime &runtime)
             if (ImGui::BeginTabItem("GS"))
             {
                 drawGsTab(runtime);
+                ImGui::EndTabItem();
+            }
+            // PS2X_DEBUG_PANEL_TAB=Effects opens the panel on that tab once (for a test or a screenshot; the tab is otherwise chosen with the mouse).
+            static const char *const wantedTab = std::getenv("PS2X_DEBUG_PANEL_TAB");
+            static bool wantedTabShown = false;
+            const ImGuiTabItemFlags effectsFlags = (wantedTab && !wantedTabShown && std::strcmp(wantedTab, "Effects") == 0) ? ImGuiTabItemFlags_SetSelected : 0;
+            if (ImGui::BeginTabItem("Effects", nullptr, effectsFlags))
+            {
+                wantedTabShown = true;
+                drawEffectsTab();
                 ImGui::EndTabItem();
             }
             if (ImGui::BeginTabItem("DMA/IO"))

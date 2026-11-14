@@ -43,6 +43,7 @@ add_library(ps2_test_lib STATIC
     src/gs_tex_pack_tests.cpp
     src/gs_font_tests.cpp
     src/ui_settings_tests.cpp
+    src/postfx_tests.cpp
     src/rom_override_tests.cpp
 )
 
