@@ -64,6 +64,24 @@
                  data-help="How strong the screen effects are when they are on. Applies at once.">
                 <span class="label">Effects Look</span><span class="tag"></span><span class="value">[Subtle]</span>
             </div>
+            <!-- Task fx2: each effect on its own, on by default. Greyed while Screen Effects is off (ui_game_menu.cpp). An effect that is off
+                 does none of its work. -->
+            <div class="row" data-kind="toggle" data-key="fx_bloom" data-name="Glow" data-value="on"
+                 data-help="The soft glow around bright lights. Off skips it entirely. Applies at once.">
+                <span class="label">Glow</span><span class="tag"></span><span class="value">[ON]</span>
+            </div>
+            <div class="row" data-kind="toggle" data-key="fx_grading" data-name="Colour Grading" data-value="on"
+                 data-help="Warmer, richer colour and softly rolled-off highlights. Off skips it entirely. Applies at once.">
+                <span class="label">Colour Grading</span><span class="tag"></span><span class="value">[ON]</span>
+            </div>
+            <div class="row" data-kind="toggle" data-key="fx_tiltshift" data-name="Miniature Blur" data-value="on"
+                 data-help="The blur above and below the middle of the ring that makes it look like a model. Off skips it entirely. Applies at once.">
+                <span class="label">Miniature Blur</span><span class="tag"></span><span class="value">[ON]</span>
+            </div>
+            <div class="row" data-kind="toggle" data-key="fx_vignette" data-name="Vignette" data-value="on"
+                 data-help="Darker corners. Off skips it entirely. Applies at once.">
+                <span class="label">Vignette</span><span class="tag"></span><span class="value">[ON]</span>
+            </div>
             <div class="row" data-kind="toggle" data-key="texture_tools" data-name="Texture Tools" data-value="off" data-restart="1"
                  data-help="For modders: dump textures and see edits at once. Needs a restart.">
                 <span class="label">Texture Tools</span><span class="tag"></span><span class="value">[OFF]</span>

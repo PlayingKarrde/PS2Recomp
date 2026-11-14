@@ -36,6 +36,11 @@ namespace ps2x_settings
             // (empty: the preset's own value). The names are the table in gpu_postfx.cpp; a unit test keeps the two in step.
             {"fx", "PS2X_FX", "off"},
             {"fx_preset", "PS2X_FX_PRESET", "subtle"},
+            // Which effects are on, each on by default; a preset never sets them. An effect that is off does none of its work (fx2).
+            {"fx_bloom", "PS2X_FX_BLOOM", "on"},
+            {"fx_grading", "PS2X_FX_GRADING", "on"},
+            {"fx_tiltshift", "PS2X_FX_TILTSHIFT", "on"},
+            {"fx_vignette", "PS2X_FX_VIGNETTE", "on"},
             {"fx_bloom_threshold", "PS2X_FX_BLOOM_THRESHOLD", ""},
             {"fx_bloom_knee", "PS2X_FX_BLOOM_KNEE", ""},
             {"fx_bloom_intensity", "PS2X_FX_BLOOM_INTENSITY", ""},
@@ -46,6 +51,7 @@ namespace ps2x_settings
             {"fx_lift", "PS2X_FX_LIFT", ""},
             {"fx_gamma", "PS2X_FX_GAMMA", ""},
             {"fx_gain", "PS2X_FX_GAIN", ""},
+            {"fx_highlight_start", "PS2X_FX_HIGHLIGHT_START", ""},
             {"fx_tilt_centre", "PS2X_FX_TILT_CENTRE", ""},
             {"fx_tilt_width", "PS2X_FX_TILT_WIDTH", ""},
             {"fx_tilt_falloff", "PS2X_FX_TILT_FALLOFF", ""},
@@ -55,10 +61,15 @@ namespace ps2x_settings
             {"fx_vignette_softness", "PS2X_FX_VIGNETTE_SOFTNESS", ""},
         };
 
-        // The settings of the screen effects that hold a number (every fx_ key but the preset). Empty means "the preset's value".
+        // The four switches of the single effects (on or off, on by default).
+        bool isFxToggleKey(const std::string &key)
+        {
+            return key == "fx_bloom" || key == "fx_grading" || key == "fx_tiltshift" || key == "fx_vignette";
+        }
+        // The settings of the screen effects that hold a number (every fx_ key but the preset and the switches). Empty means "the preset's value".
         bool isFxNumberKey(const std::string &key)
         {
-            return key.size() > 3 && key.compare(0, 3, "fx_") == 0 && key != "fx_preset";
+            return key.size() > 3 && key.compare(0, 3, "fx_") == 0 && key != "fx_preset" && !isFxToggleKey(key);
         }
         // A finite number, written back in its shortest form; the empty text for "unset". nullopt for anything else.
         std::optional<std::string> fxNumber(const std::string &text)
@@ -131,7 +142,7 @@ namespace ps2x_settings
                 return fxPresetValue(value) ? std::optional<std::string>(value) : std::nullopt;
             if (isFxNumberKey(key))
                 return fxNumber(value);
-            if (key == "fullscreen" || key == "vsync" || key == "texture_tools" || key == "skip_intros" || key == "fx")
+            if (key == "fullscreen" || key == "vsync" || key == "texture_tools" || key == "skip_intros" || key == "fx" || isFxToggleKey(key))
             {
                 if (value == "on" || value == "1" || value == "true" || value == "yes")
                     return std::string("on");
@@ -271,6 +282,14 @@ namespace ps2x_settings
                 return std::string("off");
             return std::nullopt;
         }
+        if (isFxToggleKey(key)) // on by default: a blank value is the default
+        {
+            if (text == "1" || text == "on" || text == "true" || text == "yes" || text.empty())
+                return std::string("on");
+            if (text == "0" || text == "off" || text == "false" || text == "no")
+                return std::string("off");
+            return std::nullopt;
+        }
         if (key == "fx_preset")
             return fxPresetValue(text) ? std::optional<std::string>(text) : std::nullopt;
         if (isFxNumberKey(key))
@@ -320,6 +339,8 @@ namespace ps2x_settings
             return std::nullopt;
         if (key == "fullscreen" || key == "texture_tools" || key == "skip_intros" || key == "fx")
             return std::string("1");
+        if (isFxToggleKey(key))
+            return std::string("0"); // on is the default and was filtered out above
         if (key == "vsync")
             return std::string("vsync");
         if (key == "filter")
@@ -364,7 +385,7 @@ namespace ps2x_settings
                           "# fx = on | off                 screen effects in matches (bloom, colour grading, tilt-shift, vignette; docs/hd-lighting.md)\n"
                           "# fx_preset = off | subtle | strong   fx_<name> = a number: one value of the effects instead of the preset's (blank: the preset's)\n"
                           "# An environment variable (PS2X_GS_BACKEND, PS2X_GS_SCALE, PS2X_GS_WIDE, PS2X_FULLSCREEN, PS2X_GPU_PRESENT_MODE,\n"
-                          "# PS2X_SCALE, PS2X_VOLUME, PS2X_AUTHORING, PS2X_SKIP_INTROS, PS2X_STRIKE_DEPTH, PS2X_FX, PS2X_FX_PRESET, PS2X_FX_<NAME>) set before the game starts wins over this file.\n";
+                          "# PS2X_SCALE, PS2X_VOLUME, PS2X_AUTHORING, PS2X_SKIP_INTROS, PS2X_STRIKE_DEPTH, PS2X_FX, PS2X_FX_PRESET, PS2X_FX_BLOOM|GRADING|TILTSHIFT|VIGNETTE, PS2X_FX_<NAME>) set before the game starts wins over this file.\n";
         for (const Entry &entry : entries)
             if (!entry.value.empty()) // a blank value (an fx_<name> that has no override) is the default: not written
                 out += entry.key + " = " + entry.value + "\n";

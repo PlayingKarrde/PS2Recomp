@@ -4,13 +4,15 @@
 //   the table, presets and the settings glue   first half: Params, values(), presetParams(), fromSettings(), current(), setLive()
 //   the GPU passes                             second half: Chain::Impl (tilt-shift, bloom down and up, the final pass)
 //
-// The passes (a field of w x h texels; every texture is that size unless it says half):
-//   1. tilt-shift, horizontal   the frame target                                      ->  O
-//   2. tilt-shift, vertical     O                                                      ->  T       (skipped without tilt-shift)
-//   3. bloom, bright + down     T                                                      ->  D1 (half)
-//   4. bloom, down              D1 -> D2 -> D3 -> D4 -> D5 (each half the one before)
-//   5. bloom, up                (D5, D4) -> U4, (U4, D3) -> U3, (U3, D2) -> U2, (U2, D1) -> U1     (skipped without bloom)
-//   6. final                    T, U1, frame target (alpha only)  ->  the output texture: grade, bloom added, vignette.
+// The passes (a field of w x h texels; every texture is that size unless it says half; 8 = 8-bit display encoding, F = half-float
+// linear light, task fx2):
+//   1. tilt-shift, horizontal   the frame target (8)                                   ->  O (8)   taps mixed in linear light, result encoded again
+//   2. tilt-shift, vertical     O                                                      ->  T (8)   (skipped without tilt-shift)
+//   3. bloom, bright + down     T (8, made linear by the pass)                         ->  D1 (half, F)
+//   4. bloom, down              D1 -> D2 -> D3 -> D4 -> D5 (each half the one before, F)
+//   5. bloom, up                (D5, D4) -> U4, (U4, D3) -> U3, (U3, D2) -> U2, (U2, D1) -> U1     (F; skipped without bloom)
+//   6. final                    T (8), U1, frame target (alpha only)  ->  the output texture (8): linear light, glow added, grade, the
+//                               highlight shoulder, back to the display encoding, vignette.
 // The input of the first pass (and of the bright pass, without tilt-shift) is the frame target itself, at the moment its scene is
 // complete. Nothing here writes into the game's frame targets: they are only read.
 
@@ -55,6 +57,7 @@ namespace ps2x_postfx
             {"lift", "Lift (blacks)", -0.2f, 0.2f, 0.005f, &Params::lift},
             {"gamma", "Gamma (mids)", 0.5f, 2.0f, 0.01f, &Params::gamma},
             {"gain", "Gain (whites)", 0.5f, 1.5f, 0.01f, &Params::gain},
+            {"highlight_start", "Highlight roll-off start (1 = none)", 0.3f, 1.0f, 0.01f, &Params::highlightStart},
             {"tilt_centre", "Tilt-shift focus centre", 0.0f, 1.0f, 0.01f, &Params::tiltCentre},
             {"tilt_width", "Tilt-shift focus width", 0.0f, 1.0f, 0.01f, &Params::tiltWidth},
             {"tilt_falloff", "Tilt-shift fall-off", 0.02f, 1.0f, 0.01f, &Params::tiltFalloff},
@@ -98,17 +101,21 @@ namespace ps2x_postfx
         case Preset::Off:
             break;
         case Preset::Subtle:
-            // Halfway between the first Subtle (task fx1: bloom 0.22, contrast 1.05, saturation 1.08, blur 1.0, vignette 0.20) and Strong.
+            // Task fx2: the numbers of the linear-light chain that come closest to the look of the fx1b Subtle (bloom 0.36, contrast 1.085,
+            // saturation 1.14, temperature 0.225 on display values; fitted on the recorded ring, introductions and time-over fields against
+            // the old picture with its highlights rolled off instead of cut: docs/hd-lighting.md, "Highlights"). Only what is nearly white
+            // glows (threshold 0.78). The tilt-shift and vignette are as they were.
             p.enabled = true;
-            p.bloomThreshold = 0.675f;
+            p.bloomThreshold = 0.78f;
             p.bloomKnee = 0.5f;
-            p.bloomIntensity = 0.36f;
-            p.exposure = 0.025f;
-            p.contrast = 1.085f;
-            p.saturation = 1.14f;
-            p.temperature = 0.225f;
-            p.gamma = 0.975f;
-            p.gain = 1.01f;
+            p.bloomIntensity = 0.40f;
+            p.exposure = 0.05f;
+            p.contrast = 1.25f;
+            p.saturation = 1.06f;
+            p.temperature = 0.23f;
+            p.gamma = 1.04f;
+            p.gain = 1.0f;
+            p.highlightStart = 0.75f;
             p.tiltCentre = 0.55f;
             p.tiltWidth = 0.40f;
             p.tiltFalloff = 0.30f;
@@ -118,16 +125,20 @@ namespace ps2x_postfx
             p.vignetteSoftness = 0.65f;
             break;
         case Preset::Strong:
+            // Task fx2: the same glow around the lights, warmth, vignette and tilt-shift as before, in linear light with the highlights rolled
+            // off. The fx1b numbers (bloom 0.50 added to display values from a threshold of 0.60, exposure 0.05, contrast 1.12, saturation
+            // 1.20, temperature 0.30, gamma 0.95, gain 1.02) cut 38.6% of the ring picture at 255 in some channel and 8.1% in all three.
             p.enabled = true;
-            p.bloomThreshold = 0.60f;
+            p.bloomThreshold = 0.80f;
             p.bloomKnee = 0.5f;
-            p.bloomIntensity = 0.50f;
-            p.exposure = 0.05f;
-            p.contrast = 1.12f;
-            p.saturation = 1.20f;
-            p.temperature = 0.30f;
-            p.gamma = 0.95f;
-            p.gain = 1.02f;
+            p.bloomIntensity = 0.70f;
+            p.exposure = 0.15f;
+            p.contrast = 1.28f;
+            p.saturation = 1.25f;
+            p.temperature = 0.26f;
+            p.gamma = 1.12f;
+            p.gain = 1.0f;
+            p.highlightStart = 0.70f;
             p.tiltCentre = 0.55f;
             p.tiltWidth = 0.35f;
             p.tiltFalloff = 0.30f;
@@ -165,6 +176,12 @@ namespace ps2x_postfx
             return text == "1" || text == "on" || text == "true" || text == "yes";
         }
 
+        // An effect's switch is on unless it says otherwise (blank is the default, on).
+        bool switchOn(const std::string &text)
+        {
+            return !(text == "0" || text == "off" || text == "false" || text == "no");
+        }
+
         float clampTo(float v, float lo, float hi)
         {
             return std::min(std::max(v, lo), hi);
@@ -188,6 +205,10 @@ namespace ps2x_postfx
                 p.*(value.member) = clampTo(parsed, value.min, value.max);
         }
         p.enabled = wanted;
+        p.bloomOn = switchOn(settingText("fx_bloom", "PS2X_FX_BLOOM"));
+        p.gradingOn = switchOn(settingText("fx_grading", "PS2X_FX_GRADING"));
+        p.tiltOn = switchOn(settingText("fx_tiltshift", "PS2X_FX_TILTSHIFT"));
+        p.vignetteOn = switchOn(settingText("fx_vignette", "PS2X_FX_VIGNETTE"));
         return p;
     }
 
@@ -250,6 +271,11 @@ namespace ps2x_postfx
             if (ps2x_settings::set(std::string("fx_") + value.name, text) && !same)
                 ++written;
         }
+        // the single effects' switches (written whatever they are: they have no preset to differ from)
+        ps2x_settings::set("fx_bloom", params.bloomOn ? "on" : "off");
+        ps2x_settings::set("fx_grading", params.gradingOn ? "on" : "off");
+        ps2x_settings::set("fx_tiltshift", params.tiltOn ? "on" : "off");
+        ps2x_settings::set("fx_vignette", params.vignetteOn ? "on" : "off");
         ps2x_settings::save();
         return written;
     }
@@ -268,6 +294,15 @@ namespace ps2x_postfx
         enum Slot { kSrc, kAux, kTilt, kBloom, kGradeA, kGradeB, kVig, kMode };
 
         constexpr int kMaxLevels = 5;
+
+        // The display encoding (sRGB) of one channel to linear light: what postfx_common.hlsli does in the shaders.
+        float srgbToLinear(float c)
+        {
+            return c <= 0.04045f ? c / 12.92f : std::pow((c + 0.055f) / 1.055f, 2.4f);
+        }
+
+        // The white that maps to 1.0 on the highlight shoulder, in linear light (a white two stops over the picture's own white).
+        constexpr float kShoulderWhite = 4.0f;
     }
 
     struct Chain::Impl
@@ -466,15 +501,17 @@ namespace ps2x_postfx
         if (!job.field || job.w == 0 || job.h == 0 || !ensureTextures(job.w, job.h))
             return nullptr;
         const float w = static_cast<float>(job.w), h = static_cast<float>(job.h);
-        const bool tilt = p.tiltStrength > 0.001f && p.tiltWidth < 0.999f;
-        const bool bloom = p.bloomIntensity > 0.001f && levels >= 2;
+        // An effect that is off does none of its work: no passes for the tilt-shift and the bloom, and no grading or vignette maths in the
+        // final pass (the shader reads the two switches from Tilt.x and Tilt.y, which that pass does not otherwise use).
+        const bool tilt = p.tiltOn && p.tiltStrength > 0.001f && p.tiltWidth < 0.999f;
+        const bool bloom = p.bloomOn && p.bloomIntensity > 0.001f && levels >= 2;
 
         PassParams base = {};
         base.v[kTilt][0] = p.tiltCentre;
         base.v[kTilt][1] = p.tiltWidth * 0.5f;
         base.v[kTilt][2] = p.tiltFalloff;
         base.v[kTilt][3] = p.tiltStrength * job.scale;
-        base.v[kBloom][0] = p.bloomThreshold;
+        base.v[kBloom][0] = srgbToLinear(p.bloomThreshold); // the setting is a brightness as displayed; the bloom works in linear light
         base.v[kBloom][1] = p.bloomKnee;
         base.v[kBloom][2] = p.bloomIntensity;
         base.v[kBloom][3] = 0.75f;
@@ -489,6 +526,9 @@ namespace ps2x_postfx
         base.v[kVig][1] = p.vignetteRadius;
         base.v[kVig][2] = p.vignetteSoftness;
         base.v[kVig][3] = job.aspect;
+        // The shoulder belongs to the light: it runs when the glow adds light or the grading scales it, not for a vignette or a blur alone.
+        base.v[kMode][2] = (p.gradingOn || bloom) ? p.highlightStart : 1.0f;
+        base.v[kMode][3] = kShoulderWhite;
 
         SDL_GPUTexture *source = job.field;
         SDL_GPUTexture *input = source; // what the later passes read as "the scene"
@@ -541,7 +581,13 @@ namespace ps2x_postfx
         f.v[kSrc][0] = inX; f.v[kSrc][1] = inY; f.v[kSrc][2] = w; f.v[kSrc][3] = h;
         f.v[kAux][0] = static_cast<float>(job.x); f.v[kAux][1] = static_cast<float>(job.y);
         f.v[kMode][1] = glow ? 1.0f : 0.0f;
-        SDL_GPUTextureSamplerBinding bf[3] = {{input, nearest}, {glow ? glow : tiltOut, linear}, {job.field, nearest}};
+        f.v[kTilt][0] = p.gradingOn ? 1.0f : 0.0f;
+        f.v[kTilt][1] = p.vignetteOn ? 1.0f : 0.0f;
+        // Without bloom the glow slot still needs a texture, and it must not be one that this pass uses otherwise (the picture, the field, or
+        // `scratch`, which is the target of the last pass when job.output is null): the first bloom level is free then. With the tilt-shift on
+        // and the bloom off the old placeholder was the picture itself, and one texture bound twice in a pass was left in the wrong layout
+        // under Vulkan's validation (found by the switches).
+        SDL_GPUTextureSamplerBinding bf[3] = {{input, nearest}, {glow ? glow : down[1], linear}, {job.field, nearest}};
         if (job.output)
         {
             // Into the frame target's own coordinates: the picture at (x, y) of a texture the size of the frame target.
@@ -590,9 +636,11 @@ namespace ps2x_postfx
         std::optional<ps2x_gs::DebugPassLock> passLock; // validation only: see gs_gpu_threads.h
         if (!passLockHeld)
             passLock.emplace();
+        const uint64_t passesBefore = m_stats.passes;
         SDL_GPUTexture *result = m_impl->record(commandBuffer, job, m_stats);
         if (result)
         {
+            status().lastPasses.store(static_cast<uint32_t>(m_stats.passes - passesBefore), std::memory_order_relaxed);
             ++m_stats.fields;
             m_stats.pictureW = job.w;
             m_stats.pictureH = job.h;

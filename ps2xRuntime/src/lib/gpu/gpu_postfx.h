@@ -4,6 +4,9 @@
 //
 // What they are: bloom, colour grading, tilt-shift blur and a vignette, applied to the 3D picture of a match and nothing else.
 // They are built in and off by default; the look (a preset and every value) is a setting, tuned live in the debug panel.
+// The light is handled in linear light (task fx2): the picture is converted from the display encoding at the start, the glow is added
+// and the grading done there, a soft shoulder rolls brightness above 1.0 off towards white instead of cutting it, and the result is
+// converted back at the end (postfx_final.frag.hlsl has the whole order).
 //
 // How they are applied (gs_gpu_backend.cpp calls into this file in three places):
 //   1. The game draws a match field as: clear, the 3D scene, then its 2D overlay (the clock, the pause panel, popups, names, fades).
@@ -41,6 +44,13 @@ namespace ps2x_postfx
     struct Params
     {
         bool enabled = false;
+        // The single effects, each on by default (task fx2): the settings fx_bloom, fx_grading, fx_tiltshift and fx_vignette. A preset never
+        // sets them. An effect that is off does none of its work: no bloom passes, no tilt-shift passes, and the final pass leaves out its
+        // grading or its vignette. With all four off the field takes the plain path, as if the master switch were off.
+        bool bloomOn = true;
+        bool gradingOn = true;
+        bool tiltOn = true;
+        bool vignetteOn = true;
         // bloom: what is brighter than the threshold (with a soft knee of that fraction of it) glows
         float bloomThreshold = 0.75f;
         float bloomKnee = 0.5f;
@@ -53,6 +63,9 @@ namespace ps2x_postfx
         float lift = 0.0f;
         float gamma = 1.0f;
         float gain = 1.0f;
+        // highlights: where the soft shoulder starts, as linear light (0.7 is about 85% of white as displayed); 1 or more is no shoulder,
+        // the picture is cut at white as it was in fx1. Below it nothing changes; above it, brightness rolls off towards white (fx2).
+        float highlightStart = 1.0f;
         // tilt-shift: rows near the centre stay sharp; the picture blurs above and below by the screen row only
         float tiltCentre = 0.55f;   // 0..1 down the picture
         float tiltWidth = 0.35f;    // the sharp band, as a fraction of the picture's height
@@ -63,6 +76,12 @@ namespace ps2x_postfx
         float vignetteRadius = 0.6f;   // 1 is the corners
         float vignetteSoftness = 0.6f;
     };
+
+    // True when at least one of the four effects is on (the chain has something to do).
+    inline bool anyEffectOn(const Params &p)
+    {
+        return p.bloomOn || p.gradingOn || p.tiltOn || p.vignetteOn;
+    }
 
     // One row of the table the settings, presets and the debug panel's sliders share.
     struct Value
@@ -105,6 +124,7 @@ namespace ps2x_postfx
         std::atomic<uint64_t> fieldsPlain{0};       // fields copied as before while the effects were on (menus, results, movies)
         std::atomic<int> lastMode{0};               // the last field: 0 plain, 1 effects with the overlay drawn over the processed scene, 2 effects, no overlay in the field
         std::atomic<bool> unavailable{false};       // asked for, but the renderer cannot do it (weave fields, no direct path, chain failed)
+        std::atomic<uint32_t> lastPasses{0};        // render passes the chain recorded for the last field it ran on (0 before the first); tests and the debug panel
     };
     Status &status();
 

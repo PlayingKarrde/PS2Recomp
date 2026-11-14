@@ -442,7 +442,8 @@ namespace
     {
         std::map<std::string, std::string> values{{"renderer", "gpu"},   {"resolution", "1"}, {"aspect", "4:3"}, {"fullscreen", "off"},
                                                   {"vsync", "off"},      {"filter", "sharp"},  {"volume", "100"},  {"texture_tools", "off"},
-                                                  {"skip_intros", "off"}, {"fx", "off"},    {"fx_preset", "subtle"}, {"strike_depth", "original"}};
+                                                  {"skip_intros", "off"}, {"fx", "off"},    {"fx_preset", "subtle"}, {"strike_depth", "original"},
+                                                  {"fx_bloom", "on"}, {"fx_grading", "on"}, {"fx_tiltshift", "on"}, {"fx_vignette", "on"}};
         std::map<std::string, std::string> startup;
         std::map<std::string, std::string> env;
         bool closeAsked = false;

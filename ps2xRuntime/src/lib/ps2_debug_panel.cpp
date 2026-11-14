@@ -2232,7 +2232,12 @@ namespace
             ImGui::SameLine();
             if (ImGui::SmallButton(presetName(preset)))
             {
+                const Params kept = edited; // a preset sets the strengths, never which effects are on
                 edited = presetParams(preset);
+                edited.bloomOn = kept.bloomOn;
+                edited.gradingOn = kept.gradingOn;
+                edited.tiltOn = kept.tiltOn;
+                edited.vignetteOn = kept.vignetteOn;
                 changed = true;
             }
         }
@@ -2247,8 +2252,9 @@ namespace
                                            "on, the whole field is scene (no overlay in it)"};
             const int mode = std::clamp(status.lastMode.load(), 0, 2);
             ImGui::Text("Last field: %s", kModes[mode]);
-            ImGui::TextDisabled("%llu fields with effects, %llu copied as they are",
-                                static_cast<unsigned long long>(status.fieldsWithEffects.load()), static_cast<unsigned long long>(status.fieldsPlain.load()));
+            ImGui::TextDisabled("%llu fields with effects, %llu copied as they are; the last chain recorded %u render passes",
+                                static_cast<unsigned long long>(status.fieldsWithEffects.load()), static_cast<unsigned long long>(status.fieldsPlain.load()),
+                                status.lastPasses.load());
         }
         ImGui::Separator();
 
@@ -2263,6 +2269,20 @@ namespace
             {
                 group = shown;
                 ImGui::SeparatorText(shown);
+                // The effect's own switch (an effect that is off does none of its work; the settings fx_bloom, fx_grading, fx_tiltshift, fx_vignette).
+                bool *flag = head == "bloom" ? &edited.bloomOn : head == "tilt" ? &edited.tiltOn : head == "vignette" ? &edited.vignetteOn : &edited.gradingOn;
+                bool on = *flag;
+                const std::string id = std::string("on##fx_") + head;
+                if (ImGui::Checkbox(id.c_str(), &on))
+                {
+                    *flag = on;
+                    changed = true;
+                }
+                if (!on)
+                {
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("off: none of its passes run");
+                }
             }
             float v = edited.*(value.member);
             if (ImGui::SliderFloat(value.label, &v, value.min, value.max, "%.3f"))

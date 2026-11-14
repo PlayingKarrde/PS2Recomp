@@ -110,6 +110,7 @@ namespace
     }
 
     constexpr double kOverlayZ = 65536.0;
+    constexpr uint8_t kBarRed[8] = {150, 170, 190, 210, 225, 238, 248, 255}; // drawField(extra 4): the red of each bar
 
     // A flat box drawn with a blend: alphaReg is the GS ALPHA register (A, B, C, D), alpha the vertex alpha (0x80 is 1.0).
     void blendedBox(GSRasterBackend &b, float x0, float y0, float x1, float y1, double z, uint8_t r, uint8_t g, uint8_t bl, uint8_t alpha, uint64_t alphaReg)
@@ -184,6 +185,12 @@ namespace
             blendedBox(b, 0, 0, 40, 30, kOverlayZ, 0x40, 0x40, 0x40, 0x80, kBlendAdd);  // an additive box in the corner
         else if (extra == 3)
             blendedBox(b, 0, 0, 100, 60, kOverlayZ, 0x20, 0x20, 0x20, 0x00, kBlendOver); // a box that is fully transparent (its alpha is 0)
+        else if (extra == 4)
+            for (int i = 0; i < 8; ++i) // eight warm bars of rising brightness, the top ones as bright as a lit shoulder or a highlight on the mat
+            {
+                const uint8_t r = kBarRed[i];
+                sprite(b, 120.0f + 20.0f * i, 110.0f, 140.0f + 20.0f * i, 150.0f, 1500.0, r, static_cast<uint8_t>(r * 0.82f), static_cast<uint8_t>(r * 0.60f));
+            }
     }
 
     struct Picture
@@ -249,6 +256,18 @@ namespace
         return sum2 / n - (sum / n) * (sum / n);
     }
 
+    // The red, green and blue of the pixel at the centre of bar i (drawField with extra 4: the bars are 20 wide from x = 120, at GS row 130).
+    const uint8_t *barPixel(const Picture &p, int i)
+    {
+        return p.at(130u + 20u * static_cast<uint32_t>(i), 260);
+    }
+
+    double toLinearLevel(int v)
+    {
+        const double c = v / 255.0;
+        return c <= 0.04045 ? c / 12.92 : std::pow((c + 0.055) / 1.055, 2.4);
+    }
+
     ps2x_postfx::Params neutral()
     {
         ps2x_postfx::Params p;
@@ -268,7 +287,7 @@ void register_postfx_tests()
     tc.Run("the value table, the settings and the environment names agree", [](TestCase &t)
     {
         using namespace ps2x_postfx;
-        t.IsTrue(values().size() == 17, "17 values");
+        t.IsTrue(values().size() == 18, "18 values");
         for (const Value &v : values())
         {
             const std::string key = std::string("fx_") + v.name;
@@ -281,6 +300,17 @@ void register_postfx_tests()
             }
             t.IsTrue(v.min < v.max && v.step > 0.0f, key + ": a sensible range");
         }
+        for (const char *name : {"bloom", "grading", "tiltshift", "vignette"})
+        {
+            const std::string key = std::string("fx_") + name;
+            const ps2x_settings::Definition *def = ps2x_settings::find(key);
+            t.IsTrue(def != nullptr, key + " is a setting (the switch of one effect)");
+            if (def)
+            {
+                t.Equals(std::string(def->envName), envNameOf(name), key + ": the environment variable");
+                t.Equals(std::string(def->defaultValue), std::string("on"), key + ": on by default");
+            }
+        }
         t.IsTrue(ps2x_settings::find("fx") && std::string(ps2x_settings::find("fx")->defaultValue) == "off", "off by default");
         t.IsTrue(ps2x_settings::find("fx_preset") && std::string(ps2x_settings::find("fx_preset")->envName) == "PS2X_FX_PRESET", "the preset");
     });
@@ -292,8 +322,13 @@ void register_postfx_tests()
         t.IsFalse(off.enabled, "Off is not enabled");
         t.IsTrue(subtle.enabled && strong.enabled, "Subtle and Strong are enabled");
         t.IsTrue(off.bloomIntensity == 0.0f && off.tiltStrength == 0.0f && off.vignetteStrength == 0.0f && off.exposure == 0.0f && off.contrast == 1.0f &&
-                     off.saturation == 1.0f && off.temperature == 0.0f && off.lift == 0.0f && off.gamma == 1.0f && off.gain == 1.0f,
+                     off.saturation == 1.0f && off.temperature == 0.0f && off.lift == 0.0f && off.gamma == 1.0f && off.gain == 1.0f &&
+                     off.highlightStart == 1.0f,
                  "Off has neutral numbers");
+        for (const Params &p : {off, subtle, strong})
+            t.IsTrue(p.bloomOn && p.gradingOn && p.tiltOn && p.vignetteOn, "a preset never sets which effects are on: all four stay on");
+        t.IsTrue(subtle.highlightStart < 1.0f && strong.highlightStart < 1.0f && strong.highlightStart <= subtle.highlightStart,
+                 "Subtle and Strong roll their highlights off, Strong from lower down");
         for (const Value &v : values())
         {
             for (const Params &p : {off, subtle, strong})
@@ -319,6 +354,26 @@ void register_postfx_tests()
         Params p = fromSettings();
         t.IsTrue(p.enabled, "PS2X_FX=1 turns it on");
         t.IsTrue(std::fabs(p.bloomIntensity - presetParams(Preset::Subtle).bloomIntensity) < 1e-6f, "with the Subtle values by default");
+        t.IsTrue(p.bloomOn && p.gradingOn && p.tiltOn && p.vignetteOn && anyEffectOn(p), "and all four effects on");
+        setEnvVar("PS2X_FX_BLOOM", "0");
+        p = fromSettings();
+        t.IsTrue(!p.bloomOn && p.gradingOn && p.tiltOn && p.vignetteOn, "PS2X_FX_BLOOM=0 turns the bloom off and nothing else");
+        setEnvVar("PS2X_FX_BLOOM", "1");
+        setEnvVar("PS2X_FX_TILTSHIFT", "off");
+        setEnvVar("PS2X_FX_GRADING", "no");
+        setEnvVar("PS2X_FX_VIGNETTE", "false");
+        p = fromSettings();
+        t.IsTrue(p.bloomOn && !p.gradingOn && !p.tiltOn && !p.vignetteOn && anyEffectOn(p), "the others turn off by their own variables; the bloom is on again with 1");
+        setEnvVar("PS2X_FX_BLOOM", "0");
+        t.IsFalse(anyEffectOn(fromSettings()), "with all four off no effect is on");
+        t.IsTrue(fromSettings().enabled, "while the master switch is still on");
+        setEnvVar("PS2X_FX_BLOOM", nullptr);
+        setEnvVar("PS2X_FX_TILTSHIFT", nullptr);
+        setEnvVar("PS2X_FX_GRADING", nullptr);
+        setEnvVar("PS2X_FX_VIGNETTE", nullptr);
+        setEnvVar("PS2X_FX_BLOOM", "banana");
+        t.IsTrue(fromSettings().bloomOn, "nonsense leaves a switch on");
+        setEnvVar("PS2X_FX_BLOOM", nullptr);
         setEnvVar("PS2X_FX_PRESET", "strong");
         t.IsTrue(std::fabs(fromSettings().bloomIntensity - presetParams(Preset::Strong).bloomIntensity) < 1e-6f, "PS2X_FX_PRESET=strong");
         setEnvVar("PS2X_FX_BLOOM_INTENSITY", "0.9");
@@ -346,6 +401,12 @@ void register_postfx_tests()
         t.Equals(ps2x_settings::valueFromEnvironment("fx_gamma", " 1.250 ").value_or("?"), std::string("1.25"), "a number is written back short");
         t.IsFalse(ps2x_settings::valueFromEnvironment("fx_gamma", "nan").has_value(), "nan is no number");
         t.IsFalse(ps2x_settings::environmentFromValue("fx_gamma", "").has_value(), "a blank override has no environment value");
+        t.Equals(ps2x_settings::valueFromEnvironment("fx_bloom", "0").value_or("?"), std::string("off"), "PS2X_FX_BLOOM=0 means off");
+        t.Equals(ps2x_settings::valueFromEnvironment("fx_vignette", "1").value_or("?"), std::string("on"), "PS2X_FX_VIGNETTE=1 means on");
+        t.IsFalse(ps2x_settings::valueFromEnvironment("fx_grading", "maybe").has_value(), "a switch that is neither on nor off is refused");
+        t.Equals(ps2x_settings::environmentFromValue("fx_tiltshift", "off").value_or("?"), std::string("0"), "a switch that is off is PS2X_FX_TILTSHIFT=0");
+        t.IsFalse(ps2x_settings::environmentFromValue("fx_tiltshift", "on").has_value(), "and one that is on is the default: no variable");
+        t.Equals(ps2x_settings::valueFromEnvironment("fx_bloom_threshold", " 0.5 ").value_or("?"), std::string("0.5"), "the bloom's number is still a number, not a switch");
         t.Equals(ps2x_settings::environmentFromValue("fx", "on").value_or("?"), std::string("1"), "fx on is PS2X_FX=1");
 
         const fs::path dir = fs::temp_directory_path() / "ps2x_postfx_settings_test";
@@ -371,16 +432,19 @@ void register_postfx_tests()
         tuned.bloomIntensity = 0.8f;
         tuned.vignetteStrength = 0.1f;
         tuned.enabled = true;
+        tuned.tiltOn = false; // a switch, saved with the values
         t.Equals(saveToSettings(tuned), 2, "two values differ from the preset and are written");
         const std::string text = readAll(file);
         t.IsTrue(text.find("fx_bloom_intensity = 0.8") != std::string::npos && text.find("fx_vignette_strength = 0.1") != std::string::npos, "they are in the file");
         t.IsTrue(text.find("fx_exposure") == std::string::npos, "the others are not");
         t.IsTrue(text.find("fx = on") != std::string::npos && text.find("fx_preset = strong") != std::string::npos, "with the switch and the preset");
+        t.IsTrue(text.find("fx_tiltshift = off") != std::string::npos && text.find("fx_bloom = on") != std::string::npos, "and the switches of the single effects");
+        t.IsTrue(!fromSettings().tiltOn && fromSettings().bloomOn, "which fromSettings reads back");
         t.IsTrue(std::fabs(fromSettings().bloomIntensity - 0.8f) < 1e-6f && std::fabs(fromSettings().vignetteStrength - 0.1f) < 1e-6f, "and fromSettings sees them");
         ps2x_settings::resetForTest();
         clearFxVariables();
         ps2x_settings::initialize(file);
-        t.IsTrue(std::fabs(fromSettings().bloomIntensity - 0.8f) < 1e-6f && fromSettings().enabled, "a fresh start reads the file back");
+        t.IsTrue(std::fabs(fromSettings().bloomIntensity - 0.8f) < 1e-6f && fromSettings().enabled && !fromSettings().tiltOn, "a fresh start reads the file back");
         ps2x_settings::resetForTest();
         clearFxVariables();
         fs::remove_all(dir, ec);
@@ -484,6 +548,162 @@ void register_postfx_tests()
                     const Picture bare = picture(gpu, false, true, 0, 0);
                     t.IsTrue(ghost.ok && bare.ok && ghostOff.ok && differing(bare, ghost, 0, 0, 640, 448) == 0, "a transparent box leaves no rectangle: the picture equals the one without it");
                     t.IsTrue(ghost.ok && ghostOff.ok && differing(ghostOff, ghost, 0, 0, 640, 448) > 50000, "and the scene is processed everywhere, the box included");
+
+                    // Highlights (fx2). Light that adds up past white used to be cut: warm bars that are already bright come out as one flat
+                    // colour. With the shoulder the bars stay apart and keep their hue; below its start nothing changes.
+                    setLive(off);
+                    const Picture barsOff = picture(gpu, false, true, 0, 4);
+                    Params hot = neutral();
+                    hot.bloomThreshold = 0.5f;
+                    hot.bloomIntensity = 0.4f;
+                    hot.exposure = 0.25f; // more light than the picture can show
+                    setLive(hot);
+                    const Picture barsCut = picture(gpu, false, true, 0, 4);
+                    hot.highlightStart = 0.7f;
+                    setLive(hot);
+                    const Picture barsSoft = picture(gpu, false, true, 0, 4);
+                    Params shoulderOnly = neutral();
+                    shoulderOnly.highlightStart = 0.7f;
+                    setLive(shoulderOnly);
+                    const Picture barsShoulder = picture(gpu, false, true, 0, 4);
+                    t.IsTrue(barsOff.ok && barsCut.ok && barsSoft.ok && barsShoulder.ok, "the pictures of the bars");
+                    if (barsOff.ok && barsCut.ok && barsSoft.ok && barsShoulder.ok)
+                    {
+                        t.IsTrue(barPixel(barsOff, 7)[0] == 255 && barPixel(barsOff, 3)[0] == 210, "the bars are what the game drew");
+                        t.IsTrue(barPixel(barsCut, 5)[0] == 255 && barPixel(barsCut, 6)[0] == 255 && barPixel(barsCut, 7)[0] == 255,
+                                 "cut at white (no shoulder): the three brightest bars are the same flat red");
+                        const double ratioOff = toLinearLevel(barPixel(barsOff, 7)[1]) / toLinearLevel(barPixel(barsOff, 7)[0]);
+                        const double ratioCut = toLinearLevel(barPixel(barsCut, 7)[1]) / toLinearLevel(barPixel(barsCut, 7)[0]);
+                        const double ratioSoft = toLinearLevel(barPixel(barsSoft, 7)[1]) / toLinearLevel(barPixel(barsSoft, 7)[0]);
+                        t.IsTrue(std::fabs(ratioCut - ratioOff) > 0.2 * ratioOff, "and the cut shifts the colour (green catches up with red)");
+                        // The cut turns bars 2 to 7 into one red; the shoulder keeps them apart (it squeezes the brightest together, so some neighbours
+                        // are one level apart, but the order is kept and the whole run is not one value).
+                        auto distinct = [](const Picture &pic)
+                        {
+                            std::vector<int> v;
+                            for (int i = 2; i < 8; ++i)
+                                v.push_back(barPixel(pic, i)[0]);
+                            std::sort(v.begin(), v.end());
+                            return static_cast<int>(std::unique(v.begin(), v.end()) - v.begin());
+                        };
+                        bool ordered = true;
+                        for (int i = 1; i < 8; ++i)
+                            ordered = ordered && barPixel(barsSoft, i)[0] >= barPixel(barsSoft, i - 1)[0];
+                        const bool apart = distinct(barsCut) == 1 && distinct(barsSoft) >= 4 && ordered && barPixel(barsSoft, 7)[0] < 255;
+                        if (!apart)
+                        {
+                            std::cout << "    bars, red of each (off / cut / soft):";
+                            for (int i = 0; i < 8; ++i)
+                                std::cout << " " << int(barPixel(barsOff, i)[0]) << "/" << int(barPixel(barsCut, i)[0]) << "/" << int(barPixel(barsSoft, i)[0]);
+                            std::cout << std::endl;
+                        }
+                        t.IsTrue(apart, "with the shoulder the bars are still told apart, in order, and none is flat white");
+                        t.IsTrue(std::fabs(ratioSoft - ratioOff) < 0.1 * ratioOff, "and the colour keeps its hue (green over red in linear light is what it was)");
+                        bool lowBarsSame = true;
+                        for (int i = 0; i < 4; ++i)
+                            lowBarsSame = lowBarsSame && std::memcmp(barPixel(barsOff, i), barPixel(barsShoulder, i), 3) == 0;
+                        t.IsTrue(lowBarsSame, "below the start of the shoulder nothing changes, byte for byte");
+                        t.IsTrue(barPixel(barsShoulder, 7)[0] < 250 && barPixel(barsShoulder, 7)[0] > 220, "and white itself goes a little down: it is the top of the roll-off");
+                    }
+
+                    // The single effects (fx2): an effect that is off does none of its work. Checked three ways: the render passes the chain
+                    // recorded (the bloom is 2 x levels - 1 of them, the tilt-shift 2, the final pass 1), the picture against the same look with that
+                    // effect's strength at zero, and the picture with all four off against the effects-off picture.
+                    {
+                        Status &status = ps2x_postfx::status();
+                        auto run = [&](const Params &p)
+                        {
+                            setLive(p);
+                            Picture pic = picture(gpu, true);
+                            return std::make_pair(std::move(pic), status.lastPasses.load());
+                        };
+                        const Params all = presetParams(Preset::Strong);
+                        const auto [picAll, passesAll] = run(all);
+                        t.IsTrue(picAll.ok && passesAll >= 6, "Strong with all four on: the chain recorded its passes (" + std::to_string(passesAll) + ")");
+
+                        Params noBloom = all;
+                        noBloom.bloomOn = false;
+                        Params zeroBloom = all;
+                        zeroBloom.bloomIntensity = 0.0f;
+                        const auto [picNoBloom, passesNoBloom] = run(noBloom);
+                        const auto [picZeroBloom, passesZeroBloom] = run(zeroBloom);
+                        t.IsTrue(passesNoBloom < passesAll && passesNoBloom == passesZeroBloom && differing(picNoBloom, picAll, 0, 0, 640, 448) > 1000,
+                                 "bloom off: its down and up passes are not recorded, and the picture has no glow");
+                        t.IsTrue(differing(picNoBloom, picZeroBloom, 0, 0, 640, 448) == 0, "and is the same picture as the look with the bloom's strength at zero");
+
+                        Params noTilt = all;
+                        noTilt.tiltOn = false;
+                        Params zeroTilt = all;
+                        zeroTilt.tiltStrength = 0.0f;
+                        const auto [picNoTilt, passesNoTilt] = run(noTilt);
+                        const auto [picZeroTilt, passesZeroTilt] = run(zeroTilt);
+                        t.IsTrue(passesNoTilt + 2 == passesAll && passesNoTilt == passesZeroTilt, "tilt-shift off: its two passes are not recorded");
+                        t.IsTrue(differing(picNoTilt, picZeroTilt, 0, 0, 640, 448) == 0 && differing(picNoTilt, picAll, 0, 0, 640, 448) > 1000,
+                                 "and the picture is the one with the blur's strength at zero");
+
+                        Params noVig = all;
+                        noVig.vignetteOn = false;
+                        Params zeroVig = all;
+                        zeroVig.vignetteStrength = 0.0f;
+                        const auto [picNoVig, passesNoVig] = run(noVig);
+                        const auto [picZeroVig, passesZeroVig] = run(zeroVig);
+                        (void)passesZeroVig;
+                        t.IsTrue(passesNoVig == passesAll && differing(picNoVig, picZeroVig, 0, 0, 640, 448) == 0 && differing(picNoVig, picAll, 0, 0, 640, 448) > 1000,
+                                 "vignette off: same passes (it is a step of the final pass), the picture of a vignette of strength zero");
+
+                        Params noGrade = all;
+                        noGrade.gradingOn = false;
+                        Params neutralGrade = all; // the bloom is on in both, so the highlight roll-off is too
+                        neutralGrade.exposure = 0.0f;
+                        neutralGrade.contrast = 1.0f;
+                        neutralGrade.saturation = 1.0f;
+                        neutralGrade.temperature = 0.0f;
+                        neutralGrade.lift = 0.0f;
+                        neutralGrade.gamma = 1.0f;
+                        neutralGrade.gain = 1.0f;
+                        const auto [picNoGrade, passesNoGrade] = run(noGrade);
+                        const auto [picNeutralGrade, passesNeutralGrade] = run(neutralGrade);
+                        t.IsTrue(passesNoGrade == passesAll && passesNeutralGrade == passesAll && differing(picNoGrade, picNeutralGrade, 0, 0, 640, 448) == 0 &&
+                                     differing(picNoGrade, picAll, 0, 0, 640, 448) > 1000,
+                                 "grading off: the picture of neutral grading numbers (the glow and its roll-off stay), the same passes");
+
+                        // each effect alone
+                        Params only = all;
+                        only.bloomOn = only.gradingOn = only.tiltOn = only.vignetteOn = false;
+                        Params bloomOnly = only, tiltOnly = only, vigOnly = only, gradeOnly = only;
+                        bloomOnly.bloomOn = true;
+                        tiltOnly.tiltOn = true;
+                        vigOnly.vignetteOn = true;
+                        gradeOnly.gradingOn = true;
+                        const auto [picBloomOnly, passesBloomOnly] = run(bloomOnly);
+                        const auto [picTiltOnly, passesTiltOnly] = run(tiltOnly);
+                        const auto [picVigOnly, passesVigOnly] = run(vigOnly);
+                        const auto [picGradeOnly, passesGradeOnly] = run(gradeOnly);
+                        t.IsTrue(passesBloomOnly + 2 == passesAll && passesTiltOnly == 3 && passesVigOnly == 1 && passesGradeOnly == 1,
+                                 "each effect alone records only its own passes (and the final one): bloom, tilt-shift 2 + 1, vignette 1, grading 1");
+                        setLive(off);
+                        const Picture plain = picture(gpu, true);
+                        t.IsTrue(picVigOnly.ok && plain.ok && std::memcmp(picVigOnly.at(320, 224), plain.at(320, 224), 4) == 0 && picVigOnly.at(4, 4)[2] + 20 < plain.at(4, 4)[2],
+                                 "the vignette alone darkens the corner and leaves the centre byte for byte (no grading, no roll-off)");
+                        t.IsTrue(differing(picVigOnly, plain, 0, 0, 640, 448) > 1000 && differing(picVigOnly, plain, 150, 100, 490, 350) == 0,
+                                 "and leaves the middle of the picture alone");
+                        t.IsTrue(differing(picTiltOnly, plain, 0, 200, 640, 290) == 0 && differing(picTiltOnly, plain, 0, 0, 640, 100) > 1000,
+                                 "the tilt-shift alone blurs far from the focus band and does nothing else (the focus band is byte for byte the plain picture)");
+                        t.IsTrue(differing(picGradeOnly, plain, 0, 0, 640, 448) > 50000 && picGradeOnly.at(4, 4)[2] > picAll.at(4, 4)[2],
+                                 "the grading alone changes the picture and does not darken the corner");
+                        t.IsTrue(differing(picBloomOnly, plain, 0, 0, 640, 448) > 100 && differing(picBloomOnly, plain, 0, 380, 100, 448) == 0,
+                                 "the bloom alone adds only its glow near the bright parts (the far corner is the plain picture)");
+
+                        // all four off with the master switch on: the field takes the plain path, byte for byte the effects-off picture
+                        Params none = all;
+                        none.bloomOn = none.gradingOn = none.tiltOn = none.vignetteOn = false;
+                        t.IsFalse(anyEffectOn(none), "no effect is on");
+                        const uint64_t chainFieldsBefore = status.fieldsWithEffects.load();
+                        setLive(none);
+                        const Picture picNone = picture(gpu, true);
+                        t.IsTrue(picNone.ok && differing(picNone, plain, 0, 0, 640, 448) == 0, "all four off, master on: the picture is the effects-off picture, byte for byte");
+                        t.IsTrue(status.fieldsWithEffects.load() == chainFieldsBefore, "because the chain did not run at all: the field takes the plain path (nothing tracked, nothing drawn twice)");
+                    }
 
                     // a field with no overlay is all scene: the effects reach the whole picture
                     setLive(vig);

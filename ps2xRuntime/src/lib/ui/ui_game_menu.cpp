@@ -53,6 +53,12 @@ namespace ps2x::ui
             return key == "resolution" || key == "aspect";
         }
 
+        // The four switches of the single screen effects (fx2): they matter only while the effects are on.
+        static bool isEffectSwitch(const std::string &key)
+        {
+            return key == "fx_bloom" || key == "fx_grading" || key == "fx_tiltshift" || key == "fx_vignette";
+        }
+
         bool loadPage()
         {
             if (built)
@@ -155,6 +161,16 @@ namespace ps2x::ui
                 {
                     locked = true;
                     reason = "Needs the GPU renderer.";
+                }
+                else if (isEffectSwitch(key) && host->value("fx") != "on")
+                {
+                    locked = true;
+                    reason = "Turn Screen Effects on first.";
+                }
+                else if (isEffectSwitch(key) && host->value("fx_preset") == "off")
+                {
+                    locked = true;
+                    reason = "Effects Look is Off: pick Subtle or Strong first.";
                 }
                 if (!locked && page.attribute(key, "data-restart") == "1" && host->value(key) != host->startupValue(key))
                 {

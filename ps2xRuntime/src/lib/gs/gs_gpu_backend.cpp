@@ -3825,7 +3825,9 @@ void GSGpuBackend::Impl::writeMissLog()
 void GSGpuBackend::Impl::fxRefresh()
 {
     const ps2x_postfx::Params p = ps2x_postfx::current();
-    bool want = p.enabled;
+    // The master switch, and at least one of the four effects (fx2): with all four off nothing is tracked or drawn twice, the field
+    // takes the plain path as if the master switch were off.
+    bool want = p.enabled && ps2x_postfx::anyEffectOn(p);
     if (want && !(progressive() && fields))
     {
         if (!fxLoggedWeave)

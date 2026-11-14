@@ -5,6 +5,9 @@
 // The pass draws a picture-sized texture. It reads Tex from (Src.xy) on and clamps to the picture, so the rows below the field
 // and the margins of the frame target never leak in. 13 taps spread over +-radius, Gaussian weights, linear filtering.
 //
+// Tex and the result are 8-bit pictures in the display encoding. The taps are mixed in LINEAR light (a bright pixel spreads as much
+// light as it has, as in a real lens) and the result is encoded again (fx2).
+//
 // SDL_GPU resource counts, read by build_shaders.py (SDL_CreateGPUShader needs them):
 // @samplers 1
 // @storage_textures 0
@@ -28,7 +31,7 @@ float4 main(PSInput input) : SV_Target0
         return Tex.Load(int3(int2(base), 0));
     const float2 lo = Src.xy + 0.5f;
     const float2 hi = Src.xy + Src.zw - 0.5f;
-    float4 sum = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float3 sum = float3(0.0f, 0.0f, 0.0f);
     float total = 0.0f;
     [unroll]
     for (int i = -6; i <= 6; ++i)
@@ -36,8 +39,8 @@ float4 main(PSInput input) : SV_Target0
         const float f = (float)i / 6.0f;
         const float w = exp(-4.5f * f * f);
         const float2 q = clamp(base + Aux.xy * (f * radius), lo, hi);
-        sum += Tex.SampleLevel(Samp, q / texSize, 0.0f) * w;
+        sum += SrgbToLinear(Tex.SampleLevel(Samp, q / texSize, 0.0f).rgb) * w;
         total += w;
     }
-    return sum / total;
+    return float4(LinearToSrgb(sum / total), 1.0f);
 }
