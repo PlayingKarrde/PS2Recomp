@@ -25,6 +25,7 @@ void register_gs_tex_pack_tests();
 void register_gs_font_tests();
 void register_ui_settings_tests();
 void register_postfx_tests();
+void register_gpu_lighting_tests();
 void register_rom_override_tests();
 #if defined(PS2X_HAS_MODS_TESTS)
 void register_mod_manager_tests();
@@ -71,6 +72,7 @@ int main()
     register_gs_font_tests();
     register_ui_settings_tests();
     register_postfx_tests();
+    register_gpu_lighting_tests();
     register_rom_override_tests();
 #if defined(PS2X_HAS_MODS_TESTS)
     register_mod_manager_tests();

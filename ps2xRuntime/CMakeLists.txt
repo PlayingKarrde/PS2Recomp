@@ -461,6 +461,11 @@ if(NOT PS2X_IS_VITA)
     target_sources(ps2_runtime PRIVATE src/lib/gs/gs_gpu_present.cpp src/lib/gs/gs_gpu_host.cpp)
     # The screen effects (task fx1): the chain of passes on SDL_GPU and the settings that drive it. Same two include directories, for the same reason.
     target_sources(ps2_runtime PRIVATE src/lib/gpu/gpu_postfx.cpp)
+    # The match lights, part one (task lt2-L0a): the camera of each frame from the game, undoing the projection, the light types.
+    # Plain C++ with no SDL; the game overrides call ps2x_gs::sceneCamera and sceneKickBegin/End (declared there, not in a header
+    # generated code includes). It takes the src/lib include directory for "gpu/gpu_lighting.h".
+    target_sources(ps2_runtime PRIVATE src/lib/gpu/gpu_lighting.cpp)
+    set_source_files_properties(src/lib/gpu/gpu_lighting.cpp PROPERTIES INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/src/lib")
     set_source_files_properties(src/lib/ps2_host_gpu.cpp src/lib/gs/gs_gpu_backend.cpp src/lib/gs/gs_gpu_present.cpp
         src/lib/gs/gs_gpu_host.cpp src/lib/gpu/gpu_postfx.cpp PROPERTIES
         INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/src/lib;${CMAKE_CURRENT_SOURCE_DIR}")
