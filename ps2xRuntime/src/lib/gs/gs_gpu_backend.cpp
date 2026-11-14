@@ -345,7 +345,8 @@ namespace
         // (job `fxJob` of Impl::fxJobs) on the frame target as it is at that point of the list.
         int32_t fxJob = -1;
         bool replay = false, replayFirst = false;
-        uint8_t lightFacing = 0; // a lit draw: how its direction counts (ps2x_lighting::Facing, from the object rules)
+        uint8_t lightFacing = 0; // a lit draw: its mode (ps2x_lighting::LightChoice::mode: 0 Lambert, 1 half, 2 position only, 3 a fixed light)
+        float lightStrength = 1.0f, lightGlow = 0.0f; // and how much of the lighting it takes, or how far it glows (materials)
         bool lightClear = false; // a lit draw that is the first of its field: the light buffer starts again at 1.0 before it
         uint32_t lightFirst = 0; // a draw with kLightKey: its first vertex in Impl::lightVerts (as many as vertexCount, in the same order)
     };
@@ -670,7 +671,25 @@ struct GSGpuBackend::Impl
     void lightRefresh();
     SDL_GPUShader *litShader = nullptr;
     SDL_GPUShader *litRepShader = nullptr;
-    uint8_t lightPendingFacing = 0;
+    // Materials (task lt2-L3): what the submit path knows about the primitive it is handing to submitSetup, where the texture (and so
+    // its key and its material) is known and the choice is made (ps2x_lighting::chooseLight).
+    ps2x_lighting::PrimitiveKind lightPendingKind;
+    struct LightKeyRow
+    {
+        uint64_t key = 0, count = 0;
+        ps2x_lighting::PrimitiveKind kind;
+        uint32_t test = 0, alpha = 0;
+        bool abe = false;
+        const char *name = "";
+        int arena = -1;
+        float lo[3] = {}, hi[3] = {};
+        double colourSum[4] = {}, normalSum[3] = {};
+    };
+    std::string lightKeyPath; // PS2X_LIGHT_KEYS
+    std::unordered_map<uint64_t, LightKeyRow> lightKeyRows;
+    void lightKeyNote(uint64_t key, const ps2x_lighting::PrimitiveKind &kind, const GSDrawState &state, const Setup &setup, const LightVertex *verts,
+                      const ps2x_lighting::LightChoice &choice);
+    void lightKeyWrite();
     uint64_t lightLitPrimitives = 0, lightUnlitByRule = 0, lightFieldsLit = 0;
     bool lightRecover = false; // the debug view or the mat log wants the recovery
     bool lightTiming = false;
@@ -1131,6 +1150,8 @@ bool GSGpuBackend::Impl::init(SDL_GPUDevice *device, uint32_t s, GSGpuBackend::F
         const char *timing = std::getenv("PS2X_LIGHT_TIME");
         lightTiming = timing && *timing && std::strcmp(timing, "0") != 0;
     }
+    if (const char *file = std::getenv("PS2X_LIGHT_KEYS"))
+        lightKeyPath = file;
     lightRecover = lightDebug != 0 || lightMatLog != nullptr || lightTiming; // (and the lights, when they are on: lightRefresh)
     if (packStore || fontAtlas)
     {
@@ -2748,11 +2769,13 @@ void GSGpuBackend::Impl::submitSetup(const GSDrawState &state, const Setup &setu
     const bool snap = state.prim.type == GS_PRIM_SPRITE;
     d.uniforms = BuildFragUniforms(state, setup.texelCoords, blend.coefficientFromFix, snap ? scaleX : 0u, snap ? scaleY : 0u, spriteAtTarget);
     d.texture = nullptr;
+    GpuTexture *litTexture = nullptr; // (match lights: the texture's key picks its material)
     if (state.prim.tme)
     {
         GpuTexture *texture = resolveTexture(state);
         if (!texture)
             return;
+        litTexture = texture;
         decodeTexels(*texture, state, setup);
         const GSTex0Reg &tex0 = state.context.tex0;
         const bool fontCanvas = tex0.tbp0 == FontHD::kCanvasTbp && tex0.tbw == FontHD::kCanvasTbw && tex0.psm == GS_PSM_T4 &&
@@ -2801,7 +2824,18 @@ void GSGpuBackend::Impl::submitSetup(const GSDrawState &state, const Setup &setu
     const uint32_t first = static_cast<uint32_t>(vertices.size());
     vertices.insert(vertices.end(), setup.v, setup.v + setup.count);
     stats.vertices += setup.count;
+    ps2x_lighting::LightChoice lightChoice;
     if (lightPending && lightDebug == 0)
+    {
+        // The texture's material if it has one (by its k3_i key: the look's entries, then the built-in table), else the object rule.
+        const uint64_t key = (litTexture && litTexture->rep.keyed) ? litTexture->rep.primary : 0u;
+        lightChoice = ps2x_lighting::chooseLight(lightPendingKind, ps2x_lighting::materialFor(lightLook, key));
+        if (!lightKeyPath.empty())
+            lightKeyNote(key, lightPendingKind, state, setup, lightPending, lightChoice);
+        if (!lightChoice.lit)
+            ++lightUnlitByRule;
+    }
+    if (lightPending && lightDebug == 0 && lightChoice.lit)
     {
         // A lit draw: the game's colour as always (replacement textures included) into the frame, and the light into the frame's light
         // buffer, which is made here on first use. Without the buffer the draw stays a plain one.
@@ -2826,7 +2860,9 @@ void GSGpuBackend::Impl::submitSetup(const GSDrawState &state, const Setup &setu
         if (ft.light)
         {
             d.pipeline |= kLightKey;
-            d.lightFacing = lightPendingFacing;
+            d.lightFacing = lightChoice.mode;
+            d.lightStrength = lightChoice.strength;
+            d.lightGlow = lightChoice.glow;
             d.lightClear = ft.lightPending;
             if (ft.lightPending)
                 ++lightFieldsLit;
@@ -2838,7 +2874,7 @@ void GSGpuBackend::Impl::submitSetup(const GSDrawState &state, const Setup &setu
             ++lightLitThisField;
         }
     }
-    else if (lightPending)
+    else if (lightPending && lightDebug != 0)
     {
         // The debug view draws the recovered data, not the game's colour: a replacement texture is not needed for that (the original's
         // alpha gives the cut-out), so the draw goes back to the plain texture path with the light bit.
@@ -2852,7 +2888,7 @@ void GSGpuBackend::Impl::submitSetup(const GSDrawState &state, const Setup &setu
     {
         Draw &last = draws.back();
         if (last.frame == d.frame && last.depth == d.depth && last.pipeline == d.pipeline && last.texture == d.texture && last.rep == d.rep &&
-            last.replay == d.replay && !d.replayFirst && last.lightFacing == d.lightFacing && !d.lightClear && last.sx == d.sx && last.sy == d.sy && last.sw == d.sw && last.sh == d.sh && last.uniforms == d.uniforms)
+            last.replay == d.replay && !d.replayFirst && last.lightFacing == d.lightFacing && last.lightStrength == d.lightStrength && last.lightGlow == d.lightGlow && !d.lightClear && last.sx == d.sx && last.sy == d.sy && last.sw == d.sw && last.sh == d.sh && last.uniforms == d.uniforms)
         {
             last.vertexCount += setup.count;
             return;
@@ -2935,14 +2971,9 @@ void GSGpuBackend::Impl::submit(const GSPrimitiveBatch &batch)
                 const GSVertex &v = batch.vertices[static_cast<size_t>(i)];
                 kind.flatBlack = kind.flatBlack && v.r == 0u && v.g == 0u && v.b == 0u;
             }
-            const ps2x_lighting::ObjectRule &rule = ps2x_lighting::ruleFor(kind);
-            if (rule.lit)
-            {
-                lightPending = lightOut;
-                lightPendingFacing = static_cast<uint8_t>(rule.facing);
-            }
-            else
-                ++lightUnlitByRule;
+            kind.depthWriteOff = batch.state.context.zbuf.zmask;
+            lightPending = lightOut;
+            lightPendingKind = kind;
         }
     }
     submitSetup(batch.state, setup);
@@ -3210,7 +3241,10 @@ void GSGpuBackend::Impl::flushLocked(bool wait, const FieldCopy *fieldCopies, in
             }
             else
             {
-                const ps2x_lighting::LightUniforms &lu = lightBlocks[std::min<uint32_t>(d.lightFacing, 2u)];
+                ps2x_lighting::LightUniforms lu = lightBlocks[std::min<uint32_t>(d.lightFacing, 2u)];
+                lu.rule[0] = static_cast<float>(d.lightFacing);
+                lu.rule[2] = d.lightStrength;
+                lu.rule[3] = d.lightGlow;
                 SDL_PushGPUFragmentUniformData(cmd, 1, &lu, sizeof(lu));
             }
             SDL_DrawGPUPrimitives(pass, d.vertexCount, 1, 0, 0);
@@ -4387,6 +4421,73 @@ void GSGpuBackend::Impl::fxShutdown()
 // ------------------------------------------------------------------------------------------------
 // match lights: getting the arena back from projected triangles (tasks lt2-L0a, lt2-L0b; gpu/gpu_lighting.h)
 
+// PS2X_LIGHT_KEYS=<file>: one row per texture (by its key) and kind of primitive that the lights met, written at exit: what the
+// renderer knew about it and where in the arena it was drawn. It is how the built-in material table was chosen
+// (docs/hd-lighting-tier2.md, "Built so far: L3").
+void GSGpuBackend::Impl::lightKeyNote(uint64_t key, const ps2x_lighting::PrimitiveKind &kind, const GSDrawState &state, const Setup &setup,
+                                      const LightVertex *verts, const ps2x_lighting::LightChoice &choice)
+{
+    const uint64_t id = key ^ (kind.strip ? 0x9E3779B97F4A7C15ull : 0ull) ^ (kind.depthWriteOff ? 0xC2B2AE3D27D4EB4Full : 0ull) ^
+                        (kind.flatBlack ? 0x165667B19E3779F9ull : 0ull) ^ (key == 0u ? (static_cast<uint64_t>(kind.texW) << 32 | kind.texH << 8 | kind.texPsm) : 0ull);
+    LightKeyRow &row = lightKeyRows[id];
+    if (row.count == 0u)
+    {
+        row.key = key;
+        row.kind = kind;
+        row.test = static_cast<uint32_t>(state.context.test & 0xFFFFFu);
+        row.alpha = static_cast<uint32_t>(state.context.alpha & 0xFFu);
+        row.abe = state.prim.abe;
+        row.name = choice.name;
+        row.arena = ps2x_lighting::currentArena();
+        for (int k = 0; k < 3; ++k)
+        {
+            row.lo[k] = 1e30f;
+            row.hi[k] = -1e30f;
+        }
+    }
+    ++row.count;
+    for (int i = 0; i < 3; ++i)
+    {
+        const float q = setup.v[i].q;
+        for (int k = 0; k < 3; ++k)
+        {
+            const float w = q != 0.0f ? verts[i].worldQ[k] / q : 0.0f;
+            row.lo[k] = std::min(row.lo[k], w);
+            row.hi[k] = std::max(row.hi[k], w);
+        }
+        row.colourSum[0] += (setup.v[i].rgba & 0xFFu);
+        row.colourSum[1] += ((setup.v[i].rgba >> 8) & 0xFFu);
+        row.colourSum[2] += ((setup.v[i].rgba >> 16) & 0xFFu);
+        row.colourSum[3] += (setup.v[i].rgba >> 24);
+    }
+    for (int k = 0; k < 3; ++k)
+        row.normalSum[k] += verts[0].normal[k];
+}
+
+void GSGpuBackend::Impl::lightKeyWrite()
+{
+    if (lightKeyPath.empty())
+        return;
+    std::FILE *f = std::fopen(lightKeyPath.c_str(), "w");
+    if (!f)
+        return;
+    std::fprintf(f, "key,arena,rule,primitives,strip,textured,tex_w,tex_h,psm,depth_write_off,flat_black,abe,alpha_reg,test,r,g,b,a,x0,x1,y0,y1,z0,z1,nx,ny,nz\n");
+    std::vector<const LightKeyRow *> rows;
+    for (const auto &entry : lightKeyRows)
+        rows.push_back(&entry.second);
+    std::sort(rows.begin(), rows.end(), [](const LightKeyRow *a, const LightKeyRow *b) { return a->count > b->count; });
+    for (const LightKeyRow *r : rows)
+    {
+        const double n = static_cast<double>(r->count), c = n * 3.0;
+        std::fprintf(f, "%016llx,%d,%s,%llu,%d,%d,%u,%u,%u,%d,%d,%d,%02x,%05x,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.2f,%.2f,%.2f\n",
+                     static_cast<unsigned long long>(r->key), r->arena, r->name, static_cast<unsigned long long>(r->count), r->kind.strip ? 1 : 0, r->kind.textured ? 1 : 0,
+                     r->kind.texW, r->kind.texH, r->kind.texPsm, r->kind.depthWriteOff ? 1 : 0, r->kind.flatBlack ? 1 : 0, r->abe ? 1 : 0, r->alpha, r->test,
+                     r->colourSum[0] / c, r->colourSum[1] / c, r->colourSum[2] / c, r->colourSum[3] / c, r->lo[0], r->hi[0], r->lo[1], r->hi[1], r->lo[2], r->hi[2],
+                     r->normalSum[0] / n, r->normalSum[1] / n, r->normalSum[2] / n);
+    }
+    std::fclose(f);
+}
+
 // The lights' switch and look, at each VBlank (from fxRefresh). The first time the lights are on, their shaders are made; a device
 // that cannot render to half-float textures cannot have them.
 void GSGpuBackend::Impl::lightRefresh()
@@ -4406,6 +4507,14 @@ void GSGpuBackend::Impl::lightRefresh()
             lightSetupFailed = true;
             want = false;
         }
+    }
+    if (want && !keys)
+    {
+        // Materials go by texture key, so the key tracker runs while the lights are on (it otherwise runs for texture packs and the
+        // texture tools). It learns a texture's key when the game next uploads it, which for the match's textures is every frame.
+        if (!gKeys)
+            gKeys = std::make_unique<TexKeys::Tracker>();
+        keys = gKeys.get();
     }
     if (want != lightOn)
         std::fprintf(stderr, "[light] lights %s\n", want ? "on" : "off");
@@ -4546,6 +4655,7 @@ bool GSGpuBackend::Impl::lightEnsureBuffers(size_t bytes)
 
 void GSGpuBackend::Impl::lightShutdown()
 {
+    lightKeyWrite();
     if (lightRecover)
     {
         if (lightMatLog)

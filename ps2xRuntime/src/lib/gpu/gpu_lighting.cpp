@@ -486,10 +486,13 @@ namespace ps2x_lighting
     // ================================================================================================================
     const ObjectRule &ruleFor(const PrimitiveKind &kind)
     {
+        static const ObjectRule effect = {"effect", true, Facing::PositionOnly};
         static const ObjectRule shadow = {"shadow", false, Facing::PositionOnly};
         static const ObjectRule card = {"card", true, Facing::PositionOnly};
         static const ObjectRule rope = {"rope", true, Facing::PositionOnly};
         static const ObjectRule surface = {"surface", true, Facing::Lambert};
+        if (kind.depthWriteOff)
+            return effect;
         if (kind.strip)
             return kind.flatBlack ? shadow : card;
         if (kind.textured && kind.texW == 32u && kind.texH == 32u && kind.texPsm == 0u)
@@ -577,6 +580,88 @@ namespace ps2x_lighting
     }
 
     // ================================================================================================================
+    // Materials by texture key (task lt2-L3)
+    // ================================================================================================================
+    const char *materialKindName(MaterialKind kind)
+    {
+        switch (kind)
+        {
+        case MaterialKind::Keep: return "keep";
+        case MaterialKind::Unlit: return "unlit";
+        case MaterialKind::PositionOnly: return "position";
+        case MaterialKind::FaceNormal: return "normal";
+        case MaterialKind::Soft: return "soft";
+        default: return "glow";
+        }
+    }
+
+    const std::vector<MaterialEntry> &builtInMaterials()
+    {
+        // Chosen from evidence (docs/hd-lighting-tier2.md, "Built so far: L3"): textures that look wrong under the object rules alone.
+        static const std::vector<MaterialEntry> table = {
+            // Thin wire and netting are triangle lists on upright planes, so their face normal is sideways and a light from above gave
+            // them nothing but the ambient level: a cage that stays dark in the middle of the spotlight. Wire is round and catches
+            // light from any side, so these are lit by position, like the ropes.
+            {0xa97f2e48c5a4cfd1ull, {MaterialKind::PositionOnly, 1.0f, 0.0f}, "cage netting (Cage Deathmatch, arena 8)"},
+            {0xfa394369e7adee3eull, {MaterialKind::PositionOnly, 1.0f, 0.0f}, "cage frame (Cage Deathmatch, arena 8)"},
+            {0x1af33ecad7e13ab0ull, {MaterialKind::PositionOnly, 1.0f, 0.0f}, "barbed wire (Barbed Wire Deathmatch, arena 9)"},
+        };
+        return table;
+    }
+
+    const Material *materialFor(const Look &look, uint64_t key)
+    {
+        if (key == 0u)
+            return nullptr;
+        for (const MaterialEntry &entry : look.materials)
+            if (entry.key == key)
+                return &entry.material;
+        for (const MaterialEntry &entry : builtInMaterials())
+            if (entry.key == key)
+                return &entry.material;
+        return nullptr;
+    }
+
+    LightChoice chooseLight(const PrimitiveKind &kind, const Material *material)
+    {
+        LightChoice choice;
+        if (material)
+        {
+            choice.name = materialKindName(material->kind);
+            choice.lit = material->kind != MaterialKind::Keep;
+            choice.strength = std::clamp(material->strength, 0.0f, 4.0f);
+            switch (material->kind)
+            {
+            case MaterialKind::Unlit:
+                choice.mode = 3;
+                break;
+            case MaterialKind::Glow:
+                choice.mode = 3;
+                choice.glow = std::clamp(material->glow, 0.0f, 16.0f);
+                break;
+            case MaterialKind::PositionOnly:
+                choice.mode = 2;
+                break;
+            case MaterialKind::Soft:
+                choice.mode = 1;
+                break;
+            default:
+                choice.mode = 0;
+                break;
+            }
+            return choice;
+        }
+        const ObjectRule &rule = ruleFor(kind);
+        choice.name = rule.name;
+        choice.lit = rule.lit;
+        if (std::strcmp(rule.name, "effect") == 0)
+            choice.mode = 3; // shown as the game drew it
+        else
+            choice.mode = rule.facing == Facing::Lambert ? 0 : (rule.facing == Facing::Half ? 1 : 2);
+        return choice;
+    }
+
+    // ================================================================================================================
     // The look as text, the built-in looks, the current look (task lt2-L2)
     // ================================================================================================================
     namespace
@@ -634,6 +719,24 @@ namespace ps2x_lighting
             std::snprintf(line, sizeof(line), "  intensity %.9g\n  cone %.9g %.9g\n  range %.9g\n", l.strength, l.innerDegrees, l.outerDegrees, l.radius);
             out += line;
         }
+        for (const MaterialEntry &entry : look.materials)
+        {
+            std::snprintf(line, sizeof(line), "material %016llx %s", static_cast<unsigned long long>(entry.key), materialKindName(entry.material.kind));
+            out += line;
+            if (entry.material.kind == MaterialKind::Glow)
+            {
+                std::snprintf(line, sizeof(line), " %.9g", entry.material.glow);
+                out += line;
+            }
+            else if (entry.material.strength != 1.0f && entry.material.kind != MaterialKind::Keep && entry.material.kind != MaterialKind::Unlit)
+            {
+                std::snprintf(line, sizeof(line), " strength %.9g", entry.material.strength);
+                out += line;
+            }
+            if (!entry.note.empty())
+                out += "   # " + entry.note;
+            out += "\n";
+        }
         return out;
     }
 
@@ -659,8 +762,16 @@ namespace ps2x_lighting
             at = end + 1;
             ++number;
             const size_t hash = raw.find('#');
+            std::string comment;
             if (hash != std::string::npos)
+            {
+                comment = raw.substr(hash + 1u);
+                while (!comment.empty() && (comment.front() == ' ' || comment.front() == '\t'))
+                    comment.erase(comment.begin());
+                while (!comment.empty() && (comment.back() == '\r' || comment.back() == ' '))
+                    comment.pop_back();
                 raw.resize(hash);
+            }
             // words
             std::vector<std::string> words;
             size_t i = 0;
@@ -706,6 +817,70 @@ namespace ps2x_lighting
                     return fail("ambient takes one number or three");
                 for (int k = 0; k < 3; ++k)
                     parsed.ambient[k] = clampNumber(v[k], 0.0f, 8.0f);
+                light = nullptr;
+            }
+            else if (word == "material")
+            {
+                // material <16 hex digits> keep|unlit|position|normal|soft [strength <n>]   or   material <key> glow <n>
+                if (words.size() < 3u || words[1].size() != 16u)
+                    return fail("a material is \"material <16 hex digits> keep|unlit|position|normal|soft|glow ...\"");
+                char *stop = nullptr;
+                MaterialEntry entry;
+                entry.key = std::strtoull(words[1].c_str(), &stop, 16);
+                if (*stop != '\0' || entry.key == 0u)
+                    return fail("a material's key is 16 hex digits");
+                const std::string &kind = words[2];
+                size_t next = 3;
+                const auto number = [&](float &to) {
+                    if (next >= words.size())
+                        return false;
+                    char *end = nullptr;
+                    to = std::strtof(words[next].c_str(), &end);
+                    const bool good = end != words[next].c_str() && *end == '\0' && std::isfinite(to);
+                    ++next;
+                    return good;
+                };
+                if (kind == "keep")
+                    entry.material.kind = MaterialKind::Keep;
+                else if (kind == "unlit")
+                    entry.material.kind = MaterialKind::Unlit;
+                else if (kind == "position")
+                    entry.material.kind = MaterialKind::PositionOnly;
+                else if (kind == "normal")
+                    entry.material.kind = MaterialKind::FaceNormal;
+                else if (kind == "soft")
+                    entry.material.kind = MaterialKind::Soft;
+                else if (kind == "glow")
+                {
+                    entry.material.kind = MaterialKind::Glow;
+                    if (!number(entry.material.glow))
+                        return fail("glow takes a number");
+                    entry.material.glow = clampNumber(entry.material.glow, 0.0f, 16.0f);
+                }
+                else
+                    return fail("\"" + kind + "\" is not a kind of material");
+                if (next < words.size())
+                {
+                    if (words[next] != "strength" || entry.material.kind == MaterialKind::Glow || entry.material.kind == MaterialKind::Keep ||
+                        entry.material.kind == MaterialKind::Unlit)
+                        return fail("only \"strength <n>\" may follow position, normal or soft");
+                    ++next;
+                    if (!number(entry.material.strength) || next != words.size())
+                        return fail("strength takes one number");
+                    entry.material.strength = clampNumber(entry.material.strength, 0.0f, 4.0f);
+                }
+                if (parsed.materials.size() >= kMaxMaterials)
+                    return fail("more than 256 materials");
+                entry.note = comment;
+                bool replaced = false;
+                for (MaterialEntry &have : parsed.materials)
+                    if (have.key == entry.key)
+                    {
+                        have = entry; // a later line for the same texture wins
+                        replaced = true;
+                    }
+                if (!replaced)
+                    parsed.materials.push_back(entry);
                 light = nullptr;
             }
             else if (word == "light")
@@ -1047,6 +1222,7 @@ namespace ps2x_lighting
         if (arena == s.arena)
             return;
         s.arena = arena;
+        std::fprintf(stderr, "[light] arena %d\n", arena);
         if (!s.fixedByEnvironment)
             loadForArenaLocked(s);
         // A test aid (no panel click needed): PS2X_LIGHT_SAVE_PRESET=<a preset's name> makes that preset the look of the arena and
@@ -1159,6 +1335,7 @@ namespace ps2x_lighting
             u.ambient[i] = look.ambient[i];
         u.rule[0] = facing == Facing::Lambert ? 0.0f : (facing == Facing::Half ? 1.0f : 2.0f);
         u.rule[1] = showMarkers ? 1.0f : 0.0f;
+        u.rule[2] = 1.0f;
         const float degrees = 3.14159265358979f / 180.0f;
         int count = 0, index = -1;
         for (const Light &light : look.lights)

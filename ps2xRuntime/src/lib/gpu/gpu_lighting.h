@@ -200,11 +200,45 @@ namespace ps2x_lighting
         bool on = true;             // a light that is off adds nothing (the debug panel's switch; kept in the look file)
     };
 
+    // ---- materials by texture (task lt2-L3). The object rules above decide by what a primitive is; a material decides by which
+    // texture it draws with, and wins over the rule. The texture is named by its key, the k3_i key of the texture tools
+    // (docs/formats/fprmod.md): 16 hex digits, the same in every run. A small table is built in (builtInMaterials); a look file adds
+    // entries or replaces built-in ones with lines like
+    //     material 0123456789abcdef unlit
+    //     material 0123456789abcdef normal strength 0.4
+    //     material 0123456789abcdef glow 1.5
+    enum class MaterialKind : uint8_t
+    {
+        Keep,         // not lit at all: drawn as the game draws it, and the light under it stays (what shadows get)
+        Unlit,        // shown as the game drew it whatever the lights do (the light at its pixels becomes 1)
+        PositionOnly, // lit by where it is
+        FaceNormal,   // lit by its face normal (what surfaces get)
+        Soft,         // lit by its face normal with the softer rule (Facing::Half)
+        Glow          // a light of its own: shown at 1 + glow times its colour, whatever the lights do (a screen, a lamp)
+    };
+
+    struct Material
+    {
+        MaterialKind kind = MaterialKind::FaceNormal;
+        float strength = 1.0f; // PositionOnly, FaceNormal, Soft: how much of the lighting it takes; 0 is the same as Unlit
+        float glow = 0.0f;     // Glow: how far above its own colour
+    };
+
+    struct MaterialEntry
+    {
+        uint64_t key = 0;
+        Material material;
+        std::string note; // what the texture is, for people
+    };
+    constexpr size_t kMaxMaterials = 256;
+
+
     // A look: what multiplies the game's own colours. Ambient 1 and no lights leaves the picture as the game drew it.
     struct Look
     {
         float ambient[3] = {1.0f, 1.0f, 1.0f};
         std::vector<Light> lights;
+        std::vector<MaterialEntry> materials; // per texture (below); the built-in table applies as well
     };
 
     // What one light adds at a point (not multiplied by the surface colour): colour x strength x falloff x cone x facing.
@@ -222,6 +256,7 @@ namespace ps2x_lighting
         uint32_t texW = 0, texH = 0; // the declared texture size
         uint32_t texPsm = 0;         // its GS pixel format (0 is 32-bit colour)
         bool flatBlack = false;      // all three corners are black: the wrestlers' shadows (black, alpha 64)
+        bool depthWriteOff = false;  // drawn without writing depth: the game's effects (billboards from aikoh/all.eff)
     };
 
     struct ObjectRule
@@ -232,11 +267,30 @@ namespace ps2x_lighting
     };
 
     // The rules, in the order they are tried:
+    //   effect     anything drawn without writing depth: the effect billboards. Shown as the game drew them (they are light, or
+    //              dust and sweat the game already shaded), blended into the light as they are into the picture.
     //   shadow     a flat black strip. Not lit: it keeps darkening what is under it, and the light under it stays (decision 5).
     //   card       any other strip: a wrestler part or a ring-side sprite, an upright card. By position only.
     //   rope       a triangle list with a 32 x 32 32-bit texture: flat ribbons whose normal is sideways. By position only.
     //   surface    every other triangle list: models (hall, crowd, posts, apron) and the mat. By its face normal.
     const ObjectRule &ruleFor(const PrimitiveKind &kind);
+
+    // ---- materials: the table and the choice for a primitive (the types are above, with the look)
+    const std::vector<MaterialEntry> &builtInMaterials();
+    // The material of a texture key in a look: the look's own entry, else the built-in one, else null.
+    const Material *materialFor(const Look &look, uint64_t key);
+    const char *materialKindName(MaterialKind kind);
+
+    // What the renderer does with one primitive: the material of its texture if it has one, else the object rule.
+    struct LightChoice
+    {
+        bool lit = false;     // false: a plain draw that leaves the light buffer alone
+        uint8_t mode = 0;     // 0 Lambert, 1 half, 2 position only (the Facing values), 3 a fixed light of 1 + glow
+        float strength = 1.0f;
+        float glow = 0.0f;
+        const char *name = ""; // the rule's or the material kind's name, for logs
+    };
+    LightChoice chooseLight(const PrimitiveKind &kind, const Material *material);
 
     // ---- the look for now (task lt2-L1): ambient and one spotlight above the ring centre, pointing down, from the environment.
     //   PS2X_LIGHT=1                    lights on (anything else, or unset: off)
@@ -254,7 +308,8 @@ namespace ps2x_lighting
     struct LightUniforms
     {
         float ambient[4];                // rgb, the number of lights that follow
-        float rule[4];                   // x: the facing rule of the draw (0 Lambert, 1 half, 2 position only), y: 1 = draw the markers ("show lights")
+        float rule[4];                   // x: the draw's mode (0 Lambert, 1 half, 2 position only, 3 a fixed light of 1 + glow), y: 1 = draw the
+                                         // markers ("show lights"), z: how much of the lighting the draw takes (1 = all), w: its glow
         float position[kMaxLights][4];   // xyz, range
         float axis[kMaxLights][4];       // spot: the unit direction it points in; w: intensity
         float colour[kMaxLights][4];     // rgb, w: 1 spot, 0 point

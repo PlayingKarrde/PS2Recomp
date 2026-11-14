@@ -198,11 +198,12 @@ namespace
     }
 
     // A flat triangle given by three world points, projected with `m` the way the game does: x and y cut to 1/16 pixel, Q = 1 / w.
-    void worldTriangle(GSRasterBackend &b, const float m[16], const double points[3][3], double z, uint8_t r, uint8_t g, uint8_t bl)
+    void worldTriangle(GSRasterBackend &b, const float m[16], const double points[3][3], double z, uint8_t r, uint8_t g, uint8_t bl, bool depthWrites = true)
     {
         GSPrimitiveBatch p;
         p.vertexCount = 3;
         p.state.context = sceneContext();
+        p.state.context.zbuf.zmask = !depthWrites; // (the game draws its effect billboards without depth writes)
         p.state.prim.type = GS_PRIM_TRIANGLE;
         p.state.prim.iip = false;
         p.state.prim.fst = false;
@@ -327,6 +328,13 @@ namespace
                 worldTriangle(b, m, a, 1000.0, 200, 60, 20);
                 worldTriangle(b, m, c, 1000.0, 200, 60, 20);
             }
+        {
+            // An effect: a small green square just above the floor, straight under the test spotlight, drawn without depth writes.
+            const double a[3][3] = {{-20.0, -199.0, 40.0}, {20.0, -199.0, 40.0}, {-20.0, -199.0, 80.0}};
+            const double c[3][3] = {{20.0, -199.0, 40.0}, {20.0, -199.0, 80.0}, {-20.0, -199.0, 80.0}};
+            worldTriangle(b, m, a, 1001.0, 40, 220, 80, false);
+            worldTriangle(b, m, c, 1001.0, 40, 220, 80, false);
+        }
         if (overlay)
         {
             GSPrimitiveBatch box;
@@ -1038,6 +1046,134 @@ void register_gpu_lighting_tests()
         t.IsTrue(a[0] == 1.0f && a[1] == 0.25f && b[0] == 0.75f, "the markers' colours: light 1 red, light 8 grey");
     });
 
+    tc.Run("materials: a texture's material wins over the object rule; each kind gives its mode, strength and glow; effects are shown as drawn", [](TestCase &t)
+    {
+        PrimitiveKind surface;
+        surface.textured = true;
+        surface.texW = surface.texH = 128;
+        surface.texPsm = 0x13;
+        PrimitiveKind card = surface;
+        card.strip = true;
+        PrimitiveKind shadow = card;
+        shadow.flatBlack = true;
+        PrimitiveKind effect = card;
+        effect.depthWriteOff = true;
+
+        LightChoice c = chooseLight(surface, nullptr);
+        t.IsTrue(c.lit && c.mode == 0 && c.strength == 1.0f && c.glow == 0.0f && std::string(c.name) == "surface", "no material, a surface: lit by its normal");
+        c = chooseLight(card, nullptr);
+        t.IsTrue(c.lit && c.mode == 2 && std::string(c.name) == "card", "no material, a card: by position only");
+        c = chooseLight(shadow, nullptr);
+        t.IsTrue(!c.lit && std::string(c.name) == "shadow", "no material, a shadow: not lit");
+        c = chooseLight(effect, nullptr);
+        t.IsTrue(c.lit && c.mode == 3 && c.glow == 0.0f && std::string(c.name) == "effect", "no material, drawn without depth writes: an effect, shown as the game drew it");
+        PrimitiveKind blackEffect = effect;
+        blackEffect.flatBlack = true;
+        t.IsTrue(std::string(chooseLight(blackEffect, nullptr).name) == "effect", "the effect rule comes before the shadow rule");
+
+        Material m;
+        m.kind = MaterialKind::Keep;
+        t.IsTrue(!chooseLight(surface, &m).lit, "keep: not lit");
+        m.kind = MaterialKind::Unlit;
+        c = chooseLight(card, &m);
+        t.IsTrue(c.lit && c.mode == 3 && c.glow == 0.0f, "unlit: a fixed light of 1");
+        m.kind = MaterialKind::Glow;
+        m.glow = 1.5f;
+        c = chooseLight(surface, &m);
+        t.IsTrue(c.lit && c.mode == 3 && c.glow == 1.5f, "glow 1.5: a fixed light of 2.5");
+        m.glow = 99.0f;
+        t.IsTrue(chooseLight(surface, &m).glow == 16.0f, "glow is clamped to 16");
+        m = Material{};
+        m.kind = MaterialKind::PositionOnly;
+        m.strength = 0.4f;
+        c = chooseLight(surface, &m);
+        t.IsTrue(c.lit && c.mode == 2 && c.strength == 0.4f, "position with strength 0.4, on a surface");
+        m.kind = MaterialKind::FaceNormal;
+        m.strength = 1.0f;
+        c = chooseLight(card, &m);
+        t.IsTrue(c.lit && c.mode == 0, "normal, on a card");
+        m.kind = MaterialKind::Soft;
+        t.IsTrue(chooseLight(shadow, &m).lit && chooseLight(shadow, &m).mode == 1, "soft, even on what the rules call a shadow");
+
+        // The table: a look's entry wins over a built-in one for the same key; key 0 (no key) never has a material.
+        Look look;
+        t.IsNull(materialFor(look, 0u), "no key, no material");
+        t.IsNull(materialFor(look, 0x1234567890abcdefull), "a key nobody lists has none");
+        MaterialEntry mine;
+        mine.key = 0x1234567890abcdefull;
+        mine.material.kind = MaterialKind::Glow;
+        mine.material.glow = 2.0f;
+        look.materials.push_back(mine);
+        const Material *found = materialFor(look, 0x1234567890abcdefull);
+        t.IsTrue(found && found->kind == MaterialKind::Glow && found->glow == 2.0f, "the look's entry is found");
+        for (const MaterialEntry &builtIn : builtInMaterials())
+        {
+            t.IsTrue(builtIn.key != 0u && !builtIn.note.empty(), "every built-in material has a key and says what it is");
+            Look other;
+            const Material *b = materialFor(other, builtIn.key);
+            t.IsTrue(b && b->kind == builtIn.material.kind, "a built-in material is found without any look entry");
+            MaterialEntry over;
+            over.key = builtIn.key;
+            over.material.kind = MaterialKind::Unlit;
+            other.materials.push_back(over);
+            t.IsTrue(materialFor(other, builtIn.key)->kind == MaterialKind::Unlit, "and a look's entry for the same texture wins");
+        }
+        const LightUniforms u = lightUniforms(defaultLook(), Facing::Lambert);
+        t.IsTrue(u.rule[2] == 1.0f && u.rule[3] == 0.0f, "the uniform block starts at full strength and no glow");
+    });
+
+    tc.Run("the look file: material lines read, write and are refused when wrong", [](TestCase &t)
+    {
+        Look look;
+        std::string error;
+        const char *text = "look 1\n"
+                           "ambient 0.5\n"
+                           "material 00000000000000aa unlit        # a sign\n"
+                           "material 00000000000000bb normal strength 0.4\n"
+                           "material 00000000000000cc glow 1.5   # a screen\n"
+                           "material 00000000000000dd keep\n"
+                           "material 00000000000000ee position\n"
+                           "material 00000000000000ff soft strength 9\n"
+                           "material 00000000000000aa glow 0.25\n"
+                           "light spot\n";
+        t.IsTrue(parseLook(text, look, &error), "a look with materials parses" + (error.empty() ? std::string() : ": " + error));
+        t.IsTrue(look.materials.size() == 6u && look.lights.size() == 1u, "six textures (a later line for the same key replaces the earlier one), one light");
+        if (look.materials.size() == 6u)
+        {
+            t.IsTrue(look.materials[0].key == 0xaaull && look.materials[0].material.kind == MaterialKind::Glow && look.materials[0].material.glow == 0.25f,
+                     "the second line for ...aa won: glow 0.25");
+            t.IsTrue(look.materials[1].material.kind == MaterialKind::FaceNormal && look.materials[1].material.strength == 0.4f, "normal strength 0.4");
+            t.IsTrue(look.materials[2].material.kind == MaterialKind::Glow && look.materials[2].material.glow == 1.5f && look.materials[2].note == "a screen",
+                     "glow 1.5, and the comment is kept as the note");
+            t.IsTrue(look.materials[3].material.kind == MaterialKind::Keep && look.materials[4].material.kind == MaterialKind::PositionOnly, "keep and position");
+            t.IsTrue(look.materials[5].material.kind == MaterialKind::Soft && look.materials[5].material.strength == 4.0f, "soft, strength clamped to 4");
+        }
+        Look back;
+        const std::string written = formatLook(look);
+        t.IsTrue(parseLook(written, back, &error) && formatLook(back) == written, "what is written reads back as the same text");
+        t.IsTrue(written.find("material 00000000000000cc glow 1.5   # a screen") != std::string::npos, "the line as written: key, kind, number, note");
+
+        const char *bad[] = {"look 1\nmaterial\n",
+                             "look 1\nmaterial 00aa unlit\n",
+                             "look 1\nmaterial 00000000000000zz unlit\n",
+                             "look 1\nmaterial 0000000000000000 unlit\n",
+                             "look 1\nmaterial 00000000000000aa shiny\n",
+                             "look 1\nmaterial 00000000000000aa glow\n",
+                             "look 1\nmaterial 00000000000000aa glow much\n",
+                             "look 1\nmaterial 00000000000000aa unlit strength 0.5\n",
+                             "look 1\nmaterial 00000000000000aa normal 0.5\n",
+                             "look 1\nmaterial 00000000000000aa normal strength\n",
+                             "look 1\nmaterial 00000000000000aa normal strength 0.5 extra\n",
+                             "look 1\nmaterial 00000000000000aa glow 1 strength 2\n"};
+        int refused = 0;
+        for (const char *one : bad)
+        {
+            Look l;
+            refused += parseLook(one, l, &error) ? 0 : 1;
+        }
+        t.IsTrue(refused == static_cast<int>(sizeof(bad) / sizeof(bad[0])), "12 wrong material lines are each refused (" + std::to_string(refused) + ")");
+    });
+
     tc.Run("the lights on the GPU renderer: off or without a camera the picture is the same bytes; on, the floor is lit under the spotlight and dimmed outside it, the overlay and unlit pixels are untouched", [](TestCase &t)
     {
         if (!SDL_Init(SDL_INIT_VIDEO))
@@ -1071,8 +1207,11 @@ void register_gpu_lighting_tests()
             {
                 // The floor is 200 below the eye. (0, -200, 60) is under the spotlight (4 degrees off its axis): picture (320, 412).
                 // (0, -200, 900) is 48 degrees off, outside the 20 degree cone: picture (320, 329). The clear shows at (40, 40).
-                const uint8_t *under = lit.at(320, 412), *outside = lit.at(320, 329);
-                t.IsTrue(near3(plain.at(320, 412), 200, 60, 20, 1) && near3(plain.at(320, 329), 200, 60, 20, 1), "lights off: the floor in its own colour");
+                const uint8_t *under = lit.at(345, 412), *outside = lit.at(320, 329);
+                t.IsTrue(near3(plain.at(345, 412), 200, 60, 20, 1) && near3(plain.at(320, 329), 200, 60, 20, 1), "lights off: the floor in its own colour");
+                // The effect square (drawn without depth writes) covers picture (320, 412): under the lights it is the game's own pixel.
+                t.IsTrue(near3(plain.at(320, 412), 40, 220, 80, 1), "lights off: the effect square in its own colour, " + rgbText(plain.at(320, 412)));
+                t.IsTrue(std::memcmp(lit.at(320, 412), plain.at(320, 412), 4) == 0, "lights on: an effect in the middle of the cone is shown as the game drew it, " + rgbText(lit.at(320, 412)));
                 t.IsTrue(plain.px == noCamera.px, "lights on but no camera: the same bytes as lights off");
                 const int r = linearToSrgb8(srgbToLinear(200 / 255.0) * 0.5), g = linearToSrgb8(srgbToLinear(60 / 255.0) * 0.5), b = linearToSrgb8(srgbToLinear(20 / 255.0) * 0.5);
                 t.IsTrue(near3(outside, r, g, b, 2), "outside the cone: the colour times the ambient 0.5 in linear light, " + rgbText(outside) + " for (" + std::to_string(r) + ", " +

@@ -109,7 +109,13 @@ LitOutput LitPixel(PSInput input)
     output.Colour = GsColour(input); // (a pixel that fails the alpha test is discarded in there, for both targets)
     const float invQ = 1.0f / (abs(input.UVQ.z) > 1.0e-8f ? input.UVQ.z : 1.0f);
     const float3 world = input.WorldQ * invQ;
-    float3 light = LightAtPixel(world, input.Normal);
+    // The draw's mode (LightRule.x): 3 is a fixed light of 1 + glow (a material that is unlit or glows, or an effect); otherwise the
+    // lights, of which the draw takes the share LightRule.z (1 = all; a material's strength).
+    float3 light;
+    if (LightRule.x > 2.5f)
+        light = float3(1.0f, 1.0f, 1.0f) * (1.0f + LightRule.w);
+    else
+        light = lerp(float3(1.0f, 1.0f, 1.0f), LightAtPixel(world, input.Normal), LightRule.z);
     float3 marker;
     if (LightRule.y > 0.5f && LightMarker(world, marker))
         light = -marker;
