@@ -20,6 +20,12 @@
 //
 // This is not the patch-mod format (docs/mod-layer.md "Patch mods"); it only replaces whole files.
 //
+// Mods (task md6, docs/mod-layer.md "ROM files and model mods"). An `assets` mod's files under assets/rom/<archive path> replace
+// that archive file the same way, with no variable set: the host hands them over with setModFiles() when the mod manager starts.
+// The development folder stays on top (its files win over every mod). Model containers (aikoh/r/*.all) are checked against the
+// game's own copy first (FprModelCheck.h): a mod's file that fails is refused, the development folder's only warned about. Mods
+// apply at the start of the game only (the game keeps its own copy of the directory after the first read).
+//
 // The functions below the line "Pure logic" have no global state and are what the unit tests exercise.
 //
 // Also in this pair of files: a small in-process logger that reads guest memory once per game frame and writes a CSV
@@ -29,7 +35,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -77,7 +85,9 @@ namespace ps2x_rom_override
     struct Replacement
     {
         std::string path;
-        std::filesystem::path host;
+        std::filesystem::path host;                  // served from this file, unless `data` is set
+        std::shared_ptr<const std::vector<uint8_t>> data; // served from memory (a mod's file, read out of its package)
+        std::string source;                          // the mod id, or "" for the development folder
         uint32_t originalSector = 0;
         uint32_t originalSize = 0;
         uint32_t entryOffset = 0;
@@ -86,18 +96,50 @@ namespace ps2x_rom_override
         uint32_t sectors = 0;       // sectors of the replacement
     };
 
+    // A line for the Mods tab about one mod's file: a refusal (`problem`), or information (what it replaces; warnings start "Warning: ").
+    struct PlanNote
+    {
+        std::string source; // mod id ("" = the development folder; not shown in the Mods tab)
+        bool problem = false;
+        std::string text;
+    };
+
     struct Plan
     {
         std::vector<Replacement> replacements;
         std::vector<std::string> log; // one line per decision, including every refusal
+        std::vector<PlanNote> notes;
     };
+
+    // ---- Where replacements come from (task md6: ROM files in mods, docs/mod-layer.md "ROM files and model mods") ----------
+    // A candidate is one file that offers to replace the archive file `path`. Candidates are given in load order: the mods' files
+    // first (the order of the session's load order, the last wins), then the development folder's (which wins over every mod).
+    // For each archive path the last candidate that passes the checks is used; one that fails is refused with a note and the next
+    // one down is tried, then the game's own file. Checks: size (not empty, under 4 GB, under a known load buffer), and for the
+    // model containers aikoh/r/*.all the model checks of FprModelCheck.h. A mod's failed check refuses its file; the development
+    // folder's model checks only warn, so a modder can still try past the limits.
+    struct Candidate
+    {
+        std::string path;   // archive path, lower case, '/' between folders
+        std::string source; // mod id; "" for the development folder
+        bool dev = false;
+        std::filesystem::path host;                        // dev: the host file
+        std::function<std::shared_ptr<const std::vector<uint8_t>>()> read; // mods: reads the file out of the package (nullptr = gone)
+    };
+
+    // Reads the game's own copy of an archive file (for the comparison); false when it cannot.
+    using OriginalReader = std::function<bool(const TocFile &file, std::vector<uint8_t> &bytes)>;
 
     // Lower-case relative path (with '/') -> host file, for every regular file under `dir`.
     std::map<std::string, std::filesystem::path> scanFolder(const std::filesystem::path &dir);
 
     // Decide which files of the archive are replaced by which host files. Files that do not exist in the archive, are empty,
-    // do not fit the 32-bit size, or exceed a known load limit are refused and named in the log.
+    // do not fit the 32-bit size, or exceed a known load limit are refused and named in the log. (The development folder alone.)
     Plan makePlan(const Toc &toc, const std::map<std::string, std::filesystem::path> &hostFiles);
+    // The same for candidates from mods and the development folder, with the model checks. `readOriginal` may be empty.
+    Plan makePlan(const Toc &toc, const std::vector<Candidate> &candidates, const OriginalReader &readOriginal);
+    // The development folder's files as candidates.
+    std::vector<Candidate> devCandidates(const std::map<std::string, std::filesystem::path> &hostFiles);
 
     // Rewrite the directory fields of the replaced files inside bytes the game is about to see. `archiveOffset` is where
     // dst[0] sits in the archive. Only whole fields inside [archiveOffset, archiveOffset + bytes) are changed.
@@ -110,8 +152,13 @@ namespace ps2x_rom_override
 
     // ---- The hook used by Support.h (readCdSectors) ----------------------------------------------------------------------
 
-    // Is PS2X_ROM_OVERRIDE_DIR set? Read once. Cheap: call it on every disc read.
+    // Is PS2X_ROM_OVERRIDE_DIR set, or does a mod replace a file? Cheap: call it on every disc read.
     bool enabled();
+
+    // The mods' files (task md6), given once by the host (ps2_host_mods.cpp) when the mod manager starts, before the game reads the
+    // archive. `sink` receives the notes for the Mods tab when the plan is built (on the game thread, at the first archive read).
+    using NoteSink = std::function<void(const PlanNote &note)>;
+    void setModFiles(std::vector<Candidate> files, NoteSink sink);
 
     // After the bytes of a registered file were read from the host: if it is FPR.ROM, patch the directory fields in them.
     // `baseLbn` is the file's first sector in the CD layer's numbering. `relativeSector` is the first sector read.

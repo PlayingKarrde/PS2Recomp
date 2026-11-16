@@ -82,7 +82,7 @@ namespace ps2x::ui
             switch (kind)
             {
             case Kind::Theme: return "A theme changes how this menu looks. It takes effect when the game starts.";
-            case Kind::Assets: return "Replacement pictures (texture packs). They take effect when the game starts, and only with the GPU renderer.";
+            case Kind::Assets: return "Replacement pictures, fonts or game files such as models. They take effect when the game starts; pictures and fonts only with the GPU renderer.";
             case Kind::Code: return "Code mods are not supported yet, so this does nothing.";
             case Kind::Data: return "A data pack changes what is in your save (names, for now). While one is on, the game plays from a copy of your memory card (the profile card), and your own card is not changed. It takes effect when the game starts. When the last one is turned off the game stays on the profile card, so your edits and saves are not hidden; Back to my card returns to your own.";
             default: return "This kind of mod does nothing yet. Support comes in a later version.";
@@ -363,11 +363,12 @@ namespace ps2x::ui
                     rml += "<div class=\"mod-notes-line\">and " + std::to_string(notes.size() - shown) + " more (see the log).</div>";
                 rml += "</div>";
             }
-            // What a data pack did to the memory card (and what it kept of the player's own changes).
+            // What a data pack did to the memory card (and what it kept of the player's own changes); for other kinds, what the game
+            // took from the mod (task md6: the game files it replaces, warnings about them).
             const std::vector<std::string> infos = m_manager->infoNotes(m.id);
             if (!infos.empty())
             {
-                rml += "<div id=\"mod-infonotes\">On your memory card:";
+                rml += std::string("<div id=\"mod-infonotes\">") + (m.kind == ps2x::mods::Kind::Data ? "On your memory card:" : "In the game:");
                 const size_t shown = std::min<size_t>(infos.size(), 5);
                 for (size_t i = 0; i < shown; ++i)
                     rml += "<div class=\"mod-notes-line\">" + text(infos[i]) + "</div>";

@@ -12,9 +12,13 @@
 #include "ps2_runtime.h"
 #include "ps2_settings.h"
 #include "runtime/ps2_card_activity.h"
+#include "Stubs/Helpers/RomOverride.h"
 #endif
 
+#include <algorithm>
 #include <atomic>
+#include <cctype>
+#include <set>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -110,6 +114,66 @@ namespace ps2x_host_mods
         private:
             ps2x::mods::Manager *m_manager;
         };
+
+        // Task md6 (docs/mod-layer.md "ROM files and model mods"): the session's `assets` mods' files under assets/rom/<archive path>
+        // replace that file of FPR.ROM. Every mod that has a path is offered, in load order, so a refused file falls back to the mod
+        // below it; the ROM layer decides (RomOverride.h) and sends its notes back here for the Mods tab.
+        void offerRomFiles(ps2x::mods::Manager *m)
+        {
+            static const std::string prefix = "assets/rom/";
+            const std::vector<std::string> order = m->sessionActive();
+            struct Offer
+            {
+                size_t order;
+                ps2x_rom_override::Candidate candidate;
+            };
+            std::vector<Offer> offers;
+            std::set<std::string> seen;
+            for (const auto &file : m->sessionFiles(prefix))
+            {
+                std::string archivePath = file.path.substr(prefix.size());
+                for (char &c : archivePath)
+                    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                if (archivePath.empty() || archivePath.back() == '/')
+                    continue;
+                for (const std::string &id : m->providers(file.path))
+                {
+                    if (!seen.insert(id + "|" + archivePath).second)
+                        continue;
+                    const auto info = m->find(id);
+                    if (!info || info->kind != ps2x::mods::Kind::Assets)
+                    {
+                        m->addRuntimeNote(id, file.path + ": not used; game files are replaced only by mods of kind \"assets\".");
+                        continue;
+                    }
+                    const size_t place = static_cast<size_t>(std::find(order.begin(), order.end(), id) - order.begin());
+                    ps2x_rom_override::Candidate c;
+                    c.path = archivePath;
+                    c.source = id;
+                    const std::string modPath = file.path;
+                    c.read = [m, id, modPath]() -> std::shared_ptr<const std::vector<uint8_t>>
+                    {
+                        auto data = m->readFile(id, modPath, 512ull * 1024 * 1024);
+                        if (!data)
+                            return nullptr;
+                        return std::make_shared<const std::vector<uint8_t>>(std::move(*data));
+                    };
+                    offers.push_back(Offer{place, std::move(c)});
+                }
+            }
+            if (offers.empty())
+                return;
+            std::stable_sort(offers.begin(), offers.end(), [](const Offer &a, const Offer &b) { return a.order < b.order; });
+            std::vector<ps2x_rom_override::Candidate> files;
+            for (Offer &o : offers)
+                files.push_back(std::move(o.candidate));
+            ps2x_rom_override::setModFiles(std::move(files), [m](const ps2x_rom_override::PlanNote &note) {
+                if (note.problem)
+                    m->addRuntimeNote(note.source, note.text);
+                else
+                    m->addInfoNote(note.source, note.text);
+            });
+        }
     }
 
     void initialize()
@@ -202,6 +266,7 @@ namespace ps2x_host_mods
                 std::fflush(stdout);
             }
             TexPack::SetDefaultSource(source);
+            offerRomFiles(h.manager.get());
         });
     }
 

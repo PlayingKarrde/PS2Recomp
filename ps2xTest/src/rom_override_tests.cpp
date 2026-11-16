@@ -517,6 +517,36 @@ void register_rom_override_tests()
             t.IsFalse(readCdSectors(entry.baseLbn + ro::kVirtualSectorBase + 500, 1, nothing.data(), nothing.size()),
                       "an unserved virtual sector is not invented");
 
+            // task md6: the same archive, a mod's file offered with no variable set: served from memory, notes to the sink
+            const Bytes modBytes = pattern(7000, 77);
+            ro::resetForTests(fs::path());
+            t.IsFalse(ro::enabled(), "off with no variable and no mods");
+            ro::Candidate c;
+            c.path = "yoneda/fprwaza.bin";
+            c.source = "test.mod";
+            auto bytes = std::make_shared<const Bytes>(modBytes);
+            c.read = [bytes]() { return bytes; };
+            std::vector<ro::PlanNote> notes;
+            ro::setModFiles({c}, [&notes](const ro::PlanNote &n) { notes.push_back(n); });
+            t.IsTrue(ro::enabled(), "on once a mod offers a file");
+
+            Bytes head(headerBytes);
+            t.IsTrue(readCdSectors(entry.baseLbn, 22, head.data(), head.size()), "read the header");
+            ro::Toc modToc;
+            t.IsTrue(ro::decodeToc(head.data(), head.size(), modToc, error), "the mod's header decodes: " + error);
+            const ro::TocFile *modWaza = find(modToc, "yoneda/fprwaza.bin");
+            t.IsTrue(modWaza && modWaza->size == 7000u && modWaza->sector == ro::kVirtualSectorBase, "the game is told the mod file's size and place");
+            Bytes gotMod(4 * 2048, 0xEE);
+            t.IsTrue(readCdSectors(entry.baseLbn + ro::kVirtualSectorBase, 4, gotMod.data(), gotMod.size()), "the mod's read succeeds");
+            t.IsTrue(std::equal(modBytes.begin(), modBytes.end(), gotMod.begin()), "and returns the mod's bytes");
+            bool replacesNote = false;
+            for (const ro::PlanNote &n : notes)
+                replacesNote = replacesNote || (n.source == "test.mod" && !n.problem && n.text == "Replaces yoneda/fprwaza.bin.");
+            t.IsTrue(replacesNote, "the sink heard which file the mod replaces");
+
+            ro::setModFiles({}, nullptr); // too late: the plan is built; it must not change
+            t.IsTrue(ro::currentPlanForTests().replacements.size() == 1, "files offered after the first read are not used");
+
             ro::resetForTests(fs::path());
             PS2Runtime::setIoPaths(saved);
             std::error_code ec;

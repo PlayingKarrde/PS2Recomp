@@ -1,6 +1,7 @@
 // Development aid (task a3): serve a file of FPR.ROM from a host folder, and log guest memory once per frame.
 // See RomOverride.h for what both are for and how they work.
 #include "RomOverride.h"
+#include "FprModelCheck.h"
 
 #include "game_overrides.h"
 #include "ps2_runtime.h"
@@ -13,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -228,62 +230,192 @@ namespace ps2x_rom_override
         return out;
     }
 
+    std::vector<Candidate> devCandidates(const std::map<std::string, std::filesystem::path> &hostFiles)
+    {
+        std::vector<Candidate> out;
+        for (const auto &kv : hostFiles)
+        {
+            Candidate c;
+            c.path = kv.first;
+            c.dev = true;
+            c.host = kv.second;
+            out.push_back(std::move(c));
+        }
+        return out;
+    }
+
     Plan makePlan(const Toc &toc, const std::map<std::string, std::filesystem::path> &hostFiles)
+    {
+        return makePlan(toc, devCandidates(hostFiles), OriginalReader());
+    }
+
+    namespace
+    {
+        std::string sourceName(const Candidate &c)
+        {
+            return c.dev ? "the development folder" : "the mod " + c.source;
+        }
+
+        // Reads a candidate's bytes (mods: out of the package; dev: the host file). Null when they cannot be read.
+        std::shared_ptr<const std::vector<uint8_t>> readCandidate(const Candidate &c)
+        {
+            if (!c.dev)
+                return c.read ? c.read() : nullptr;
+            std::ifstream in(c.host, std::ios::binary);
+            if (!in.is_open())
+                return nullptr;
+            return std::make_shared<std::vector<uint8_t>>((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        }
+    }
+
+    Plan makePlan(const Toc &toc, const std::vector<Candidate> &candidates, const OriginalReader &readOriginal)
     {
         Plan plan;
         std::set<std::string> used;
         uint32_t nextSector = kVirtualSectorBase;
+        auto note = [&plan](const Candidate &c, bool problem, const std::string &text)
+        {
+            plan.notes.push_back(PlanNote{c.dev ? std::string() : c.source, problem, text});
+        };
         for (const TocFile &f : toc.files)
         {
-            const auto it = hostFiles.find(f.path);
-            if (it == hostFiles.end())
+            // This path's candidates, the winner (the last one given) first.
+            std::vector<const Candidate *> offers;
+            for (auto it = candidates.rbegin(); it != candidates.rend(); ++it)
+            {
+                if (it->path == f.path)
+                    offers.push_back(&*it);
+            }
+            if (offers.empty())
                 continue;
             used.insert(f.path);
-            std::error_code ec;
-            const uint64_t size = std::filesystem::file_size(it->second, ec);
-            if (ec)
-            {
-                plan.log.push_back("REFUSED " + f.path + ": cannot read the size of " + it->second.string());
-                continue;
-            }
-            if (size == 0)
-            {
-                plan.log.push_back("REFUSED " + f.path + ": the replacement file is empty");
-                continue;
-            }
-            if (size > 0xFFFFFFFFull)
-            {
-                plan.log.push_back("REFUSED " + f.path + ": the replacement is larger than 4 GB");
-                continue;
-            }
+            const bool isModel = ps2x_fpr_model::isModelContainer(f.path);
             const uint64_t limit = knownLoadLimit(f.path);
-            if (limit != 0 && size > limit)
+            bool originalRead = false;
+            std::vector<uint8_t> original;
+            for (size_t k = 0; k < offers.size(); ++k)
             {
-                plan.log.push_back("REFUSED " + f.path + ": " + std::to_string(size) + " bytes is larger than the game's load buffer for this file (" +
-                                   std::to_string(limit) + " bytes); the game would overrun it");
-                continue;
+                const Candidate &c = *offers[k];
+                const std::string from = sourceName(c);
+                uint64_t size = 0;
+                std::shared_ptr<const std::vector<uint8_t>> bytes;
+                if (!c.dev)
+                {
+                    bytes = readCandidate(c);
+                    if (!bytes)
+                    {
+                        plan.log.push_back("REFUSED " + f.path + " from " + from + ": cannot read the file out of the mod");
+                        note(c, true, f.path + ": not used, the file could not be read out of the mod.");
+                        continue;
+                    }
+                    size = bytes->size();
+                }
+                else
+                {
+                    std::error_code ec;
+                    size = std::filesystem::file_size(c.host, ec);
+                    if (ec)
+                    {
+                        plan.log.push_back("REFUSED " + f.path + ": cannot read the size of " + c.host.string());
+                        continue;
+                    }
+                }
+                std::string refusal;
+                if (size == 0)
+                    refusal = "the replacement file is empty";
+                else if (size > 0xFFFFFFFFull)
+                    refusal = "the replacement is larger than 4 GB";
+                else if (limit != 0 && size > limit)
+                    refusal = std::to_string(size) + " bytes is larger than the game's load buffer for this file (" + std::to_string(limit) +
+                              " bytes); the game would overrun it";
+                std::vector<std::string> warnings;
+                if (refusal.empty() && isModel && c.dev)
+                {
+                    bytes = readCandidate(c);
+                    if (!bytes || bytes->size() != size)
+                        refusal = "cannot read the file from " + from;
+                }
+                if (refusal.empty() && isModel)
+                {
+                    if (!originalRead)
+                    {
+                        originalRead = true;
+                        if (!readOriginal || !readOriginal(f, original))
+                            original.clear();
+                    }
+                    const ps2x_fpr_model::Verdict v =
+                        ps2x_fpr_model::checkReplacement(f.path, original.data(), original.size(), bytes->data(), bytes->size());
+                    warnings = v.warnings;
+                    if (v.refused)
+                    {
+                        if (c.dev)
+                        {
+                            for (const std::string &p : v.problems)
+                                warnings.push_back("would be refused in a mod: " + p);
+                        }
+                        else
+                        {
+                            refusal = v.problems.front();
+                            for (size_t i = 1; i < v.problems.size(); ++i)
+                                refusal += " " + v.problems[i];
+                        }
+                    }
+                }
+                if (!refusal.empty())
+                {
+                    plan.log.push_back("REFUSED " + f.path + " from " + from + ": " + refusal);
+                    note(c, true, f.path + ": not used, " + refusal);
+                    continue;
+                }
+                Replacement r;
+                r.path = f.path;
+                r.source = c.dev ? std::string() : c.source;
+                if (c.dev)
+                    r.host = c.host;
+                else
+                    r.data = bytes;
+                r.originalSector = f.sector;
+                r.originalSize = f.size;
+                r.entryOffset = f.entryOffset;
+                r.newSize = static_cast<uint32_t>(size);
+                r.sectors = static_cast<uint32_t>((size + kSectorSize - 1) / kSectorSize);
+                r.virtualSector = nextSector;
+                nextSector += r.sectors + 1; // one empty sector between files
+                std::string line = "replacing " + f.path + " (" + std::to_string(f.size) + " -> " + std::to_string(size) + " bytes) with " +
+                                   (c.dev ? c.host.string() : "the file from the mod " + c.source);
+                if (!isModel && limit == 0 && size > f.size)
+                    line += "; WARNING: larger than the original and the game's buffer for it is unknown";
+                plan.log.push_back(std::move(line));
+                for (const std::string &w : warnings)
+                {
+                    plan.log.push_back("WARNING " + f.path + " from " + from + ": " + w);
+                    note(c, false, "Warning: " + f.path + ": " + w);
+                }
+                if (!isModel && limit == 0)
+                    note(c, false, f.path + ": not checked; the game's buffer for this file is unknown" +
+                                       std::string(size > f.size ? " and this file is larger than the game's." : "."));
+                else
+                    note(c, false, "Replaces " + f.path + ".");
+                // Mods further down the order that also have this file lose it to this one; both pages say so.
+                for (size_t j = k + 1; j < offers.size(); ++j)
+                {
+                    if (c.dev || offers[j]->dev)
+                        continue;
+                    note(*offers[j], false, f.path + ": also in " + c.source + ", which loads later and wins.");
+                    note(c, false, f.path + ": also in " + offers[j]->source + "; this mod loads later and wins.");
+                }
+                plan.replacements.push_back(std::move(r));
+                break;
             }
-            Replacement r;
-            r.path = f.path;
-            r.host = it->second;
-            r.originalSector = f.sector;
-            r.originalSize = f.size;
-            r.entryOffset = f.entryOffset;
-            r.newSize = static_cast<uint32_t>(size);
-            r.sectors = static_cast<uint32_t>((size + kSectorSize - 1) / kSectorSize);
-            r.virtualSector = nextSector;
-            nextSector += r.sectors + 1; // one empty sector between files
-            std::string line = "replacing " + f.path + " (" + std::to_string(f.size) + " -> " + std::to_string(size) + " bytes) with " +
-                               it->second.string();
-            if (limit == 0 && size > f.size)
-                line += "; WARNING: larger than the original and the game's buffer for it is unknown";
-            plan.log.push_back(std::move(line));
-            plan.replacements.push_back(std::move(r));
         }
-        for (const auto &kv : hostFiles)
+        std::set<std::string> said;
+        for (const Candidate &c : candidates)
         {
-            if (!used.count(kv.first))
-                plan.log.push_back("ignored " + kv.first + ": no such file in the archive");
+            if (used.count(c.path) || !said.insert(c.source + "|" + c.path).second)
+                continue;
+            plan.log.push_back("ignored " + c.path + ": no such file in the archive" + (c.dev ? "" : " (from the mod " + c.source + ")"));
+            if (!c.dev)
+                note(c, true, c.path + ": there is no such file in the game's archive.");
         }
         return plan;
     }
@@ -323,6 +455,12 @@ namespace ps2x_rom_override
                 continue;
             std::memset(dst, 0, bytes);
             const uint64_t offset = (sector - r.virtualSector) * kSectorSize;
+            if (r.data)
+            {
+                if (offset < r.data->size())
+                    std::memcpy(dst, r.data->data() + offset, static_cast<size_t>(std::min<uint64_t>(bytes, r.data->size() - offset)));
+                return true;
+            }
             std::ifstream in(r.host, std::ios::binary);
             if (!in.is_open())
                 return true; // zeros: the host file vanished; the log has said what was planned
@@ -341,8 +479,11 @@ namespace ps2x_rom_override
         struct State
         {
             std::mutex mutex;
-            std::atomic<int> mode{-1}; // -1 not decided, 0 off, 1 on
+            std::atomic<int> mode{-1}; // the development folder: -1 not decided, 0 off, 1 on
+            std::atomic<bool> haveMods{false};
             std::filesystem::path dir;
+            std::vector<Candidate> modFiles; // task md6: the mods' files, in load order
+            NoteSink sink;
             bool built = false;
             bool failed = false;
             uint32_t baseLbn = 0;
@@ -423,7 +564,30 @@ namespace ps2x_rom_override
                 say("cannot decode the archive's directory: " + error + "; the override is off");
                 return;
             }
-            s.plan = makePlan(s.toc, scanFolder(s.dir));
+            std::vector<Candidate> candidates = s.modFiles;
+            if (s.mode.load() == 1)
+            {
+                std::vector<Candidate> dev = devCandidates(scanFolder(s.dir));
+                candidates.insert(candidates.end(), dev.begin(), dev.end());
+            }
+            const OriginalReader readOriginal = [&romPath](const TocFile &f, std::vector<uint8_t> &bytes)
+            {
+                std::ifstream rom(romPath, std::ios::binary);
+                if (!rom.is_open())
+                    return false;
+                bytes.assign(f.size, 0);
+                rom.seekg(static_cast<std::streamoff>(uint64_t(f.sector) * kSectorSize), std::ios::beg);
+                return static_cast<bool>(rom.read(reinterpret_cast<char *>(bytes.data()), static_cast<std::streamsize>(bytes.size())));
+            };
+            s.plan = makePlan(s.toc, candidates, readOriginal);
+            if (s.sink)
+            {
+                for (const PlanNote &n : s.plan.notes)
+                {
+                    if (!n.source.empty())
+                        s.sink(n);
+                }
+            }
             s.served.assign(s.plan.replacements.size(), 0);
             say("archive directory decoded: " + std::to_string(s.toc.files.size()) + " files");
             for (const std::string &line : s.plan.log)
@@ -440,7 +604,23 @@ namespace ps2x_rom_override
         State &s = state();
         if (s.mode.load(std::memory_order_relaxed) == -1)
             decideMode(s);
-        return s.mode.load(std::memory_order_relaxed) == 1;
+        return s.mode.load(std::memory_order_relaxed) == 1 || s.haveMods.load(std::memory_order_relaxed);
+    }
+
+    void setModFiles(std::vector<Candidate> files, NoteSink sink)
+    {
+        State &s = state();
+        std::lock_guard<std::mutex> lock(s.mutex);
+        if (s.built)
+        {
+            say("the mods' files came after the archive was first read; they are not used this run");
+            return;
+        }
+        s.modFiles = std::move(files);
+        s.sink = std::move(sink);
+        s.haveMods.store(!s.modFiles.empty());
+        if (!s.modFiles.empty())
+            say(std::to_string(s.modFiles.size()) + " archive file(s) offered by mods");
     }
 
     void afterHostRead(const std::filesystem::path &hostPath, uint32_t baseLbn, uint64_t relativeSector, uint8_t *dst, size_t bytes)
@@ -476,7 +656,7 @@ namespace ps2x_rom_override
             if (rel >= r.virtualSector && rel < uint64_t(r.virtualSector) + r.sectors && i < s.served.size() && !s.served[i])
             {
                 s.served[i] = 1;
-                say("the game read " + r.path + " from " + r.host.string() + " (" + std::to_string(r.newSize) + " bytes, sector " +
+                say("the game read " + r.path + " from " + (r.data ? "the mod " + r.source : r.host.string()) + " ("+ std::to_string(r.newSize) + " bytes, sector " +
                     std::to_string(rel - r.virtualSector) + " of " + std::to_string(r.sectors) + " first)");
             }
         }
@@ -494,6 +674,9 @@ namespace ps2x_rom_override
         s.plan = Plan();
         s.served.clear();
         s.dir = dir;
+        s.modFiles.clear();
+        s.sink = nullptr;
+        s.haveMods.store(false);
         s.mode.store(dir.empty() ? 0 : 1);
     }
 
