@@ -1,0 +1,392 @@
+/*
+ * Greyblock: a deliberately plain look for UI proofs of concept (pages/match_settings.rml). Greys, one font, boxes with a word in
+ * them for pictures. It shows layout, hierarchy and flow only; the real look comes later from the design.
+ *
+ * Sizes are dp: 1 dp is one pixel in a 720 pixel high window (Overlay::setViewport scales by height, capped by width / 840).
+ * So a 16:9 window is 1280 dp wide, 4:3 is 960 dp, 21:9 is 1680 dp, and a portrait phone is about 840 dp wide.
+ *
+ * Responsive rules (media queries on the window's shape, not its size, so they hold at any resolution):
+ *   wide (wider than 3:2)      three columns: section list | corners and rows | preview card
+ *   standard (3:2 and below)   two columns: the section list goes (the section headings in the list remain)
+ *   portrait                   one column: the preview card goes; a one-line summary appears in the top bar instead
+ * The screen is at most 1600 dp wide and centred, so 21:9 and 32:9 do not stretch lines across the room.
+ */
+
+div { display: block; }
+
+body
+{
+    font-family: LatoLatin;
+    font-size: 19dp;
+    color: #e4e4e4;
+    background-color: #1b1b1b;
+    width: 100%;
+    height: 100%;
+}
+
+.k { color: #9a9a9a; }
+.hidden { display: none; }
+
+#screen
+{
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    max-width: 1600dp;
+    margin: 0 auto;
+    padding: 18dp 28dp 14dp 28dp;
+    box-sizing: border-box;
+}
+
+/* ---- Top bar: where you are, preset ------------------------------------------------------------------------------ */
+
+#topbar
+{
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    height: 40dp;
+    flex-shrink: 0;
+}
+#crumbs { font-size: 24dp; flex: 1; }
+#summary-line { display: none; }
+#preset
+{
+    padding: 6dp 14dp;
+    border: 1dp #555;
+    border-radius: 6dp;
+    background-color: #262626;
+}
+
+/* ---- Match type chips -------------------------------------------------------------------------------------------- */
+
+#types
+{
+    display: flex;
+    flex-direction: row;
+    flex-wrap: wrap;
+    flex-shrink: 0;
+    margin: 10dp 0 12dp 0;
+    padding: 4dp;
+    border: 2dp #1b1b1b;
+    border-radius: 8dp;
+}
+.chip
+{
+    padding: 7dp 16dp;
+    margin: 2dp 6dp 2dp 0;
+    border: 1dp #4a4a4a;
+    border-radius: 16dp;
+    background-color: #262626;
+    color: #bdbdbd;
+}
+.chip.selected { background-color: #d8d8d8; color: #141414; border-color: #d8d8d8; }
+
+/* ---- Three columns ----------------------------------------------------------------------------------------------- */
+
+#main
+{
+    display: flex;
+    flex-direction: row;
+    flex: 1;
+    min-height: 0;
+}
+
+#sections
+{
+    width: 190dp;
+    flex-shrink: 0;
+    margin-right: 18dp;
+}
+.nav
+{
+    padding: 9dp 12dp;
+    margin-bottom: 4dp;
+    border-left: 3dp #333;
+    color: #9a9a9a;
+}
+.nav .n { float: right; color: #6a6a6a; }
+.nav.current { border-left-color: #e4e4e4; color: #e4e4e4; background-color: #262626; }
+
+#center
+{
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-width: 0;
+}
+
+/* Corner cards */
+#corners
+{
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    flex-shrink: 0;
+    margin-bottom: 12dp;
+}
+.corner
+{
+    display: flex;
+    flex-direction: row;
+    flex: 1;
+    padding: 10dp;
+    border: 2dp #333;
+    border-radius: 8dp;
+    background-color: #242424;
+}
+.corner.blue { border-left: 8dp #59708a; }
+.corner.red { border-left: 8dp #8a5959; }
+.portrait
+{
+    width: 64dp;
+    height: 64dp;
+    flex-shrink: 0;
+    margin-right: 12dp;
+    border: 1dp #5a5a5a;
+    background-color: #333;
+    color: #777;
+    font-size: 12dp;
+    text-align: center;
+    line-height: 64dp;
+}
+.corner-text { flex: 1; }
+.corner-name { font-size: 20dp; }
+.corner-who { font-size: 14dp; color: #8a8a8a; }
+.corner-ctrl { margin-top: 4dp; white-space: nowrap; }
+.corner-ctrl .val { min-width: 56dp; }
+.vs { width: 56dp; text-align: center; color: #8a8a8a; font-size: 18dp; flex-shrink: 0; }
+
+/* The rows */
+#list
+{
+    flex: 1;
+    overflow-y: auto;
+    padding-right: 10dp;
+}
+.section-head
+{
+    margin: 14dp 0 6dp 0;
+    font-size: 14dp;
+    letter-spacing: 1.5dp;
+    color: #8a8a8a;
+    border-bottom: 1dp #333;
+    padding-bottom: 4dp;
+}
+.row
+{
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    height: 46dp;
+    padding: 0 12dp;
+    margin-bottom: 3dp;
+    border: 2dp #1b1b1b;
+    border-radius: 6dp;
+    background-color: #222;
+}
+.row-label { flex: 1; }
+.row-value { width: 220dp; text-align: center; }
+.val { display: inline-block; min-width: 140dp; text-align: center; }
+.arrow { color: #777; padding: 0 8dp; }
+.pips { width: 120dp; text-align: right; }
+.pip
+{
+    display: inline-block;
+    width: 7dp;
+    height: 7dp;
+    margin-left: 4dp;
+    border-radius: 4dp;
+    background-color: #444;
+}
+.pip.on { background-color: #d8d8d8; }
+.count { width: 120dp; text-align: right; color: #8a8a8a; font-size: 15dp; }
+.more { width: 70dp; text-align: right; color: #6a6a6a; font-size: 13dp; }
+.lock { width: 190dp; text-align: right; color: #7a7a7a; font-size: 14dp; }
+.row.locked { color: #8a8a8a; background-color: #1f1f1f; }
+.row.unverified .row-label { color: #b9a982; }
+
+/* Focus: one strong outline; the same for every focusable thing */
+.focused { border-color: #f2f2f2; background-color: #343434; }
+.row.locked.focused { background-color: #2a2a2a; }
+.corner.blue.focused { border-left-color: #59708a; }
+.corner.red.focused { border-left-color: #8a5959; }
+.focused .arrow { color: #f2f2f2; }
+
+/* ---- Preview card ------------------------------------------------------------------------------------------------ */
+
+#preview
+{
+    width: 330dp;
+    flex-shrink: 0;
+    margin-left: 18dp;
+    padding: 14dp;
+    border: 1dp #333;
+    border-radius: 8dp;
+    background-color: #212121;
+}
+#preview-title { font-size: 22dp; margin-bottom: 10dp; }
+.ph
+{
+    height: 160dp;
+    border: 1dp #5a5a5a;
+    background-color: #2e2e2e;
+    color: #7a7a7a;
+    text-align: center;
+    padding-top: 60dp;
+    box-sizing: border-box;
+    font-size: 15dp;
+}
+#preview-summary { margin-top: 12dp; color: #cfcfcf; }
+#preview-corners { margin-top: 6dp; color: #9a9a9a; }
+#preview-ring { margin-top: 14dp; }
+#preview-ref { margin-top: 10dp; }
+.face
+{
+    width: 48dp;
+    height: 48dp;
+    float: left;
+    margin-right: 10dp;
+    border: 1dp #5a5a5a;
+    background-color: #2e2e2e;
+    color: #777;
+    font-size: 10dp;
+    text-align: center;
+    line-height: 48dp;
+}
+
+/* ---- Footer: help, buttons, Continue ------------------------------------------------------------------------------ */
+
+#footer
+{
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    flex-shrink: 0;
+    height: 56dp;
+    margin-top: 10dp;
+    border-top: 1dp #333;
+}
+#help { flex: 1; color: #bdbdbd; font-size: 16dp; padding-right: 12dp; }
+#legend { color: #8a8a8a; font-size: 15dp; margin-right: 16dp; }
+.btn
+{
+    display: inline-block;
+    padding: 1dp 7dp;
+    margin: 0 4dp 0 10dp;
+    border: 1dp #6a6a6a;
+    border-radius: 4dp;
+    color: #d8d8d8;
+}
+#continue
+{
+    padding: 10dp 22dp;
+    border: 2dp #8a8a8a;
+    border-radius: 6dp;
+    background-color: #d8d8d8;
+    color: #141414;
+}
+#continue.focused { border-color: #ffffff; background-color: #ffffff; }
+
+/* ---- Picker for long lists ---------------------------------------------------------------------------------------- */
+
+#picker
+{
+    position: absolute;
+    left: 0;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    background-color: #000000b0;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+}
+#picker.hidden { display: none; }
+#picker-panel
+{
+    display: flex;
+    flex-direction: column;
+    width: 80%;
+    max-width: 1000dp;
+    height: 80%;
+    padding: 18dp;
+    border: 1dp #555;
+    border-radius: 10dp;
+    background-color: #202020;
+}
+#picker-title { font-size: 24dp; margin-bottom: 12dp; flex-shrink: 0; }
+#picker-list
+{
+    display: flex;
+    flex-direction: row;
+    flex-wrap: wrap;
+    flex: 1;
+    overflow-y: auto;
+    align-content: flex-start;
+}
+.pick
+{
+    width: 180dp;
+    margin: 0 10dp 10dp 0;
+    padding: 6dp;
+    border: 2dp #202020;
+    border-radius: 6dp;
+}
+.pick .thumb
+{
+    height: 90dp;
+    border: 1dp #5a5a5a;
+    background-color: #2e2e2e;
+    color: #777;
+    font-size: 13dp;
+    text-align: center;
+    line-height: 90dp;
+}
+.pick-name { margin-top: 6dp; text-align: center; font-size: 16dp; }
+.pick.current .pick-name { color: #ffffff; }
+.pick.current .thumb { border-color: #d8d8d8; }
+#picker-foot { flex-shrink: 0; margin-top: 10dp; color: #8a8a8a; font-size: 15dp; }
+
+/* ---- Scrollbars (RmlUi draws none by default) --------------------------------------------------------------------- */
+
+scrollbarvertical { width: 6dp; }
+scrollbarvertical slidertrack { background-color: #262626; border-radius: 3dp; }
+scrollbarvertical sliderbar { width: 6dp; min-height: 24dp; background-color: #5a5a5a; border-radius: 3dp; }
+scrollbarvertical sliderarrowinc, scrollbarvertical sliderarrowdec { width: 0; height: 0; }
+
+/* ---- Window shapes ------------------------------------------------------------------------------------------------ */
+
+/* Standard (4:3, 5:4, 3:2): no section list; a narrower preview. */
+@media (max-aspect-ratio: 3/2)
+{
+    #sections { display: none; }
+    #preview { width: 260dp; }
+    .ph { height: 120dp; padding-top: 42dp; }
+    .row-value { width: 200dp; }
+    .val { min-width: 120dp; }
+    .pips { width: 100dp; }
+    .lock { width: 150dp; }
+}
+
+/* Portrait (phones, tablets held upright): one column. The preview card goes; its one line moves to the top bar. */
+@media (orientation: portrait)
+{
+    #screen { padding: 14dp 16dp 10dp 16dp; }
+    #topbar { display: block; position: relative; height: 66dp; }
+    #crumbs { font-size: 22dp; }
+    #preset { position: absolute; right: 0; top: 0; }
+    #summary-line { display: block; margin-top: 6dp; font-size: 15dp; color: #9a9a9a; }
+    #preview { display: none; }
+    #sections { display: none; }
+    .corner { padding: 8dp; }
+    .portrait { width: 48dp; height: 48dp; line-height: 48dp; }
+    .vs { width: 36dp; }
+    #legend { display: none; }
+    .more { display: none; }
+    .pips { width: 90dp; }
+    .row-value { width: 190dp; }
+    .val { min-width: 110dp; }
+    .pick { width: 46%; }
+    #picker-panel { width: 92%; height: 86%; }
+}

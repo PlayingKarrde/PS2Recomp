@@ -77,6 +77,7 @@ FetchContent_MakeAvailable(rmlui)
 add_library(ps2_ui STATIC
     ui_game_menu.cpp
     ui_input.cpp
+    ui_match_settings.cpp
     ui_overlay.cpp
     ui_render_sdlgpu.cpp
     ui_settings.cpp

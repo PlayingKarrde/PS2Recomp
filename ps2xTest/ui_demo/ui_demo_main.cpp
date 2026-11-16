@@ -33,6 +33,9 @@
 //   --virtual-pad drive the script's controller steps through an SDL virtual gamepad (SDL_AttachVirtualJoystick), so
 //                 the events come out of SDL's own gamepad layer, not pushed by this program.
 //   --page FILE   show another page of the asset folder (default pages/settings.rml) without the settings behaviour.
+//   --match-settings  the greyblock match settings hub (pages/match_settings.rml, ui_match_settings.h), a UI proof of concept
+//                 not connected to the game. --expect understands its values (rule, time, ring..., type, preset, blue, red, focus,
+//                 picker, summary, visible-rows) and rect:SELECTOR. Escape / B on the page ends the run (Back).
 //   --menu        show the game's settings menu (pages/game_settings.rml, ui_game_menu.h) with a stand-in for the game side,
 //                 instead of the demo page. --set k=v,... gives starting values, --startup k=v,... what the "running game"
 //                 started with (a different current value then shows RESTART), --env-lock k=NAME,... settings fixed by an
@@ -71,6 +74,7 @@
 #include "mod_manager.h"
 #endif
 #include "ui_game_menu.h"
+#include "ui_match_settings.h"
 #include "ui_overlay.h"
 #include "ui_render_sdlgpu.h"
 #include "ui_settings.h"
@@ -122,6 +126,7 @@ namespace
         bool breakScissor = false; // --validation-selftest
         bool virtualPad = false;   // --virtual-pad
         bool menu = false;         // --menu
+        bool match = false;        // --match-settings
         std::string menuSet, menuStartup, menuEnvLock, quitBlocked, cardLine, cardButtons, devLine, loadNow, restartBlocked;
         bool noRestart = false;
         std::string modsDir, modsState;
@@ -443,7 +448,7 @@ namespace
         std::map<std::string, std::string> values{{"renderer", "gpu"},   {"resolution", "1"}, {"aspect", "4:3"}, {"fullscreen", "off"},
                                                   {"vsync", "off"},      {"filter", "sharp"},  {"volume", "100"},  {"texture_tools", "off"},
                                                   {"skip_intros", "off"}, {"fx", "off"},    {"fx_preset", "subtle"}, {"strike_depth", "original"},
-                                                  {"fx_bloom", "on"}, {"fx_grading", "on"}, {"fx_tiltshift", "on"}, {"fx_vignette", "on"}};
+                                                  {"fx_bloom", "on"}, {"fx_grading", "on"}, {"fx_tiltshift", "on"}, {"fx_vignette", "on"}, {"light", "off"}};
         std::map<std::string, std::string> startup;
         std::map<std::string, std::string> env;
         bool closeAsked = false;
@@ -550,6 +555,7 @@ namespace
         Overlay *overlayPtr = &ownOverlay; // the menu's overlay in --menu mode
         Overlay &overlay() { return *overlayPtr; }
         SettingsPage page;
+        MatchSettingsPage match;
         Picture picture;
         Rml::ElementDocument *document = nullptr;
         GameMenu menu;
@@ -1103,6 +1109,8 @@ int main(int argc, char **argv)
             opt.breakScissor = true;
         else if (a == "--virtual-pad")
             opt.virtualPad = true;
+        else if (a == "--match-settings")
+            opt.match = true;
         else if (a == "--page" && i + 1 < argc)
             opt.page = next();
         else if (a == "--menu")
@@ -1294,7 +1302,7 @@ int main(int argc, char **argv)
     }
     else
     {
-        d.document = d.overlay().loadPage(opt.page);
+        d.document = d.overlay().loadPage(opt.match ? std::string("pages/match_settings.rml") : opt.page);
         if (!d.document)
             return 2;
         d.overlay().setVisible(true);
@@ -1323,8 +1331,18 @@ int main(int argc, char **argv)
         std::printf("back\n");
         d.backPressed = true;
     });
+    if (opt.match)
+    {
+        if (!d.match.attach(d.document))
+            return 2;
+        d.match.setOnBack([&]() {
+            std::printf("back\n");
+            d.backPressed = true;
+        });
+        d.match.setOnContinue([&](const std::string &summary) { std::printf("continue: %s\n", summary.c_str()); });
+    }
     // Another page (--page) is just shown: it has none of the settings page's rows to wire up.
-    if (!opt.menu && opt.page == "pages/settings.rml")
+    else if (!opt.menu && opt.page == "pages/settings.rml")
     {
         if (!d.page.attach(d.document))
             return 2;
@@ -1373,6 +1391,25 @@ int main(int argc, char **argv)
                 const std::string key = item.substr(0, eq);
                 const std::string want = item.substr(eq + 1);
                 std::string got = opt.menu ? d.fake.values[key] : d.page.value(key);
+                if (opt.match)
+                {
+                    got = d.match.value(key);
+                    if (key.compare(0, 5, "rect:") == 0)
+                    {
+                        Rml::Element *element = findElement(d, key.substr(5));
+                        if (!element || element->GetClientWidth() <= 0.0f)
+                            got = "(none)";
+                        else
+                        {
+                            const Rml::Vector2f at = element->GetAbsoluteOffset(Rml::BoxArea::Border);
+                            const Rml::Vector2f size = element->GetBox().GetSize(Rml::BoxArea::Border);
+                            char text[96];
+                            std::snprintf(text, sizeof(text), "%d %d %d %d", static_cast<int>(std::lround(at.x)), static_cast<int>(std::lround(at.y)),
+                                          static_cast<int>(std::lround(size.x)), static_cast<int>(std::lround(size.y)));
+                            got = text;
+                        }
+                    }
+                }
                 if (opt.menu && (key.compare(0, 5, "rect:") == 0 || key == "scale" || key == "focus" || key == "confirm" || key == "quit-locked" || key == "help" || key == "tab" ||
                                  key == "mod-confirm" || key == "selected-mod" || key == "mods-status" || key == "mod-title" ||
                                  key == "mod-problem" || key == "restart-note" || key == "mods-card" || key == "back-card" || key == "keep-card" ||
@@ -1439,6 +1476,7 @@ int main(int argc, char **argv)
         status = 1;
 
     d.page.detach();
+    d.match.detach();
     d.overlay().renderer().ReleaseGeometry(d.picture.quad);
     d.overlay().renderer().ReleaseGeometry(d.picture.shade);
     d.overlay().renderer().ReleaseTexture(d.picture.texture);

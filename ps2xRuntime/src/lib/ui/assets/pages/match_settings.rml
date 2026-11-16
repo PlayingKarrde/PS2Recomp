@@ -1,0 +1,52 @@
+<rml>
+<head>
+    <title>Match Setup</title>
+    <link type="text/rcss" href="../theme/greyblock.rcss"/>
+</head>
+<body>
+    <!-- Greyblock proof of concept of the match settings hub (ui_match_settings.h). Static frame here; the chips, the corner
+         cards, the rows, the section list and the preview are filled in by MatchSettingsPage. Grey boxes with a word in them
+         stand for pictures (venue, referee, wrestler). -->
+    <div id="screen">
+        <div id="topbar">
+            <div id="crumbs"><span class="k">Exhibition</span> / Match setup</div>
+            <div id="summary-line"></div>
+            <div id="preset"></div>
+        </div>
+
+        <div id="types"></div>
+
+        <div id="main">
+            <div id="sections"></div>
+            <div id="center">
+                <div id="corners"></div>
+                <div id="list"></div>
+            </div>
+            <div id="preview">
+                <div id="preview-title"></div>
+                <div id="preview-venue" class="ph"></div>
+                <div id="preview-summary"></div>
+                <div id="preview-corners"></div>
+                <div id="preview-ring"></div>
+                <div id="preview-ref"></div>
+            </div>
+        </div>
+
+        <div id="footer">
+            <div id="help"></div>
+            <div id="legend">
+                <span class="btn">A</span> Change <span class="btn">B</span> Back <span class="btn">LB/RB</span> Match type
+            </div>
+            <div id="continue">Continue &gt;</div>
+        </div>
+
+        <div id="picker" class="hidden">
+            <div id="picker-panel">
+                <div id="picker-title"></div>
+                <div id="picker-list"></div>
+                <div id="picker-foot"><span class="btn">A</span> Choose <span class="btn">B</span> Cancel</div>
+            </div>
+        </div>
+    </div>
+</body>
+</rml>
