@@ -1428,8 +1428,8 @@ void register_data_pack_tests()
             const std::string cut = shortenPath(win, 40);
             t.IsTrue(textLength(cut) <= 40 && cut.rfind("C:\\Users\\...", 0) == 0, "Windows path: " + cut);
             t.Equals(cut, std::string("C:\\Users\\...\\FPWR-Recomp\\FPWR\\mods"), "the start and whole folders from the end are kept: " + cut);
-            const std::string unix = "/home/sethp/.local/share/FPWR-Recomp/FPWR/mods";
-            t.Equals(shortenPath(unix, 37), std::string("/home/sethp/.../FPWR-Recomp/FPWR/mods"), "Unix path");
+            const std::string unixPath = "/home/sethp/.local/share/FPWR-Recomp/FPWR/mods";
+            t.Equals(shortenPath(unixPath, 37), std::string("/home/sethp/.../FPWR-Recomp/FPWR/mods"), "Unix path");
             for (size_t limit = 12; limit < textLength(win); ++limit)
                 t.IsTrue(textLength(shortenPath(win, limit)) <= limit, "never longer than the limit " + std::to_string(limit) + ": " + shortenPath(win, limit));
             // one very long folder name: its end is kept

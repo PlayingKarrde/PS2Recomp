@@ -29,6 +29,7 @@
 //
 // No game code and no SDL headers here, so it can be unit-tested. (The default path uses SDL_GetPrefPath in the .cpp.)
 
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <vector>
