@@ -8,9 +8,12 @@ and this script compiles it three times. The results are committed to the reposi
 `compiled/`, so building the game or the tests never needs a shader compiler. Run this script only
 when you change a `.hlsl` file, then commit the changed headers together with it.
 
-What it does, for every `<name>.vert.hlsl` and `<name>.frag.hlsl` in this folder:
-  1. DXIL:   Windows SDK `dxc -T vs_6_0|ps_6_0 -E main`. The Windows SDK build ships `dxil.dll`, which
-             signs the result; Direct3D 12 refuses unsigned DXIL. That build cannot write SPIR-V.
+What it does, for every `<name>.vert.hlsl` and `<name>.frag.hlsl` in this folder (or only the ones
+named with `--only`):
+  1. DXIL:   a `dxc` that can sign, `dxc -T vs_6_0|ps_6_0 -E main`. Direct3D 12 refuses unsigned DXIL.
+             On Windows that is the Windows SDK build (it ships `dxil.dll`, which signs; it cannot
+             write SPIR-V). On Linux it is Microsoft's DirectXShaderCompiler release, whose `dxc`
+             finds `libdxil.so` beside its own library.
   2. SPIR-V: Vulkan SDK `dxc -spirv -fspv-target-env=vulkan1.0 -T ... -E main`.
   3. MSL:    Vulkan SDK `spirv-cross --msl --msl-version 20100` applied to the SPIR-V from step 2.
              spirv-cross renames the entry point `main` to `main0`; the script reads the real name
@@ -31,15 +34,38 @@ SDL_CreateGPUShader): vertex shaders use space0 for textures/storage and space1 
 buffers, fragment shaders use space2 and space3. dxc turns "spaceN" into SPIR-V descriptor set N, so
 the same source satisfies DXIL and SPIR-V.
 
-The output is byte-for-byte reproducible (no timestamps or paths), which is what `--check` relies on:
-it recompiles everything into a temporary folder and exits with status 1 if any committed header
-differs, is missing, or has no matching shader. Status 2 means a tool is missing or failed.
+The output is byte-for-byte reproducible for one set of tools (no timestamps or paths), which is what
+`--check` relies on. Another build of the same compiler gives other bytes for the same source, and
+the headers in `compiled/` were not all made on one machine: every header records the versions of the
+three tools that made it. So `--check` works header by header:
+  - a header made by exactly the tools found now is compiled again and must match byte for byte;
+  - a header made by other tools is listed as "built by another toolchain, not compared". That is not
+    a failure, but it is also no proof that the header is up to date with its source: only its
+    resource counts are compared with the `// @key N` lines of the source;
+  - a shader with no header, and a header with no shader, are failures.
+It exits with status 1 on any failure. Status 2 means a tool is missing or failed.
+
+`--only NAME [NAME...]` compiles and writes just those shaders, named by source file
+(`postfx_rim.frag.hlsl`; `postfx_rim.frag` and `postfx_rim_frag` are accepted too). Use it on a
+machine whose tools differ from the ones that built the committed headers, so that the headers of
+shaders you did not touch keep their bytes. You must name every shader whose own source or whose
+included `.hlsli` changed: the script cannot tell for you.
+
+Where the tools are looked for (an explicit argument wins, then these, then PATH):
+  Windows  DXIL    the Windows SDK's dxc.exe (DEFAULT_WINDOWS_SDK_DXC below)
+           SPIR-V  %VULKAN_SDK% or DEFAULT_VULKAN_SDK_ROOT below (Bin/dxc.exe, Bin/spirv-cross.exe)
+  Linux    DXIL    ~/sdk/dxc-1.8.2502/bin/dxc   (Microsoft's release; signs through libdxil.so)
+           SPIR-V  $VULKAN_SDK or ~/sdk/vulkan/1.4.357.0/x86_64 (bin/dxc, bin/spirv-cross)
+On Linux each `dxc` finds its own `libdxcompiler.so` through its RPATH. LD_LIBRARY_PATH must not point
+at either: both would then load the same library, the wrong one for one of them. The script takes
+LD_LIBRARY_PATH out of the environment of the tools it runs for that reason.
 
 Uses the Python standard library only.
 
 Examples:
-    python build_shaders.py            # rebuild compiled/*.h
-    python build_shaders.py --check    # verify the committed headers are up to date
+    python build_shaders.py                                   # rebuild every compiled/*.h
+    python build_shaders.py --only postfx_rim.frag.hlsl       # rebuild one
+    python build_shaders.py --check                           # verify the committed headers
 """
 
 import argparse
@@ -64,6 +90,9 @@ COUNT_KEYS = ("samplers", "storage_textures", "storage_buffers", "uniform_buffer
 # Defaults named in the task brief; used only when the file exists, otherwise PATH is searched.
 DEFAULT_WINDOWS_SDK_DXC = r"C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\dxc.exe"
 DEFAULT_VULKAN_SDK_ROOT = r"C:\VulkanSDK\1.4.363.0"
+# Linux (installed outside the repository; see the module docstring).
+DEFAULT_LINUX_DXIL_DXC = os.path.join(os.path.expanduser("~"), "sdk", "dxc-1.8.2502", "bin", "dxc")
+DEFAULT_LINUX_VULKAN_SDK_ROOT = os.path.join(os.path.expanduser("~"), "sdk", "vulkan", "1.4.357.0", "x86_64")
 
 MSL_VERSION = "20100"  # MSL 2.1, the oldest version SDL's Metal backend targets (macOS 10.14)
 
@@ -92,7 +121,7 @@ def find_tool(explicit, candidates, path_name):
 
 
 def vulkan_sdk_candidates(tool):
-    roots = [os.environ.get("VULKAN_SDK"), DEFAULT_VULKAN_SDK_ROOT]
+    roots = [os.environ.get("VULKAN_SDK"), DEFAULT_VULKAN_SDK_ROOT if os.name == "nt" else DEFAULT_LINUX_VULKAN_SDK_ROOT]
     out = []
     for r in roots:
         if r:
@@ -101,8 +130,15 @@ def vulkan_sdk_candidates(tool):
     return out
 
 
+def tool_env():
+    """The environment the tools run in: ours without LD_LIBRARY_PATH (each dxc must find its own library, see the docstring)."""
+    env = dict(os.environ)
+    env.pop("LD_LIBRARY_PATH", None)
+    return env
+
+
 def run(cmd, cwd):
-    proc = subprocess.run(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace")
+    proc = subprocess.run(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace", env=tool_env())
     if proc.returncode != 0:
         raise ToolError(f"command failed ({proc.returncode}): {' '.join(cmd)}\n{proc.stdout}{proc.stderr}")
     return proc.stdout + proc.stderr
@@ -110,7 +146,7 @@ def run(cmd, cwd):
 
 def tool_version(cmd):
     """First useful line of the tool's version output, flattened to one line."""
-    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace", env=tool_env())
     lines = [ln.strip() for ln in proc.stdout.splitlines() if ln.strip()]
     if not lines:
         raise ToolError(f"{' '.join(cmd)}: no version output")
@@ -250,11 +286,61 @@ def discover(shader_dir):
     return found
 
 
-def build_all(shader_dir, out_dir, tools, versions):
-    """Write every header into out_dir; returns the list of header file names written."""
+def header_name(path):
+    """compiled/<this> for a source path: smoke.vert.hlsl -> smoke_vert.h"""
+    return os.path.basename(path)[:-len(".hlsl")].replace(".", "_") + ".h"
+
+
+def select_only(sources, names):
+    """The sources named by --only (file name, with or without .hlsl, or the header's stem). Unknown names are an error."""
+    by_key = {}
+    for path, stage in sources:
+        base = os.path.basename(path)
+        stem = base[:-len(".hlsl")]
+        for key in (base, stem, stem.replace(".", "_"), stem.replace(".", "_") + ".h"):
+            by_key[key] = (path, stage)
+    chosen = []
+    for n in names:
+        if n not in by_key:
+            raise ToolError(f"--only {n}: no such shader (expected a name like {os.path.basename(sources[0][0])})")
+        if by_key[n] not in chosen:
+            chosen.append(by_key[n])
+    return chosen
+
+
+def header_tools(path):
+    """The three tool version strings a committed header records, as header_text wrote them (None for a line that is missing)."""
+    found = {"dxc_dxil": None, "dxc_spirv": None, "spirv_cross": None}
+    labels = {"DXIL": "dxc_dxil", "SPIR-V": "dxc_spirv", "MSL": "spirv_cross"}
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for _ in range(12):
+            line = f.readline()
+            m = re.match(r"^//\s+(DXIL|SPIR-V|MSL)\s*:\s(.*)$", line.rstrip("\r\n"))
+            if m:
+                value = m.group(2)
+                if m.group(1) == "MSL":
+                    value = re.sub(r" \(entry point renamed by spirv-cross to \"\w+\"\)$", "", value)
+                found[labels[m.group(1)]] = value
+    return found
+
+
+def header_counts(path):
+    """The resource counts a committed header holds (the four '    N, // samplers' lines)."""
+    counts = {}
+    names = {"samplers": "samplers", "storage textures": "storage_textures", "storage buffers": "storage_buffers", "uniform buffers": "uniform_buffers"}
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            m = re.match(r"^\s+(\d+), // (samplers|storage textures|storage buffers|uniform buffers)\s*$", line)
+            if m:
+                counts[names[m.group(2)]] = int(m.group(1))
+    return counts
+
+
+def build_all(shader_dir, out_dir, tools, versions, sources=None):
+    """Write the header of every source (or of `sources`) into out_dir; returns the list of header file names written."""
     os.makedirs(out_dir, exist_ok=True)
     written = []
-    for path, stage in discover(shader_dir):
+    for path, stage in (discover(shader_dir) if sources is None else sources):
         base = os.path.basename(path)
         stem = base[:-len(".hlsl")]
         name = stem.replace(".", "_")
@@ -283,7 +369,11 @@ def main():
     ap.add_argument("--shader-dir", default=HERE, help="folder with the .hlsl sources (default: this folder)")
     ap.add_argument("--out-dir", default=None, help="where the headers go (default: <shader-dir>/compiled)")
     ap.add_argument("--check", action="store_true",
-                    help="recompile into a temporary folder; exit 1 if a committed header differs")
+                    help="verify the committed headers: recompile the ones this machine's tools built and compare; "
+                         "list the ones another toolchain built; exit 1 if one differs, is missing or has no shader")
+    ap.add_argument("--only", nargs="+", metavar="NAME",
+                    help="compile and write only these shaders (source names, e.g. postfx_rim.frag.hlsl). "
+                         "Name every shader whose source or included .hlsli changed")
     args = ap.parse_args()
 
     shader_dir = os.path.abspath(args.shader_dir)
@@ -291,7 +381,7 @@ def main():
 
     try:
         tools = {
-            "dxc_dxil": find_tool(args.dxc_dxil, [DEFAULT_WINDOWS_SDK_DXC], "dxc"),
+            "dxc_dxil": find_tool(args.dxc_dxil, [DEFAULT_WINDOWS_SDK_DXC if os.name == "nt" else DEFAULT_LINUX_DXIL_DXC], "dxc"),
             "dxc_spirv": find_tool(args.dxc_spirv, vulkan_sdk_candidates("dxc"), "dxc"),
             "spirv_cross": find_tool(args.spirv_cross, vulkan_sdk_candidates("spirv-cross"), "spirv-cross"),
         }
@@ -310,28 +400,43 @@ def main():
         if not sources:
             raise ToolError(f"no *.vert.hlsl or *.frag.hlsl files in {shader_dir}")
 
+        if args.only:
+            sources = select_only(sources, args.only)
+
         if not args.check:
-            build_all(shader_dir, out_dir, tools, versions)
+            build_all(shader_dir, out_dir, tools, versions, sources)
             return 0
 
+        # --check, header by header: compared byte for byte when this machine's tools are the ones that built it.
+        problems, same_tools, other_tools = [], [], []
+        for path, stage in sources:
+            name = header_name(path)
+            committed = os.path.join(out_dir, name)
+            if not os.path.isfile(committed):
+                problems.append(f"missing: {committed}")
+                continue
+            if header_tools(committed) == versions:
+                same_tools.append((path, stage))
+            else:
+                other_tools.append(name)
+                if header_counts(committed) != parse_counts(path):
+                    problems.append(f"resource counts differ from the source's: {committed}")
         with tempfile.TemporaryDirectory(prefix="ps2x_shader_check_") as tmp:
-            written = set(build_all(shader_dir, tmp, tools, versions))
-            problems = []
-            for name in sorted(written):
-                committed = os.path.join(out_dir, name)
-                if not os.path.isfile(committed):
-                    problems.append(f"missing: {committed}")
-                elif read_normalised(committed) != read_normalised(os.path.join(tmp, name)):
-                    problems.append(f"differs: {committed}")
-            if os.path.isdir(out_dir):
-                for name in sorted(os.listdir(out_dir)):
-                    if name.endswith(".h") and name not in written:
-                        problems.append(f"stale (no matching .hlsl): {os.path.join(out_dir, name)}")
-            if problems:
-                print("CHECK FAILED:\n  " + "\n  ".join(problems))
-                return 1
-            print(f"CHECK OK: {len(written)} header(s) match a fresh build")
-            return 0
+            for name in sorted(build_all(shader_dir, tmp, tools, versions, same_tools)):
+                if read_normalised(os.path.join(out_dir, name)) != read_normalised(os.path.join(tmp, name)):
+                    problems.append(f"differs: {os.path.join(out_dir, name)}")
+        if os.path.isdir(out_dir) and not args.only:
+            expected = {header_name(path) for path, _ in sources}
+            for name in sorted(os.listdir(out_dir)):
+                if name.endswith(".h") and name not in expected:
+                    problems.append(f"stale (no matching .hlsl): {os.path.join(out_dir, name)}")
+        if other_tools:
+            print(f"built by another toolchain, not compared ({len(other_tools)}): " + ", ".join(sorted(other_tools)))
+        if problems:
+            print("CHECK FAILED:\n  " + "\n  ".join(problems))
+            return 1
+        print(f"CHECK OK: {len(same_tools)} header(s) match a fresh build; {len(other_tools)} built by another toolchain, not compared")
+        return 0
     except ToolError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2

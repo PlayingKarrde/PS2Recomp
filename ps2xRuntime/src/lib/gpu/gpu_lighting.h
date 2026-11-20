@@ -233,18 +233,53 @@ namespace ps2x_lighting
     constexpr size_t kMaxMaterials = 256;
 
 
+    // ---- wrestler shape (task lt3-T1; docs/hd-lighting-tier3.md in the game's repository). A wrestler is flat pictures ("cards"), so
+    // the lights can only tint him by where he stands. With these values above 0 the renderer also takes the outline of the whole
+    // wrestler on the screen, lets the surface lean outward near it as a rounded body would, and lights that (wrestlerShapeAt below).
+    // The built-in values, which a look file without these lines gets too:
+    constexpr float kWrestlerShape = 1.0f;   // how much of the shaped light replaces today's tint by position (0 = today's picture)
+    constexpr float kWrestlerRim = 0.8f;     // how strong the extra edge of light is on the side of the outline that faces a light
+    constexpr float kWrestlerOutline = 2.4f; // how wide the rounded edge is, in texels of the wrestler's own pictures (the blur's sigma)
+    constexpr float kWrestlerLean = 0.92f;   // how far the surface leans at the very outline (1 would be edge-on)
+    constexpr float kWrestlerWrap = 0.5f;    // how far a light reaches past the edge of what faces it
+
     // A look: what multiplies the game's own colours. Ambient 1 and no lights leaves the picture as the game drew it.
     struct Look
     {
         float ambient[3] = {1.0f, 1.0f, 1.0f};
         std::vector<Light> lights;
         std::vector<MaterialEntry> materials; // per texture (below); the built-in table applies as well
+        // Wrestler shape (above). Look file lines "wrestler_shape <n>", "wrestler_rim <n>", "wrestler_outline <n>".
+        float wrestlerShape = kWrestlerShape;     // 0 to 1
+        float wrestlerRim = kWrestlerRim;         // 0 to 4
+        float wrestlerOutline = kWrestlerOutline; // 0.5 to 8 texels
     };
+
+    // True when the look asks for wrestler shape at all. With both strengths at 0 the renderer does none of the work and the lit
+    // picture is exactly the one of tier 2.
+    inline bool wrestlerShapeWanted(const Look &look)
+    {
+        return look.wrestlerShape > 0.0f || look.wrestlerRim > 0.0f;
+    }
 
     // What one light adds at a point (not multiplied by the surface colour): colour x strength x falloff x cone x facing.
     void lightAt(const Light &light, const float position[3], const float normal[3], Facing facing, float out[3]);
     // The whole look at a point: ambient plus every light.
     void lookAt(const Look &look, const float position[3], const float normal[3], Facing facing, float out[3]);
+
+    // What the shape pass adds to the light of one wrestler pixel (the reference for shaders/postfx_rim.frag.hlsl; not multiplied by
+    // the pixel's share). `position` is the pixel's place in the arena and `eye` the camera's; `outX`, `outY` say which way the
+    // wrestler's outline lies on the screen (a unit vector, y down the screen; 0, 0 when there is none) and `lean` how far the surface
+    // tips that way (0 well inside the wrestler, kWrestlerLean on his outline). `rightSign` is +1 when cross(up, view direction)
+    // points to the right of the screen and -1 when to the left (the renderer works it out from the camera).
+    //   N       the camera's view of a flat-on surface, tipped by `lean` towards (outX, outY) in the screen's plane
+    //   shaped  ambient + sum of light x wrap(N.L) x gain, wrap(x) = clamp((x + 1/2) / (3/2)); the gain is 1 / wrap of a flat-on
+    //           surface under the look's first light that is on, so that surface keeps exactly today's brightness
+    //   rim     sum of light x max(N2.L, 0) x lean^2, N2 the outward direction lying in the screen's plane
+    //   out     wrestlerShape x (shaped - today's light by position) + wrestlerRim x rim
+    void wrestlerShapeAt(const Look &look, const float position[3], const double eye[3], float outX, float outY, float lean, float rightSign, float out[3]);
+    // PS2X_LIGHT_SHAPE=<shape>[,<rim>[,<outline>]] (a test aid): fixes those values whatever the look says. True when it is set.
+    bool wrestlerShapeFromEnvironment(Look &look);
 
     // ---- which rule a primitive gets (task lt2-L1). One table, so that later steps (materials by texture, L3) extend it in one place.
     // What the renderer knows about a scene primitive when it decides (GSGpuBackend::Impl::submit).
@@ -310,6 +345,7 @@ namespace ps2x_lighting
         float ambient[4];                // rgb, the number of lights that follow
         float rule[4];                   // x: the draw's mode (0 Lambert, 1 half, 2 position only, 3 a fixed light of 1 + glow), y: 1 = draw the
                                          // markers ("show lights"), z: how much of the lighting the draw takes (1 = all), w: its glow
+                                         // (a wrestler card drawn with shape, mode 2: w is its mask channel, 1 to 4; gs_card.hlsli)
         float position[kMaxLights][4];   // xyz, range
         float axis[kMaxLights][4];       // spot: the unit direction it points in; w: intensity
         float colour[kMaxLights][4];     // rgb, w: 1 spot, 0 point
@@ -328,6 +364,7 @@ namespace ps2x_lighting
     //       intensity 0.9
     //       cone 24 38
     //       range 2000
+    //     wrestler_shape 1          (optional, with wrestler_rim and wrestler_outline: the shape of the wrestlers, see Look)
     // `#` starts a comment. A light is `light spot|point [on|off]` and the lines after it; every field is optional. Numbers out of range
     // are clamped. Anything else (no `look 1` line, an unknown word, a missing or broken number, more than 8 lights) makes the whole
     // text bad: parseLook returns false with a reason and leaves `look` alone.

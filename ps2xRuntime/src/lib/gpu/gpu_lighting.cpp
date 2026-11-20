@@ -661,6 +661,89 @@ namespace ps2x_lighting
         return choice;
     }
 
+    void wrestlerShapeAt(const Look &look, const float position[3], const double eye[3], float outX, float outY, float lean, float rightSign, float out[3])
+    {
+        out[0] = out[1] = out[2] = 0.0f;
+        const auto dot = [](const float a[3], const float b[3]) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; };
+        const auto normalise = [&](float v[3]) {
+            const float length = std::sqrt(dot(v, v));
+            if (length > 0.0f)
+                for (int i = 0; i < 3; ++i)
+                    v[i] /= length;
+            return length;
+        };
+        // The camera's axes at the pixel: V away from the eye, R to the right of the screen, U up the screen.
+        float V[3] = {position[0] - static_cast<float>(eye[0]), position[1] - static_cast<float>(eye[1]), position[2] - static_cast<float>(eye[2])};
+        normalise(V);
+        float R[3] = {V[2], 0.0f, -V[0]}; // cross((0, 1, 0), V)
+        if (!(normalise(R) > 1.0e-5f))
+        {
+            R[0] = 1.0f;
+            R[1] = R[2] = 0.0f;
+        }
+        const float U[3] = {V[1] * R[2] - V[2] * R[1], V[2] * R[0] - V[0] * R[2], V[0] * R[1] - V[1] * R[0]}; // cross(V, R)
+        for (int i = 0; i < 3; ++i)
+            R[i] *= rightSign;
+        const float sx = outX * lean, sy = outY * lean;
+        const float depth = std::sqrt(std::max(1.0f - lean * lean, 0.02f));
+        float N[3], N2[3], flat[3];
+        for (int i = 0; i < 3; ++i)
+        {
+            N[i] = sx * R[i] - sy * U[i] - depth * V[i];
+            N2[i] = sx * R[i] - sy * U[i] - 0.001f * V[i];
+            flat[i] = -V[i];
+        }
+        normalise(N);
+        normalise(N2);
+        const auto wrap = [](float nl) { return std::clamp((nl + kWrestlerWrap) / (1.0f + kWrestlerWrap), 0.0f, 1.0f); };
+        float today[3] = {}, shaped[3] = {}, rim[3] = {};
+        float gain = 1.0f;
+        bool first = true;
+        for (const Light &light : look.lights)
+        {
+            // (the lights the shader's block holds: lightUniforms leaves the same ones out)
+            if (!light.on || !(light.strength > 0.0f) || !(light.radius > 0.0f))
+                continue;
+            if (light.type == LightType::Spot && light.target[0] == light.position[0] && light.target[1] == light.position[1] && light.target[2] == light.position[2])
+                continue;
+            float l[3] = {light.position[0] - position[0], light.position[1] - position[1], light.position[2] - position[2]};
+            if (!(normalise(l) > 0.0f))
+            {
+                l[0] = l[2] = 0.0f;
+                l[1] = 1.0f;
+            }
+            if (first)
+                gain = 1.0f / std::clamp(wrap(dot(flat, l)), 0.3f, 1.0f);
+            first = false;
+            float c[3];
+            lightAt(light, position, flat, Facing::PositionOnly, c);
+            const float face = wrap(dot(N, l)), edge = std::max(dot(N2, l), 0.0f);
+            for (int i = 0; i < 3; ++i)
+            {
+                today[i] += c[i];
+                shaped[i] += c[i] * face;
+                rim[i] += c[i] * edge;
+            }
+        }
+        for (int i = 0; i < 3; ++i)
+            out[i] = look.wrestlerShape * (shaped[i] * gain - today[i]) + look.wrestlerRim * lean * lean * rim[i];
+    }
+
+    bool wrestlerShapeFromEnvironment(Look &look)
+    {
+        const char *text = std::getenv("PS2X_LIGHT_SHAPE");
+        if (!text || !*text)
+            return false;
+        float v[3] = {look.wrestlerShape, look.wrestlerRim, look.wrestlerOutline};
+        const int got = std::sscanf(text, "%f,%f,%f", &v[0], &v[1], &v[2]);
+        if (got < 1)
+            return false;
+        look.wrestlerShape = std::clamp(v[0], 0.0f, 1.0f);
+        look.wrestlerRim = std::clamp(v[1], 0.0f, 4.0f);
+        look.wrestlerOutline = std::clamp(v[2], 0.5f, 8.0f);
+        return true;
+    }
+
     // ================================================================================================================
     // The look as text, the built-in looks, the current look (task lt2-L2)
     // ================================================================================================================
@@ -705,6 +788,8 @@ namespace ps2x_lighting
                           "# the mat is at height 100, the post tops at 255. Edit it in the debug panel (F1, Lights) or by hand.\n"
                           "look 1\n";
         std::snprintf(line, sizeof(line), "ambient %.9g %.9g %.9g\n", look.ambient[0], look.ambient[1], look.ambient[2]);
+        out += line;
+        std::snprintf(line, sizeof(line), "wrestler_shape %.9g\nwrestler_rim %.9g\nwrestler_outline %.9g\n", look.wrestlerShape, look.wrestlerRim, look.wrestlerOutline);
         out += line;
         for (const Light &l : look.lights)
         {
@@ -817,6 +902,19 @@ namespace ps2x_lighting
                     return fail("ambient takes one number or three");
                 for (int k = 0; k < 3; ++k)
                     parsed.ambient[k] = clampNumber(v[k], 0.0f, 8.0f);
+                light = nullptr;
+            }
+            else if (word == "wrestler_shape" || word == "wrestler_rim" || word == "wrestler_outline")
+            {
+                // The shape of the wrestlers (task lt3-T1). A file without these lines keeps the built-in values.
+                if (!numbers(1))
+                    return fail(word + " takes one number");
+                if (word == "wrestler_shape")
+                    parsed.wrestlerShape = clampNumber(v[0], 0.0f, 1.0f);
+                else if (word == "wrestler_rim")
+                    parsed.wrestlerRim = clampNumber(v[0], 0.0f, 4.0f);
+                else
+                    parsed.wrestlerOutline = clampNumber(v[0], 0.5f, 8.0f);
                 light = nullptr;
             }
             else if (word == "material")

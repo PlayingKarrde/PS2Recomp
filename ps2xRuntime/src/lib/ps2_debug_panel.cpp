@@ -2250,7 +2250,12 @@ namespace
             ImGui::SameLine();
             if (ImGui::SmallButton(name.c_str()))
             {
+                // (a starting point is about the lights: the wrestlers' shape values below stay as they are)
+                const float shape = look.wrestlerShape, rim = look.wrestlerRim, outline = look.wrestlerOutline;
                 look = presetLook(name);
+                look.wrestlerShape = shape;
+                look.wrestlerRim = rim;
+                look.wrestlerOutline = outline;
                 changed = true;
             }
         }
@@ -2272,6 +2277,22 @@ namespace
                 changed = true;
             }
         }
+
+        // Wrestler shape (task lt3-T1, docs/hd-lighting-tier3.md): the wrestlers are flat pictures; these make the lights treat each as
+        // a rounded figure near his outline. Both strengths at 0 is the flat tint of before.
+        ImGui::SeparatorText("Wrestlers (shape from their outline)");
+        changed = ImGui::SliderFloat("Shape (0 = flat tint by position)", &look.wrestlerShape, 0.0f, 1.0f, "%.2f") || changed;
+        changed = ImGui::SliderFloat("Rim light on the lit side of the outline", &look.wrestlerRim, 0.0f, 3.0f, "%.2f") || changed;
+        changed = ImGui::SliderFloat("Width of the rounded edge (wrestler texels)", &look.wrestlerOutline, 0.5f, 8.0f, "%.1f") || changed;
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Defaults##wrestlers"))
+        {
+            look.wrestlerShape = kWrestlerShape;
+            look.wrestlerRim = kWrestlerRim;
+            look.wrestlerOutline = kWrestlerOutline;
+            changed = true;
+        }
+        ImGui::TextDisabled("Shows most with a low or coloured light from the side. Two wrestlers in a hold count as one outline.");
 
         int removeAt = -1, duplicateAt = -1;
         for (size_t i = 0; i < look.lights.size(); ++i)

@@ -142,6 +142,20 @@ namespace ps2x_postfx
         // size, 1.0 where nothing lit was drawn), or null. With it the chain first multiplies the scene by it in linear light, so the
         // bloom sees the lit highlights; when no effect is on that multiply is the only pass.
         SDL_GPUTexture *light = nullptr;
+        // Wrestler shape (task lt3-T1, gpu_lighting.h; docs/hd-lighting-tier3.md): with `light` and both textures below, the chain first
+        // blurs the wrestler mask, works the wrestlers' light out again for a surface that leans outward near their outline, and
+        // multiplies the scene by that copy of the light buffer instead. The light buffer itself is only read, so a field that is
+        // processed twice comes out the same. All null and zero: the chain is exactly the one of the lights alone.
+        SDL_GPUTexture *rimMask = nullptr;   // the wrestler mask (8 bits, the frame target's size, one channel per wrestler)
+        SDL_GPUTexture *rimWhere = nullptr;  // where each wrestler pixel is in the arena, and its channel (half-float, the frame target's size)
+        uint32_t targetW = 0, targetH = 0;   // the frame target's size in texels
+        int32_t rimX0 = 0, rimY0 = 0, rimX1 = -1, rimY1 = -1; // the box the wrestlers cover, in texels of the frame target (inclusive)
+        float rimEye[3] = {0.0f, 0.0f, 0.0f}; // the camera's position, world units
+        float rimRightSign = 1.0f;           // +1 or -1: whether cross(up, view) points to the right of the screen
+        float rimShape = 0.0f, rimStrength = 0.0f; // the look's wrestler_shape and wrestler_rim
+        float rimSigma = 0.0f;               // the blur of the mask, in texels of the frame target
+        float rimLean = 0.92f;               // how far the surface leans at the outline
+        float rimLights[136] = {};           // the look's lights: a ps2x_lighting::LightUniforms (the block of the lit shaders)
         float aspect = 4.0f / 3.0f;          // width over height as displayed
         float scale = 1.0f;                  // target pixels per GS pixel (the internal resolution)
         Params params;

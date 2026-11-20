@@ -13,6 +13,10 @@
 //   5. bloom, up                (D5, D4) -> U4, (U4, D3) -> U3, (U3, D2) -> U2, (U2, D1) -> U1     (F; skipped without bloom)
 //   6. final                    T (8), U1, frame target (alpha only)  ->  the output texture (8): linear light, glow added, grade, the
 //                               highlight shoulder, back to the display encoding, vignette.
+// With the match lights (a job with a light buffer) a multiply pass comes first: the frame target times its light buffer. With
+// wrestler shape (a job with a wrestler mask too, task lt3-T1) three passes come before that one: the mask blurred across, then
+// down, then the light buffer copied with the wrestlers' pixels lit again (postfx_rim_blur.frag.hlsl, postfx_rim.frag.hlsl); the
+// multiply pass reads that copy.
 // The input of the first pass (and of the bright pass, without tilt-shift) is the frame target itself, at the moment its scene is
 // complete. Nothing here writes into the game's frame targets: they are only read.
 
@@ -24,6 +28,8 @@
 #include "shaders/compiled/postfx_down_frag.h"
 #include "shaders/compiled/postfx_final_frag.h"
 #include "shaders/compiled/postfx_light_frag.h"
+#include "shaders/compiled/postfx_rim_blur_frag.h"
+#include "shaders/compiled/postfx_rim_frag.h"
 #include "shaders/compiled/postfx_tilt_frag.h"
 #include "shaders/compiled/postfx_up_frag.h"
 #include "shaders/compiled/postfx_vert.h"
@@ -325,6 +331,15 @@ namespace ps2x_postfx
         SDL_GPUTexture *scratchHdr = nullptr; // the blur's two steps for such a picture
         SDL_GPUTexture *tiltOutHdr = nullptr;
         bool ensureLitTextures(uint32_t w, uint32_t h, bool blur);
+        // Wrestler shape (task lt3-T1): the mask's blur and the pass that lights the wrestlers again. Made the first time a job asks.
+        SDL_GPUShader *fsRimBlur = nullptr, *fsRim = nullptr;
+        SDL_GPUGraphicsPipeline *pipeRimBlur = nullptr, *pipeRim = nullptr;
+        bool rimTried = false, rimReady = false;
+        uint32_t rimW = 0, rimH = 0, relitW = 0, relitH = 0;
+        SDL_GPUTexture *rimA = nullptr, *rimB = nullptr; // the mask blurred across, then down too: half-float, the picture's size
+        SDL_GPUTexture *relit = nullptr;                 // the light buffer with the wrestlers lit again: half-float, the frame target's size
+        bool ensureRim(const Job &job);
+        SDL_GPUTexture *recordRim(SDL_GPUCommandBuffer *cmd, const Job &job, Stats &stats);
 
         // Sized for the picture (texW x texH); made again when the picture's size changes.
         uint32_t texW = 0, texH = 0;
@@ -448,6 +463,10 @@ namespace ps2x_postfx
         drop(lit);
         drop(scratchHdr);
         drop(tiltOutHdr);
+        drop(rimA);
+        drop(rimB);
+        drop(relit);
+        rimW = rimH = relitW = relitH = 0;
         litW = litH = 0;
         for (int i = 0; i <= kMaxLevels; ++i)
         {
@@ -530,6 +549,118 @@ namespace ps2x_postfx
         return lit && (!blur || (scratchHdr && tiltOutHdr));
     }
 
+    // Wrestler shape: the shaders and pipelines (once), and the textures for this job's sizes.
+    bool Chain::Impl::ensureRim(const Job &job)
+    {
+        if (!rimTried)
+        {
+            rimTried = true;
+            fsRimBlur = ps2x::gpu::createShader(dev, ps2x::gpu::shaders::postfx_rim_blur_frag);
+            fsRim = ps2x::gpu::createShader(dev, ps2x::gpu::shaders::postfx_rim_frag);
+            if (fsRimBlur && fsRim)
+            {
+                pipeRimBlur = makePipeline(dev, vs, fsRimBlur, SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT);
+                pipeRim = makePipeline(dev, vs, fsRim, SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT);
+            }
+            rimReady = pipeRimBlur && pipeRim;
+            if (!rimReady)
+                std::fprintf(stderr, "[light] the wrestler shape pass could not be set up; the wrestlers stay tinted by position only\n");
+        }
+        if (!rimReady)
+            return false;
+        auto remake = [&](SDL_GPUTexture *&t, uint32_t oldW, uint32_t oldH, uint32_t w, uint32_t h)
+        {
+            if (t && (oldW != w || oldH != h))
+            {
+                ps2x_gs::DefragGuard guard;
+                SDL_ReleaseGPUTexture(dev, t);
+                bytes -= static_cast<uint64_t>(oldW) * oldH * 8u;
+                t = nullptr;
+            }
+            if (!t)
+                t = makeTexture(w, h, SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT);
+        };
+        remake(rimA, rimW, rimH, job.w, job.h);
+        remake(rimB, rimW, rimH, job.w, job.h);
+        rimW = job.w;
+        rimH = job.h;
+        remake(relit, relitW, relitH, job.targetW, job.targetH);
+        relitW = job.targetW;
+        relitH = job.targetH;
+        return rimA && rimB && relit;
+    }
+
+    // Wrestler shape: three passes; returns the texture the multiply pass reads in place of the light buffer (null: the light buffer).
+    SDL_GPUTexture *Chain::Impl::recordRim(SDL_GPUCommandBuffer *cmd, const Job &job, Stats &stats)
+    {
+        if (!job.light || !job.rimMask || !job.rimWhere || job.targetW == 0 || job.targetH == 0 || !(job.rimShape > 0.0f || job.rimStrength > 0.0f) ||
+            job.rimX1 < job.rimX0 || job.rimY1 < job.rimY0 || !ensureRim(job))
+            return nullptr;
+        const float w = static_cast<float>(job.w), h = static_cast<float>(job.h);
+        const float sigma = std::clamp(job.rimSigma, 0.25f, 25.0f);
+        const int reach = static_cast<int>(std::min(std::ceil(sigma * 2.5f), 64.0f));
+        // The wrestlers' box in texels of the picture. The second blur is needed there (and one texel around it, for the slope); the
+        // first, which the second reads up and down, in rows `reach` further out. Nothing outside those boxes is read by the last pass.
+        const int px0 = job.rimX0 - static_cast<int>(job.x), py0 = job.rimY0 - static_cast<int>(job.y);
+        const int px1 = job.rimX1 - static_cast<int>(job.x), py1 = job.rimY1 - static_cast<int>(job.y);
+        const auto box = [&](int growX, int growY) {
+            const int x0 = std::clamp(px0 - growX, 0, static_cast<int>(job.w)), y0 = std::clamp(py0 - growY, 0, static_cast<int>(job.h));
+            const int x1 = std::clamp(px1 + 1 + growX, 0, static_cast<int>(job.w)), y1 = std::clamp(py1 + 1 + growY, 0, static_cast<int>(job.h));
+            return SDL_Rect{x0, y0, std::max(x1 - x0, 0), std::max(y1 - y0, 0)};
+        };
+        const SDL_Rect across = box(2, reach + 2), down = box(2, 2);
+        if (down.w <= 0 || down.h <= 0)
+            return nullptr; // the wrestlers are outside the picture
+        PassParams b = {};
+        b.v[kSrc][0] = static_cast<float>(job.x); b.v[kSrc][1] = static_cast<float>(job.y); b.v[kSrc][2] = w; b.v[kSrc][3] = h;
+        b.v[kAux][0] = 1.0f; b.v[kAux][1] = 0.0f;
+        b.v[kTilt][2] = sigma;
+        const auto blurPass = [&](SDL_GPUTexture *target, SDL_GPUTexture *source, const SDL_Rect &scissor) {
+            SDL_GPUColorTargetInfo ct = {};
+            ct.texture = target;
+            ct.load_op = SDL_GPU_LOADOP_DONT_CARE; // only the box is written, and only the box is read
+            ct.store_op = SDL_GPU_STOREOP_STORE;
+            SDL_GPURenderPass *rp = SDL_BeginGPURenderPass(cmd, &ct, 1, nullptr);
+            SDL_BindGPUGraphicsPipeline(rp, pipeRimBlur);
+            SDL_SetGPUScissor(rp, &scissor);
+            const SDL_GPUTextureSamplerBinding binding = {source, nearest};
+            SDL_BindGPUFragmentSamplers(rp, 0, &binding, 1);
+            SDL_PushGPUFragmentUniformData(cmd, 0, &b, sizeof(b));
+            SDL_DrawGPUPrimitives(rp, 3, 1, 0, 0);
+            SDL_EndGPURenderPass(rp);
+            ++stats.passes;
+        };
+        blurPass(rimA, job.rimMask, across);
+        b.v[kSrc][0] = 0.0f; b.v[kSrc][1] = 0.0f;
+        b.v[kAux][0] = 0.0f; b.v[kAux][1] = 1.0f;
+        blurPass(rimB, rimA, down);
+
+        PassParams r = {};
+        r.v[kSrc][0] = static_cast<float>(job.x); r.v[kSrc][1] = static_cast<float>(job.y); r.v[kSrc][2] = w; r.v[kSrc][3] = h;
+        r.v[kAux][0] = job.rimEye[0]; r.v[kAux][1] = job.rimEye[1]; r.v[kAux][2] = job.rimEye[2]; r.v[kAux][3] = job.rimRightSign;
+        r.v[kTilt][0] = job.rimShape;
+        r.v[kTilt][1] = job.rimStrength;
+        r.v[kTilt][3] = job.rimLean;
+        {
+            SDL_GPUColorTargetInfo ct = {};
+            ct.texture = relit;
+            ct.load_op = SDL_GPU_LOADOP_DONT_CARE; // the picture's rectangle is written whole, and the multiply pass reads nothing else
+            ct.store_op = SDL_GPU_STOREOP_STORE;
+            SDL_GPURenderPass *rp = SDL_BeginGPURenderPass(cmd, &ct, 1, nullptr);
+            SDL_BindGPUGraphicsPipeline(rp, pipeRim);
+            const SDL_GPUViewport viewport = {static_cast<float>(job.x), static_cast<float>(job.y), w, h, 0.0f, 1.0f};
+            SDL_SetGPUViewport(rp, &viewport);
+            const SDL_GPUTextureSamplerBinding bindings[3] = {{job.light, nearest}, {job.rimWhere, nearest}, {rimB, nearest}};
+            SDL_BindGPUFragmentSamplers(rp, 0, bindings, 3);
+            SDL_PushGPUFragmentUniformData(cmd, 0, &r, sizeof(r));
+            SDL_PushGPUFragmentUniformData(cmd, 1, job.rimLights, sizeof(job.rimLights));
+            SDL_DrawGPUPrimitives(rp, 3, 1, 0, 0);
+            SDL_EndGPURenderPass(rp);
+            ++stats.passes;
+        }
+        return relit;
+    }
+
     void Chain::Impl::pass(SDL_GPUCommandBuffer *cmd, SDL_GPUGraphicsPipeline *pipeline, SDL_GPUTexture *target,
                            const SDL_GPUTextureSamplerBinding *bindings, uint32_t bindingCount, const PassParams &params, Stats &stats,
                            const SDL_GPUViewport *viewport)
@@ -596,7 +727,9 @@ namespace ps2x_postfx
         {
             PassParams l = base;
             l.v[kSrc][0] = static_cast<float>(job.x); l.v[kSrc][1] = static_cast<float>(job.y); l.v[kSrc][2] = w; l.v[kSrc][3] = h;
-            const SDL_GPUTextureSamplerBinding bl[2] = {{job.field, nearest}, {job.light, nearest}};
+            // Wrestler shape: the light buffer copied with the wrestlers lit again, when the job asks for it.
+            SDL_GPUTexture *const shaped = recordRim(cmd, job, stats);
+            const SDL_GPUTextureSamplerBinding bl[2] = {{job.field, nearest}, {shaped ? shaped : job.light, nearest}};
             if (!tilt && !bloom && !p.gradingOn && !p.vignetteOn)
             {
                 // No effect is on: this is the only pass, and it writes the finished picture (postfx_light.frag.hlsl, form 1).
@@ -704,10 +837,10 @@ namespace ps2x_postfx
     {
         releaseTextures();
         ps2x_gs::DefragGuard guard;
-        for (SDL_GPUGraphicsPipeline *p : {pipeTilt, pipeDown, pipeUp, pipeFinal, pipeLightHdr, pipeLightOut, pipeTiltHdr})
+        for (SDL_GPUGraphicsPipeline *p : {pipeTilt, pipeDown, pipeUp, pipeFinal, pipeLightHdr, pipeLightOut, pipeTiltHdr, pipeRimBlur, pipeRim})
             if (p)
                 SDL_ReleaseGPUGraphicsPipeline(dev, p);
-        for (SDL_GPUShader *s : {vs, fsTilt, fsDown, fsUp, fsFinal, fsLight})
+        for (SDL_GPUShader *s : {vs, fsTilt, fsDown, fsUp, fsFinal, fsLight, fsRimBlur, fsRim})
             if (s)
                 SDL_ReleaseGPUShader(dev, s);
         if (linear)

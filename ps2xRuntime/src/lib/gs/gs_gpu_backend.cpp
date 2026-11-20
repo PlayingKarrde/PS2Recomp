@@ -91,8 +91,12 @@
 #include "gpu/gpu_postfx.h"
 #include "gpu/gpu_shaders.h"
 #include "shaders/compiled/gs_frag.h"
+#include "shaders/compiled/gs_card_frag.h"
 #include "shaders/compiled/gs_light_debug_frag.h"
 #include "shaders/compiled/gs_light_vert.h"
+#include "shaders/compiled/gs_mask_frag.h"
+#include "shaders/compiled/gs_rep_card_frag.h"
+#include "shaders/compiled/gs_rep_mask_frag.h"
 #include "shaders/compiled/gs_lit_frag.h"
 #include "shaders/compiled/gs_rep_lit_frag.h"
 #include "shaders/compiled/gs_rep_frag.h"
@@ -284,6 +288,22 @@ namespace
         SDL_GPUTexture *light = nullptr;
         bool lightPending = true; // the field's next lit draw is its first: the buffer is cleared to 1.0 before it
         bool lightValid = false;  // this field has lit draws, so `light` is its light
+        // Wrestler shape (task lt3-T1, docs/hd-lighting-tier3.md): idle unless the look asks for it. Two more textures of this target's
+        // size, made at the first wrestler card: `rimWhere` (half-float) is the cards' third colour target, where each wrestler pixel
+        // is in the arena and which wrestler it is; `rimMask` (8 bits, a channel per wrestler) gets every card a second time with no
+        // depth test, so it is the wrestlers' whole outline also behind ropes. The rest describes the field being drawn.
+        SDL_GPUTexture *rimWhere = nullptr;
+        SDL_GPUTexture *rimMask = nullptr;
+        bool rimPending = true; // the field's next card is its first: both textures are cleared before it
+        bool rimValid = false;  // this field has cards drawn with shape
+        int32_t rimX0 = 0x7FFFFFFF, rimY0 = 0x7FFFFFFF, rimX1 = -1, rimY1 = -1; // the box the cards cover, target pixels
+        double rimAreaPixels = 0.0, rimAreaTexels = 0.0; // of the cards so far: together they say how big a wrestler texel is on screen
+        float rimEye[3] = {0.0f, 0.0f, 0.0f}; // the camera of the field's cards
+        float rimRightSign = 1.0f;
+        // Wrestlers are told apart by the upright plane their cards stand in (all parts of one wrestler share it): the planes seen
+        // so far in this field, as the distance of each from the arena's centre along the card's normal. Entry i uses mask channel i % 4.
+        float rimPlanes[16] = {};
+        uint32_t rimPlaneCount = 0;
         bool procValid = false;        // `proc` holds this field's processed scene (and its overlay so far); nothing scene-like came after
         bool replayPending = false;    // the next overlay draw is the field's first: it clears procDepth
         uint32_t procX = 0, procY = 0, procW = 0, procH = 0; // the picture in `proc`, as the chain was told
@@ -349,6 +369,8 @@ namespace
         float lightStrength = 1.0f, lightGlow = 0.0f; // and how much of the lighting it takes, or how far it glows (materials)
         bool lightClear = false; // a lit draw that is the first of its field: the light buffer starts again at 1.0 before it
         uint32_t lightFirst = 0; // a draw with kLightKey: its first vertex in Impl::lightVerts (as many as vertexCount, in the same order)
+        uint8_t rimChannel = 0;  // a wrestler card drawn with shape (kCardKey): 1 + its wrestler's mask channel; such a draw is also drawn into the mask
+        bool rimClear = false;   // the first such draw of its field: the target's rimWhere and rimMask start again at 0 before it
     };
 
     SDL_GPUBlendFactor toSdl(BlendFactor f)
@@ -396,6 +418,9 @@ namespace
     // (gs_light.vert.hlsl). With the lights on (lt2-L1) such a draw has two colour targets, the frame and the frame's light buffer
     // (gs_lit.frag.hlsl, gs_rep_lit.frag.hlsl); with a debug view it has one and draws the recovered data (gs_light_debug.frag.hlsl).
     constexpr uint32_t kLightKey = 1u << 15;
+    // Wrestler shape (task lt3-T1): with kLightKey, the pipeline of a wrestler card. It has a third colour target, the frame's
+    // rimWhere (gs_card.frag.hlsl, gs_rep_card.frag.hlsl), which is not blended.
+    constexpr uint32_t kCardKey = 1u << 16;
     // The screen effects tell scene from overlay by the Z of the last vertex (docs/hd-lighting.md, "The boundary"): the scene's is below
     // 65536 (the highest seen in a whole match: 23,772), the overlay's (clock, pause panel, popups, fades) at or above it. 65536 / 2^24 is exact in a float.
     constexpr float kOverlayZ = 65536.0f * GSGpu::kDepthScale;
@@ -667,6 +692,16 @@ struct GSGpuBackend::Impl
     bool lightShow = false;       // "show lights": the lit shader draws markers of the lights
     bool lightSetupFailed = false;
     ps2x_lighting::LightUniforms lightBlocks[3]; // the shader's block for each facing rule, made from lightLook when it changes
+    // Wrestler shape (task lt3-T1; docs/hd-lighting-tier3.md). `rimOn`: the look asks for it (wrestler_shape or wrestler_rim above 0)
+    // and its shaders exist. With rimOn false no card gets kCardKey, no mask is drawn and no job carries a mask: the lit picture is
+    // tier 2's, byte for byte.
+    bool rimOn = false, rimSetupFailed = false;
+    SDL_GPUShader *cardShader = nullptr, *cardRepShader = nullptr, *maskShader = nullptr, *maskRepShader = nullptr;
+    SDL_GPUGraphicsPipeline *maskPipeline = nullptr, *maskRepPipeline = nullptr;
+    float lightRightSign = 1.0f; // of the camera in lightUnproject: +1 when cross(up, view) points to the right of the screen
+    uint64_t rimCards = 0, rimFields = 0, rimLitAfterCards = 0, rimPlanesMost = 0;
+    void rimNoteCard(FrameTarget &ft, Draw &d, const Setup &setup, const GSDrawState &state, const LightVertex *verts);
+    void rimFillJob(const FrameTarget &ft, ps2x_postfx::Job &job) const;
     uint32_t lightLitThisField = 0;
     void lightRefresh();
     SDL_GPUShader *litShader = nullptr;
@@ -1365,6 +1400,10 @@ GSGpuBackend::Impl::~Impl()
         SDL_ReleaseGPUTexture(dev, f.color);
         if (f.light)
             SDL_ReleaseGPUTexture(dev, f.light);
+        if (f.rimWhere)
+            SDL_ReleaseGPUTexture(dev, f.rimWhere);
+        if (f.rimMask)
+            SDL_ReleaseGPUTexture(dev, f.rimMask);
         if (f.proc)
             SDL_ReleaseGPUTexture(dev, f.proc);
         if (f.procDepth)
@@ -1717,9 +1756,13 @@ SDL_GPUGraphicsPipeline *GSGpuBackend::Impl::pipeline(uint32_t key)
     // A lit draw: with a debug view, the debug shader into the frame alone; with the lights, the plain shader's lit variant into the
     // frame and the light buffer. The light buffer blends as the frame does (its alpha is the same coefficient).
     const bool litTwo = lit && lightDebug == 0;
-    SDL_GPUColorTargetDescription cts[2] = {ct, ct};
+    // A wrestler card drawn with shape has a third target (FrameTarget::rimWhere), written as it is: no blend.
+    const bool card = litTwo && (key & kCardKey) != 0u;
+    SDL_GPUColorTargetDescription cts[3] = {ct, ct, {}};
     cts[1].format = SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT;
-    info.fragment_shader = litTwo ? (replaced ? litRepShader : litShader) : (lit ? lightDebugShader : (zrestore ? zcopyShader : (replaced ? repShader : fragmentShader)));
+    cts[2].format = SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT;
+    info.fragment_shader = card ? (replaced ? cardRepShader : cardShader)
+                                : (litTwo ? (replaced ? litRepShader : litShader) : (lit ? lightDebugShader : (zrestore ? zcopyShader : (replaced ? repShader : fragmentShader))));
     info.vertex_input_state.vertex_buffer_descriptions = vbs;
     info.vertex_input_state.num_vertex_buffers = lit ? 2 : 1;
     info.vertex_input_state.vertex_attributes = attrs;
@@ -1734,7 +1777,7 @@ SDL_GPUGraphicsPipeline *GSGpuBackend::Impl::pipeline(uint32_t key)
     info.depth_stencil_state.enable_depth_write = depthWrite;
     info.depth_stencil_state.compare_op = toSdlCompare(compare);
     info.target_info.color_target_descriptions = cts;
-    info.target_info.num_color_targets = litTwo ? 2 : 1;
+    info.target_info.num_color_targets = card ? 3 : (litTwo ? 2 : 1);
     info.target_info.has_depth_stencil_target = true;
     info.target_info.depth_stencil_format = SDL_GPU_TEXTUREFORMAT_D32_FLOAT;
     SDL_GPUGraphicsPipeline *p = SDL_CreateGPUGraphicsPipeline(dev, &info);
@@ -2872,6 +2915,12 @@ void GSGpuBackend::Impl::submitSetup(const GSDrawState &state, const Setup &setu
             lightVerts.insert(lightVerts.end(), lightPending, lightPending + 3);
             ++lightLitPrimitives;
             ++lightLitThisField;
+            // Wrestler shape: a card (a strip that is lit by position: wrestler parts, the referee, ring-side sprites) also writes
+            // where it is and goes into the wrestler mask. Shadows, effects and strips with a material of another kind do not.
+            if (rimOn && lightPendingKind.strip && !lightPendingKind.flatBlack && !lightPendingKind.depthWriteOff && lightChoice.mode == 2u)
+                rimNoteCard(ft, d, setup, state, lightPending);
+            else if (ft.rimValid)
+                ++rimLitAfterCards; // (something lit drawn after a card: if it covers a card's pixel, that pixel is still shaped. Counted for the log.)
         }
     }
     else if (lightPending && lightDebug != 0)
@@ -2888,7 +2937,7 @@ void GSGpuBackend::Impl::submitSetup(const GSDrawState &state, const Setup &setu
     {
         Draw &last = draws.back();
         if (last.frame == d.frame && last.depth == d.depth && last.pipeline == d.pipeline && last.texture == d.texture && last.rep == d.rep &&
-            last.replay == d.replay && !d.replayFirst && last.lightFacing == d.lightFacing && last.lightStrength == d.lightStrength && last.lightGlow == d.lightGlow && !d.lightClear && last.sx == d.sx && last.sy == d.sy && last.sw == d.sw && last.sh == d.sh && last.uniforms == d.uniforms)
+            last.replay == d.replay && !d.replayFirst && last.lightFacing == d.lightFacing && last.lightStrength == d.lightStrength && last.lightGlow == d.lightGlow && !d.lightClear && last.rimChannel == d.rimChannel && !d.rimClear && last.sx == d.sx && last.sy == d.sy && last.sw == d.sw && last.sh == d.sh && last.uniforms == d.uniforms)
         {
             last.vertexCount += setup.count;
             return;
@@ -3123,8 +3172,12 @@ void GSGpuBackend::Impl::flushLocked(bool wait, const FieldCopy *fieldCopies, in
             // No buffer: draw them as the plain scene (the first stream alone is a complete vertex).
             for (Draw &d : draws)
             {
-                d.pipeline &= ~kLightKey;
+                if (d.pipeline == kBoundaryKey)
+                    continue;
+                d.pipeline &= ~(kLightKey | kCardKey);
                 d.lightClear = false;
+                d.rimChannel = 0;
+                d.rimClear = false;
             }
         }
     }
@@ -3134,6 +3187,7 @@ void GSGpuBackend::Impl::flushLocked(bool wait, const FieldCopy *fieldCopies, in
     bool litBinding = false; // the vertex buffers bound in the open pass are a lit draw's (both streams, at the draw's own offsets)
     uint32_t curFrame = ~0u, curDepth = ~0u;
     bool curLit = false; // the open pass has the frame's light buffer as its second colour target
+    bool curCard = false; // ... and the frame's rimWhere as its third (wrestler cards drawn with shape)
     uint32_t curPipeline = ~0u;
     SDL_GPUTexture *curTexture = reinterpret_cast<SDL_GPUTexture *>(~uintptr_t(0));
     SDL_GPUTexture *curRepTexture = reinterpret_cast<SDL_GPUTexture *>(~uintptr_t(0));
@@ -3147,9 +3201,9 @@ void GSGpuBackend::Impl::flushLocked(bool wait, const FieldCopy *fieldCopies, in
     };
     // Begins a render pass into `colorTex` / `depthTex` (the frame's own, or its processed picture's).
     auto beginPass = [&](uint32_t frame, SDL_GPUTexture *colorTex, SDL_GPUTexture *depthTex, SDL_GPULoadOp depthLoad, SDL_GPUTexture *lightTex = nullptr,
-                         bool lightClear = false)
+                         bool lightClear = false, SDL_GPUTexture *whereTex = nullptr, bool whereClear = false)
     {
-        SDL_GPUColorTargetInfo colors[2] = {};
+        SDL_GPUColorTargetInfo colors[3] = {};
         SDL_GPUColorTargetInfo &color = colors[0];
         color.texture = colorTex;
         color.load_op = SDL_GPU_LOADOP_LOAD;
@@ -3162,6 +3216,14 @@ void GSGpuBackend::Impl::flushLocked(bool wait, const FieldCopy *fieldCopies, in
             colors[1].store_op = SDL_GPU_STOREOP_STORE;
             colors[1].clear_color = SDL_FColor{1.0f, 1.0f, 1.0f, 1.0f};
         }
+        if (lightTex && whereTex)
+        {
+            // Wrestler shape: where the cards' pixels are. A field's first card starts it at 0, "no card here".
+            colors[2].texture = whereTex;
+            colors[2].load_op = whereClear ? SDL_GPU_LOADOP_CLEAR : SDL_GPU_LOADOP_LOAD;
+            colors[2].store_op = SDL_GPU_STOREOP_STORE;
+            colors[2].clear_color = SDL_FColor{0.0f, 0.0f, 0.0f, 0.0f};
+        }
         SDL_GPUDepthStencilTargetInfo depth = {};
         depth.texture = depthTex;
         depth.clear_depth = 0.0f; // the GS clears Z to 0 and keeps the larger value
@@ -3169,7 +3231,7 @@ void GSGpuBackend::Impl::flushLocked(bool wait, const FieldCopy *fieldCopies, in
         depth.store_op = SDL_GPU_STOREOP_STORE;
         depth.stencil_load_op = SDL_GPU_LOADOP_DONT_CARE;
         depth.stencil_store_op = SDL_GPU_STOREOP_DONT_CARE;
-        pass = SDL_BeginGPURenderPass(cmd, colors, lightTex ? 2 : 1, &depth);
+        pass = SDL_BeginGPURenderPass(cmd, colors, lightTex ? (whereTex ? 3 : 2) : 1, &depth);
         ++stats.renderPasses;
         const float globals[4] = {static_cast<float>(frames[frame].w), static_cast<float>(frames[frame].h), 0.0f, 0.0f};
         SDL_PushGPUVertexUniformData(cmd, 0, globals, sizeof(globals));
@@ -3244,7 +3306,7 @@ void GSGpuBackend::Impl::flushLocked(bool wait, const FieldCopy *fieldCopies, in
                 ps2x_lighting::LightUniforms lu = lightBlocks[std::min<uint32_t>(d.lightFacing, 2u)];
                 lu.rule[0] = static_cast<float>(d.lightFacing);
                 lu.rule[2] = d.lightStrength;
-                lu.rule[3] = d.lightGlow;
+                lu.rule[3] = d.rimChannel != 0u ? static_cast<float>(d.rimChannel) : d.lightGlow; // (a card is mode 2, which has no glow)
                 SDL_PushGPUFragmentUniformData(cmd, 1, &lu, sizeof(lu));
             }
             SDL_DrawGPUPrimitives(pass, d.vertexCount, 1, 0, 0);
@@ -3260,14 +3322,84 @@ void GSGpuBackend::Impl::flushLocked(bool wait, const FieldCopy *fieldCopies, in
         SDL_DrawGPUPrimitives(pass, d.vertexCount, 1, d.firstVertex, 0);
         ++stats.drawCalls;
     };
-    bool anyReplay = false;
-    for (const Draw &d : draws)
+    // Wrestler shape: every card of this flush a second time, into its frame's wrestler mask, with no depth test (gs_mask.frag.hlsl).
+    // Called outside any pass, for the draws from the last call's end up to `end`: before the chain runs at a boundary, and after the
+    // last draw (a field without an overlay is processed at the field copy, below).
+    size_t maskNext = 0;
+    auto drawMasks = [&](size_t end)
     {
+        SDL_GPURenderPass *maskPass = nullptr;
+        uint32_t maskFrame = ~0u;
+        for (size_t i = maskNext; i < end; ++i)
+        {
+            const Draw &d = draws[i];
+            if (d.rimChannel == 0u || d.pipeline == kBoundaryKey)
+                continue;
+            const FrameTarget &ft = frames[d.frame];
+            const RepDraw *rd = d.rep != 0u ? &repDraws[d.rep - 1u] : nullptr;
+            SDL_GPUGraphicsPipeline *p = rd ? maskRepPipeline : maskPipeline;
+            if (!ft.rimMask || !p)
+                continue;
+            if (!maskPass || d.frame != maskFrame || d.rimClear)
+            {
+                if (maskPass)
+                    SDL_EndGPURenderPass(maskPass);
+                SDL_GPUColorTargetInfo color = {};
+                color.texture = ft.rimMask;
+                color.load_op = d.rimClear ? SDL_GPU_LOADOP_CLEAR : SDL_GPU_LOADOP_LOAD;
+                color.store_op = SDL_GPU_STOREOP_STORE;
+                color.clear_color = SDL_FColor{0.0f, 0.0f, 0.0f, 0.0f};
+                maskPass = SDL_BeginGPURenderPass(cmd, &color, 1, nullptr);
+                ++stats.renderPasses;
+                maskFrame = d.frame;
+                const float globals[4] = {static_cast<float>(ft.w), static_cast<float>(ft.h), 0.0f, 0.0f};
+                SDL_PushGPUVertexUniformData(cmd, 0, globals, sizeof(globals));
+                SDL_GPUBufferBinding vb = {vertexBuffer, 0};
+                SDL_BindGPUVertexBuffers(maskPass, 0, &vb, 1);
+            }
+            SDL_BindGPUGraphicsPipeline(maskPass, p);
+            if (rd)
+            {
+                const SDL_GPUTextureSamplerBinding bindings[2] = {{d.texture ? d.texture : dummy, sampler}, {rd->tex, sampler}};
+                SDL_BindGPUFragmentSamplers(maskPass, 0, bindings, 2);
+                RepUniforms u;
+                u.base = d.uniforms;
+                std::memcpy(u.info, rd->info, sizeof(u.info));
+                if (rd->palette)
+                    std::memcpy(u.palette, rd->palette->data(), sizeof(u.palette));
+                else
+                    std::memset(u.palette, 0, sizeof(u.palette));
+                SDL_PushGPUFragmentUniformData(cmd, 0, &u, sizeof(u));
+            }
+            else
+            {
+                SDL_GPUTextureSamplerBinding binding = {d.texture ? d.texture : dummy, sampler};
+                SDL_BindGPUFragmentSamplers(maskPass, 0, &binding, 1);
+                SDL_PushGPUFragmentUniformData(cmd, 0, &d.uniforms, sizeof(d.uniforms));
+            }
+            float channel[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            channel[(d.rimChannel - 1u) & 3u] = 1.0f;
+            SDL_PushGPUFragmentUniformData(cmd, 1, channel, sizeof(channel));
+            const SDL_Rect scissor = {d.sx, d.sy, d.sw, d.sh};
+            SDL_SetGPUScissor(maskPass, &scissor);
+            SDL_DrawGPUPrimitives(maskPass, d.vertexCount, 1, d.firstVertex, 0);
+            ++stats.drawCalls;
+        }
+        if (maskPass)
+            SDL_EndGPURenderPass(maskPass);
+        maskNext = end;
+    };
+    bool anyReplay = false;
+    for (size_t drawIndex = 0; drawIndex < draws.size(); ++drawIndex)
+    {
+        const Draw &d = draws[drawIndex];
         if (d.pipeline == kBoundaryKey)
         {
             // Screen effects: the scene of this target is complete. Run the chain on it, into the target's processed picture; the overlay
             // primitives that follow are drawn into that picture a second time (below). The chain takes its own render passes, outside ours.
             endPass();
+            if (rimOn)
+                drawMasks(drawIndex);
             if (fx && d.fxJob >= 0 && static_cast<size_t>(d.fxJob) < fxJobs.size())
             {
                 fx->record(cmd, fxJobs[static_cast<size_t>(d.fxJob)], true);
@@ -3283,12 +3415,14 @@ void GSGpuBackend::Impl::flushLocked(bool wait, const FieldCopy *fieldCopies, in
             anyReplay = true;
         // A lit draw (the lights, not a debug view) needs the light buffer in its pass, and a plain draw must not have it.
         const bool litDraw = lightDebug == 0 && (d.pipeline & kLightKey) != 0u;
-        if (!pass || d.frame != curFrame || d.depth != curDepth || litDraw != curLit || d.lightClear)
+        const bool cardDraw = litDraw && (d.pipeline & kCardKey) != 0u;
+        if (!pass || d.frame != curFrame || d.depth != curDepth || litDraw != curLit || d.lightClear || cardDraw != curCard || d.rimClear)
         {
             endPass();
             beginPass(d.frame, frames[d.frame].color, depths[d.depth].depth, depths[d.depth].needsClear ? SDL_GPU_LOADOP_CLEAR : SDL_GPU_LOADOP_LOAD,
-                      litDraw ? frames[d.frame].light : nullptr, d.lightClear);
+                      litDraw ? frames[d.frame].light : nullptr, d.lightClear, cardDraw ? frames[d.frame].rimWhere : nullptr, d.rimClear);
             curLit = litDraw;
+            curCard = cardDraw;
             depths[d.depth].needsClear = false;
             curFrame = d.frame;
             curDepth = d.depth;
@@ -3296,6 +3430,8 @@ void GSGpuBackend::Impl::flushLocked(bool wait, const FieldCopy *fieldCopies, in
         drawOne(d);
     }
     endPass();
+    if (rimOn)
+        drawMasks(draws.size());
     if (anyReplay)
     {
         // The overlay a second time, over the processed scene: the same draws, the same pipelines, into the target's processed picture and
@@ -3313,6 +3449,7 @@ void GSGpuBackend::Impl::flushLocked(bool wait, const FieldCopy *fieldCopies, in
                 endPass();
                 beginPass(d.frame, ft.proc, ft.procDepth, d.replayFirst ? SDL_GPU_LOADOP_CLEAR : SDL_GPU_LOADOP_LOAD);
                 curLit = false;
+                curCard = false;
                 curFrame = d.frame;
             }
             drawOne(d);
@@ -3728,6 +3865,8 @@ GSGpuBackend::MarkResult GSGpuBackend::Impl::produceField(const GSPresentationRe
                         fxJob.scale = static_cast<float>(scaleX);
                         fxJob.params = fxParams;
                         fxJob.light = (lightLive && fxTarget->lightValid) ? fxTarget->light : nullptr;
+                        if (fxJob.light)
+                            rimFillJob(*fxTarget, fxJob);
                         copies[0].fx = &fxJob;
                         ++fxStats.fieldsDirect;
                     }
@@ -4217,6 +4356,12 @@ void GSGpuBackend::Impl::fxResetTarget(FrameTarget &t)
     t.shown = false;
     t.lightPending = true;
     t.lightValid = false;
+    t.rimPending = true;
+    t.rimValid = false;
+    t.rimX0 = t.rimY0 = 0x7FFFFFFF;
+    t.rimX1 = t.rimY1 = -1;
+    t.rimAreaPixels = t.rimAreaTexels = 0.0;
+    t.rimPlaneCount = 0;
     t.sceneTris = 0;
     t.scenePrims = t.overlayPrims = 0;
     t.sceneZMax = t.sceneAnyZMax = 0;
@@ -4284,6 +4429,8 @@ void GSGpuBackend::Impl::fxBoundary(uint32_t frameIndex)
     job.field = t.color;
     job.output = t.proc;
     job.light = lit ? t.light : nullptr;
+    if (lit)
+        rimFillJob(t, job);
     job.aspect = static_cast<float>(640u + padLeft + padRight) / 480.0f;
     job.scale = static_cast<float>(scaleX);
     job.params = fxParams;
@@ -4529,7 +4676,186 @@ void GSGpuBackend::Impl::lightRefresh()
         lightBlocks[0] = ps2x_lighting::lightUniforms(lightLook, ps2x_lighting::Facing::Lambert, lightShow);
         lightBlocks[1] = ps2x_lighting::lightUniforms(lightLook, ps2x_lighting::Facing::Half, lightShow);
         lightBlocks[2] = ps2x_lighting::lightUniforms(lightLook, ps2x_lighting::Facing::PositionOnly, lightShow);
+        if (ps2x_lighting::wrestlerShapeFromEnvironment(lightLook) && !rimSetupFailed && lightLookGeneration != 0u)
+        {
+            static bool said = false;
+            if (!said)
+                std::fprintf(stderr, "[light] PS2X_LIGHT_SHAPE: wrestler shape %.3g, rim %.3g, outline %.3g texels, whatever the look says\n", lightLook.wrestlerShape,
+                             lightLook.wrestlerRim, lightLook.wrestlerOutline);
+            said = true;
+        }
     }
+    // Wrestler shape (task lt3-T1): its shaders and the mask's two pipelines, the first time a look asks for it.
+    bool wantRim = lightOn && !rimSetupFailed && ps2x_lighting::wrestlerShapeWanted(lightLook);
+    if (wantRim && !cardShader)
+    {
+        cardShader = ps2x::gpu::createShader(dev, ps2x::gpu::shaders::gs_card_frag);
+        cardRepShader = ps2x::gpu::createShader(dev, ps2x::gpu::shaders::gs_rep_card_frag);
+        maskShader = ps2x::gpu::createShader(dev, ps2x::gpu::shaders::gs_mask_frag);
+        maskRepShader = ps2x::gpu::createShader(dev, ps2x::gpu::shaders::gs_rep_mask_frag);
+        if (cardShader && cardRepShader && maskShader && maskRepShader)
+        {
+            // The mask: the plain vertex stream, one 8-bit target, no depth; the blend keeps the larger value of each channel.
+            SDL_GPUVertexBufferDescription vb = {};
+            vb.slot = 0;
+            vb.pitch = sizeof(Vertex);
+            vb.input_rate = SDL_GPU_VERTEXINPUTRATE_VERTEX;
+            const SDL_GPUVertexAttribute attrs[4] = {{0, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2, offsetof(Vertex, x)},
+                                                     {1, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT, offsetof(Vertex, z)},
+                                                     {2, 0, SDL_GPU_VERTEXELEMENTFORMAT_UBYTE4_NORM, offsetof(Vertex, rgba)},
+                                                     {3, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, offsetof(Vertex, u)}};
+            SDL_GPUColorTargetDescription ct = {};
+            ct.format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
+            ct.blend_state.enable_blend = true;
+            ct.blend_state.src_color_blendfactor = ct.blend_state.dst_color_blendfactor = SDL_GPU_BLENDFACTOR_ONE;
+            ct.blend_state.src_alpha_blendfactor = ct.blend_state.dst_alpha_blendfactor = SDL_GPU_BLENDFACTOR_ONE;
+            ct.blend_state.color_blend_op = ct.blend_state.alpha_blend_op = SDL_GPU_BLENDOP_MAX;
+            SDL_GPUGraphicsPipelineCreateInfo info = {};
+            info.vertex_shader = vertexShader;
+            info.vertex_input_state.vertex_buffer_descriptions = &vb;
+            info.vertex_input_state.num_vertex_buffers = 1;
+            info.vertex_input_state.vertex_attributes = attrs;
+            info.vertex_input_state.num_vertex_attributes = 4;
+            info.primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST;
+            info.rasterizer_state.fill_mode = SDL_GPU_FILLMODE_FILL;
+            info.rasterizer_state.cull_mode = SDL_GPU_CULLMODE_NONE;
+            info.rasterizer_state.front_face = SDL_GPU_FRONTFACE_COUNTER_CLOCKWISE;
+            info.rasterizer_state.enable_depth_clip = false;
+            info.multisample_state.sample_count = SDL_GPU_SAMPLECOUNT_1;
+            info.target_info.color_target_descriptions = &ct;
+            info.target_info.num_color_targets = 1;
+            info.target_info.has_depth_stencil_target = false;
+            info.fragment_shader = maskShader;
+            maskPipeline = SDL_CreateGPUGraphicsPipeline(dev, &info);
+            info.fragment_shader = maskRepShader;
+            maskRepPipeline = SDL_CreateGPUGraphicsPipeline(dev, &info);
+        }
+        if (!maskPipeline || !maskRepPipeline)
+        {
+            std::fprintf(stderr, "[light] wrestler shape cannot be set up (%s); the wrestlers stay tinted by position only\n", SDL_GetError());
+            rimSetupFailed = true;
+            wantRim = false;
+        }
+    }
+    if (wantRim != rimOn)
+        std::fprintf(stderr, "[light] wrestler shape %s\n", wantRim ? "on" : "off");
+    rimOn = wantRim;
+}
+
+// Wrestler shape (task lt3-T1): one triangle of a wrestler card is about to be drawn into `ft`. Makes the frame's two textures on first
+// use, finds the wrestler the card belongs to (by its plane), and adds the card to what the field's shape pass needs to know.
+void GSGpuBackend::Impl::rimNoteCard(FrameTarget &ft, Draw &d, const Setup &setup, const GSDrawState &state, const LightVertex *verts)
+{
+    if (!ft.rimWhere || !ft.rimMask)
+    {
+        SDL_GPUTextureCreateInfo ci = {};
+        ci.type = SDL_GPU_TEXTURETYPE_2D;
+        ci.usage = SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER;
+        ci.width = ft.w;
+        ci.height = ft.h;
+        ci.layer_count_or_depth = 1;
+        ci.num_levels = 1;
+        ci.sample_count = SDL_GPU_SAMPLECOUNT_1;
+        if (!ft.rimWhere)
+        {
+            ci.format = SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT;
+            ft.rimWhere = SDL_CreateGPUTexture(dev, &ci);
+            if (ft.rimWhere)
+                frameTargetBytes += static_cast<uint64_t>(ft.w) * ft.h * 8u;
+        }
+        if (!ft.rimMask)
+        {
+            ci.format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
+            ft.rimMask = SDL_CreateGPUTexture(dev, &ci);
+            if (ft.rimMask)
+                frameTargetBytes += static_cast<uint64_t>(ft.w) * ft.h * 4u;
+        }
+        if (!ft.rimWhere || !ft.rimMask)
+        {
+            std::fprintf(stderr, "[light] cannot create the %ux%u wrestler textures of a frame target: %s\n", ft.w, ft.h, SDL_GetError());
+            return; // the card is drawn as tier 2 draws it
+        }
+    }
+    // The card's plane: every part of a wrestler stands in one upright plane that faces the camera's side, so the distance of the
+    // plane from the arena's centre along its normal is the same for all his parts (they differ by under 1 unit; another wrestler
+    // further forward or back by more). Two wrestlers in a hold share a plane and count as one.
+    float centre[3] = {0.0f, 0.0f, 0.0f};
+    for (int i = 0; i < 3; ++i)
+    {
+        const float q = setup.v[i].q;
+        for (int k = 0; k < 3; ++k)
+            centre[k] += (std::fabs(q) > 1.0e-12f ? verts[i].worldQ[k] / q : 0.0f) / 3.0f;
+    }
+    const float plane = centre[0] * verts[0].normal[0] + centre[1] * verts[0].normal[1] + centre[2] * verts[0].normal[2];
+    uint32_t index = ft.rimPlaneCount;
+    for (uint32_t i = 0; i < ft.rimPlaneCount; ++i)
+        if (std::fabs(ft.rimPlanes[i] - plane) < 2.0f)
+        {
+            index = i;
+            break;
+        }
+    if (index == ft.rimPlaneCount)
+    {
+        if (ft.rimPlaneCount < 16u)
+            ft.rimPlanes[ft.rimPlaneCount++] = plane;
+        else
+            index = 15u; // more planes than the table holds: the rest share the last one's channel
+        rimPlanesMost = std::max<uint64_t>(rimPlanesMost, ft.rimPlaneCount);
+    }
+    d.pipeline |= kCardKey;
+    d.rimChannel = static_cast<uint8_t>(1u + (index & 3u));
+    d.rimClear = ft.rimPending;
+    if (ft.rimPending)
+        ++rimFields;
+    ft.rimPending = false;
+    ft.rimValid = true;
+    ++rimCards;
+    // The box the cards cover and how big their texels are on the screen (the outline's width is given in such texels).
+    const float tw = static_cast<float>(1u << state.context.tex0.tw), th = static_cast<float>(1u << state.context.tex0.th);
+    float u[3], v[3];
+    for (int i = 0; i < 3; ++i)
+    {
+        const Vertex &p = setup.v[i];
+        const float invQ = std::fabs(p.q) > 1.0e-12f ? 1.0f / p.q : 0.0f;
+        u[i] = p.u * invQ * tw;
+        v[i] = p.v * invQ * th;
+        ft.rimX0 = std::min(ft.rimX0, static_cast<int32_t>(std::floor(p.x)));
+        ft.rimY0 = std::min(ft.rimY0, static_cast<int32_t>(std::floor(p.y)));
+        ft.rimX1 = std::max(ft.rimX1, static_cast<int32_t>(std::ceil(p.x)));
+        ft.rimY1 = std::max(ft.rimY1, static_cast<int32_t>(std::ceil(p.y)));
+    }
+    ft.rimAreaPixels += 0.5 * std::fabs(static_cast<double>(setup.v[1].x - setup.v[0].x) * (setup.v[2].y - setup.v[0].y) -
+                                        static_cast<double>(setup.v[2].x - setup.v[0].x) * (setup.v[1].y - setup.v[0].y));
+    ft.rimAreaTexels += 0.5 * std::fabs(static_cast<double>(u[1] - u[0]) * (v[2] - v[0]) - static_cast<double>(u[2] - u[0]) * (v[1] - v[0]));
+    for (int k = 0; k < 3; ++k)
+        ft.rimEye[k] = static_cast<float>(lightUnproject.eye[k]);
+    ft.rimRightSign = lightRightSign;
+}
+
+// Wrestler shape: what the chain needs for the field in `ft` (nothing when the field has no card drawn with shape).
+void GSGpuBackend::Impl::rimFillJob(const FrameTarget &ft, ps2x_postfx::Job &job) const
+{
+    if (!rimOn || !ft.rimValid || !ft.rimWhere || !ft.rimMask || ft.rimX1 < ft.rimX0 || ft.rimY1 < ft.rimY0)
+        return;
+    job.rimMask = ft.rimMask;
+    job.rimWhere = ft.rimWhere;
+    job.targetW = ft.w;
+    job.targetH = ft.h;
+    job.rimX0 = std::max(ft.rimX0, 0);
+    job.rimY0 = std::max(ft.rimY0, 0);
+    job.rimX1 = std::min(ft.rimX1, static_cast<int32_t>(ft.w) - 1);
+    job.rimY1 = std::min(ft.rimY1, static_cast<int32_t>(ft.h) - 1);
+    std::memcpy(job.rimEye, ft.rimEye, sizeof(job.rimEye));
+    job.rimRightSign = ft.rimRightSign;
+    job.rimShape = lightLook.wrestlerShape;
+    job.rimStrength = lightLook.wrestlerRim;
+    job.rimLean = ps2x_lighting::kWrestlerLean;
+    // One wrestler texel on the screen, in target pixels (the internal resolution is in it): the outline keeps its width in the
+    // wrestler's own texels at any resolution and camera distance.
+    const double texel = ft.rimAreaTexels > 1.0 ? std::sqrt(ft.rimAreaPixels / ft.rimAreaTexels) : static_cast<double>(scaleX);
+    job.rimSigma = static_cast<float>(lightLook.wrestlerOutline * texel);
+    static_assert(sizeof(job.rimLights) == sizeof(ps2x_lighting::LightUniforms), "Job::rimLights holds a LightUniforms");
+    std::memcpy(job.rimLights, &lightBlocks[2], sizeof(job.rimLights));
 }
 
 // One scene triangle, while the game hands over a frame that has a camera: the world position of each corner (times its Q) and
@@ -4550,6 +4876,20 @@ bool GSGpuBackend::Impl::lightRecoverTriangle(const GSPrimitiveBatch &batch, con
             lightMatRow(); // the frame of the previous camera is complete
         lightSerial = camera.serial;
         lightUnproject = ps2x_lighting::Unprojector::from(camera.m);
+        {
+            // Wrestler shape needs to know which way is "right on the screen" in the world: a step to the right at this triangle's
+            // first corner, at the same distance, against cross(up, view direction).
+            const GSVertex &v0 = batch.vertices[0];
+            double a[3], b[3];
+            lightRightSign = 1.0f;
+            if (lightUnproject.worldAt(v0.x, v0.y, v0.q, a) && lightUnproject.worldAt(v0.x + 8.0f, v0.y, v0.q, b))
+            {
+                const double view[3] = {a[0] - lightUnproject.eye[0], a[1] - lightUnproject.eye[1], a[2] - lightUnproject.eye[2]};
+                const double right[3] = {view[2], 0.0, -view[0]}; // cross((0, 1, 0), view)
+                if ((b[0] - a[0]) * right[0] + (b[2] - a[2]) * right[2] < 0.0)
+                    lightRightSign = -1.0f;
+            }
+        }
         lightStats.matVertices = lightStats.matEdgeVertices = 0;
         lightStats.matSum = lightStats.matEdgeSum = 0.0;
         ++lightStats.cameras;
@@ -4668,6 +5008,10 @@ void GSGpuBackend::Impl::lightShutdown()
         if (lightOn)
             std::fprintf(stderr, "[light] lit %llu primitives in %llu fields; %llu left unlit by rule (shadows)\n", static_cast<unsigned long long>(lightLitPrimitives),
                          static_cast<unsigned long long>(lightFieldsLit), static_cast<unsigned long long>(lightUnlitByRule));
+        if (rimCards != 0u)
+            std::fprintf(stderr, "[light] wrestler shape: %llu card triangles in %llu fields; most wrestler planes in a field %llu; %llu lit primitives that are not cards came after a card\n",
+                         static_cast<unsigned long long>(rimCards), static_cast<unsigned long long>(rimFields), static_cast<unsigned long long>(rimPlanesMost),
+                         static_cast<unsigned long long>(rimLitAfterCards));
         std::fprintf(stderr, "[light] recovered %llu scene triangles in %llu frames with a camera (%llu with no area in the world), %llu drawn by the debug view",
                      static_cast<unsigned long long>(lightStats.triangles), static_cast<unsigned long long>(lightStats.cameras),
                      static_cast<unsigned long long>(lightStats.noNormal), static_cast<unsigned long long>(lightStats.drawn));
@@ -4689,6 +5033,14 @@ void GSGpuBackend::Impl::lightShutdown()
     if (litRepShader)
         SDL_ReleaseGPUShader(dev, litRepShader);
     litShader = litRepShader = nullptr;
+    for (SDL_GPUGraphicsPipeline *p : {maskPipeline, maskRepPipeline})
+        if (p)
+            SDL_ReleaseGPUGraphicsPipeline(dev, p);
+    for (SDL_GPUShader *sh : {cardShader, cardRepShader, maskShader, maskRepShader})
+        if (sh)
+            SDL_ReleaseGPUShader(dev, sh);
+    maskPipeline = maskRepPipeline = nullptr;
+    cardShader = cardRepShader = maskShader = maskRepShader = nullptr;
     lightBuffer = nullptr;
     lightUpload = nullptr;
     lightVertexShader = lightDebugShader = nullptr;

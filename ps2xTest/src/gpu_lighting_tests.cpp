@@ -16,6 +16,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <sstream>
 #include <iostream>
 #include <string>
@@ -303,7 +304,7 @@ namespace
     // ---- the lights on the GPU renderer (task lt2-L1)
     // A match field in the made-up camera: the clear, a floor of 16 x 16 squares (512 triangle-list triangles, which makes it a match
     // field for the screen effects' tracking) 200 units below the eye, and optionally an opaque overlay box (the clock's Z).
-    void drawLitField(GSRasterBackend &b, const float m[16], bool overlay)
+    void drawLitField(GSRasterBackend &b, const float m[16], bool overlay, const std::function<void()> &beforeOverlay = {})
     {
         GSPrimitiveBatch clear;
         clear.vertexCount = 2;
@@ -335,6 +336,8 @@ namespace
             worldTriangle(b, m, a, 1001.0, 40, 220, 80, false);
             worldTriangle(b, m, c, 1001.0, 40, 220, 80, false);
         }
+        if (beforeOverlay)
+            beforeOverlay(); // (more of the scene: the wrestler card of the shape test)
         if (overlay)
         {
             GSPrimitiveBatch box;
@@ -373,7 +376,68 @@ namespace
 
     // A renderer with the lights on or off (PS2X_LIGHT, which is the switch when there is no settings store) and `look` as the
     // current look; the field is drawn three times and the last one read.
-    Field renderLitField(SDL_GPUDevice *device, bool lights, bool camera, bool overlay, const Look &look = testLook(), bool show = false)
+    // ---- wrestler shape (task lt3-T1)
+    // One triangle of a strip, as the game draws a wrestler part: an upright card in the plane z = 0, which faces the made-up camera.
+    void cardTriangle(GSRasterBackend &b, const float m[16], const double points[3][3], double z, uint8_t r, uint8_t g, uint8_t bl)
+    {
+        GSPrimitiveBatch p;
+        p.vertexCount = 3;
+        p.state.context = sceneContext();
+        p.state.prim.type = GS_PRIM_TRISTRIP;
+        p.state.prim.iip = false;
+        p.state.prim.fst = false;
+        for (size_t i = 0; i < 3; ++i)
+        {
+            double x, y, w;
+            project(m, points[i], x, y, w);
+            p.vertices[i].x = static_cast<float>(std::floor(x * 16.0) / 16.0);
+            p.vertices[i].y = static_cast<float>(std::floor(y * 16.0) / 16.0);
+            p.vertices[i].z = z;
+            p.vertices[i].q = static_cast<float>(1.0 / w);
+            p.vertices[i].r = r;
+            p.vertices[i].g = g;
+            p.vertices[i].b = bl;
+            p.vertices[i].a = 0x80;
+        }
+        b.Submit(p);
+    }
+
+    // The scene of the shape test, drawn after the floor: optionally a thin post in front (a triangle list, as ropes and posts are,
+    // drawn before the wrestlers with a higher Z), then a grey card 120 wide and 120 high standing on x -60..60, y -150..-30 at z 0:
+    // picture x 290 to 350, y 254 to 374. The post covers picture x 316 to 324 over the card's whole height.
+    void drawCard(GSRasterBackend &b, const float m[16], bool post)
+    {
+        if (post)
+        {
+            const double a[3][3] = {{-8.0, -160.0, 0.0}, {8.0, -160.0, 0.0}, {-8.0, -20.0, 0.0}};
+            const double c[3][3] = {{8.0, -160.0, 0.0}, {8.0, -20.0, 0.0}, {-8.0, -20.0, 0.0}};
+            worldTriangle(b, m, a, 3000.0, 20, 20, 120);
+            worldTriangle(b, m, c, 3000.0, 20, 20, 120);
+        }
+        const double a[3][3] = {{-60.0, -150.0, 0.0}, {60.0, -150.0, 0.0}, {-60.0, -30.0, 0.0}};
+        const double c[3][3] = {{60.0, -150.0, 0.0}, {-60.0, -30.0, 0.0}, {60.0, -30.0, 0.0}};
+        cardTriangle(b, m, a, 2000.0, 120, 120, 120);
+        cardTriangle(b, m, c, 2000.0, 120, 120, 120);
+    }
+
+    // The look of the shape test: the hall at 0.5 and one white point light to the left of the card and in front of it.
+    Look shapeLook(float shape, float rim)
+    {
+        Look look;
+        look.ambient[0] = look.ambient[1] = look.ambient[2] = 0.5f;
+        Light side;
+        side.type = LightType::Point;
+        side.position[0] = -500.0f; side.position[1] = -90.0f; side.position[2] = -400.0f;
+        side.strength = 1.0f;
+        side.radius = 3000.0f;
+        look.lights.push_back(side);
+        look.wrestlerShape = shape;
+        look.wrestlerRim = rim;
+        look.wrestlerOutline = 4.0f;
+        return look;
+    }
+
+    Field renderLitField(SDL_GPUDevice *device, bool lights, bool camera, bool overlay, const Look &look = testLook(), bool show = false, int card = 0)
     {
         Field out;
         setEnvVar("PS2X_LIGHT", lights ? "1" : nullptr);
@@ -405,7 +469,10 @@ namespace
             if (camera)
                 channel().post(m, 2000u + frame, frame & 1u);
             channel().kickBegin(2000u + frame, frame & 1u);
-            drawLitField(gpu, m, overlay);
+            if (card != 0)
+                drawLitField(gpu, m, overlay, [&]() { drawCard(gpu, m, card == 2); }); // 1: the card, 2: a post in front of it too
+            else
+                drawLitField(gpu, m, overlay);
             channel().kickEnd(1u);
             gpu.MarkPresentation(request);
         }
@@ -1238,6 +1305,204 @@ void register_gpu_lighting_tests()
                     t.IsTrue(changed > 200u && changed < 20000u, "the markers are a dot and thin outlines, not the whole floor (" + std::to_string(changed) + " pixels)");
                     t.IsTrue(std::memcmp(marked.at(530, 64), plain.at(530, 64), 4) == 0, "the overlay box is still the game's");
                 }
+            }
+        }
+        SDL_DestroyGPUDevice(device);
+    });
+
+    tc.Run("wrestler shape: the look file's three lines, the built-in values for a file without them, clamps and refusals; PS2X_LIGHT_SHAPE", [](TestCase &t)
+    {
+        Look look = defaultLook();
+        t.IsTrue(look.wrestlerShape == kWrestlerShape && look.wrestlerRim == kWrestlerRim && look.wrestlerOutline == kWrestlerOutline && wrestlerShapeWanted(look),
+                 "the built-in look has the built-in shape values, and they ask for shape");
+        look.wrestlerShape = 0.25f;
+        look.wrestlerRim = 1.5f;
+        look.wrestlerOutline = 3.5f;
+        Look back;
+        std::string error;
+        const std::string text = formatLook(look);
+        t.IsTrue(text.find("wrestler_shape 0.25\n") != std::string::npos && text.find("wrestler_rim 1.5\n") != std::string::npos && text.find("wrestler_outline 3.5\n") != std::string::npos,
+                 "the three lines are written");
+        t.IsTrue(parseLook(text, back, &error) && back.wrestlerShape == 0.25f && back.wrestlerRim == 1.5f && back.wrestlerOutline == 3.5f && formatLook(back) == text,
+                 "and read back the same" + (error.empty() ? std::string() : ": " + error));
+        // A file written before these lines existed (the L2 format): everything else as it says, the shape at the built-in values.
+        Look old;
+        old.wrestlerShape = old.wrestlerRim = 0.0f;
+        t.IsTrue(parseLook("look 1\nambient 0.3\nlight point\n  position 1 2 3\n", old, &error) && old.ambient[0] == 0.3f && old.lights.size() == 1u &&
+                     old.wrestlerShape == kWrestlerShape && old.wrestlerRim == kWrestlerRim && old.wrestlerOutline == kWrestlerOutline,
+                 "a file without the lines gets the built-in values");
+        Look clamped;
+        t.IsTrue(parseLook("look 1\nwrestler_shape 7\nwrestler_rim -1\nwrestler_outline 100\n", clamped) && clamped.wrestlerShape == 1.0f && clamped.wrestlerRim == 0.0f &&
+                     clamped.wrestlerOutline == 8.0f,
+                 "numbers out of range are clamped (shape 0 to 1, rim 0 to 4, outline 0.5 to 8)");
+        Look none;
+        t.IsTrue(parseLook("look 1\nwrestler_shape 0\nwrestler_rim 0\n", none) && !wrestlerShapeWanted(none), "both strengths at 0: no shape is wanted");
+        const Look before = presetLook("two colours");
+        int refused = 0, untouched = 0;
+        for (const char *bad : {"look 1\nwrestler_shape\n", "look 1\nwrestler_rim 1 2\n", "look 1\nwrestler_outline wide\n", "look 1\nwrestler_glow 1\n"})
+        {
+            Look l = before;
+            refused += parseLook(bad, l, &error) ? 0 : 1;
+            untouched += formatLook(l) == formatLook(before) ? 1 : 0;
+        }
+        t.IsTrue(refused == 4 && untouched == 4, "four wrong lines are refused and leave the look alone");
+
+        Look env = defaultLook();
+        setEnvVar("PS2X_LIGHT_SHAPE", nullptr);
+        t.IsFalse(wrestlerShapeFromEnvironment(env), "PS2X_LIGHT_SHAPE unset: the look's values stay");
+        setEnvVar("PS2X_LIGHT_SHAPE", "0,0");
+        t.IsTrue(wrestlerShapeFromEnvironment(env) && !wrestlerShapeWanted(env) && env.wrestlerOutline == kWrestlerOutline, "PS2X_LIGHT_SHAPE=0,0 turns the shape off and keeps the outline");
+        setEnvVar("PS2X_LIGHT_SHAPE", "0.5,2,3");
+        t.IsTrue(wrestlerShapeFromEnvironment(env) && env.wrestlerShape == 0.5f && env.wrestlerRim == 2.0f && env.wrestlerOutline == 3.0f, "three numbers set all three");
+        setEnvVar("PS2X_LIGHT_SHAPE", nullptr);
+    });
+
+    tc.Run("wrestler shape: a flat-on pixel keeps today's light under the first light; the lit side of the outline gains and the far side loses; the rim only adds", [](TestCase &t)
+    {
+        // The made-up camera's place and a point on a card in front of it; one light to the left and in front.
+        const double eye[3] = {0.0, 0.0, -1000.0};
+        const float at[3] = {0.0f, -90.0f, 0.0f};
+        Look look = shapeLook(1.0f, 0.0f);
+        float flat[3], left[3], right[3], up[3];
+        wrestlerShapeAt(look, at, eye, 0.0f, 0.0f, 0.0f, 1.0f, flat);
+        t.IsTrue(std::fabs(flat[0]) < 1.0e-5f && std::fabs(flat[2]) < 1.0e-5f, "no lean: the change is 0 (" + number(flat[0]) + ")");
+        wrestlerShapeAt(look, at, eye, -1.0f, 0.0f, kWrestlerLean, 1.0f, left);
+        wrestlerShapeAt(look, at, eye, 1.0f, 0.0f, kWrestlerLean, 1.0f, right);
+        wrestlerShapeAt(look, at, eye, 0.0f, -1.0f, kWrestlerLean, 1.0f, up);
+        t.IsTrue(left[0] > 0.05f && right[0] < -0.05f, "the outline on the light's side gains (" + number(left[0]) + "), the other side loses (" + number(right[0]) + ")");
+        t.IsTrue(up[0] < left[0] && up[0] > right[0], "an outline that faces up, with the light level with it, is in between (" + number(up[0]) + ")");
+        // By hand for the left outline, with the eye level with the point (so "towards the eye" is exactly -z):
+        // N = 0.92 x left + sqrt(1 - 0.92^2) x towards the eye; L = (-500, 0, -400) / |...|.
+        {
+            const double level[3] = {0.0, -90.0, -1000.0};
+            wrestlerShapeAt(look, at, level, -1.0f, 0.0f, kWrestlerLean, 1.0f, left);
+            const double lx = -500.0 / std::sqrt(500.0 * 500.0 + 400.0 * 400.0), lz = -400.0 / std::sqrt(500.0 * 500.0 + 400.0 * 400.0);
+            const double depth = std::sqrt(1.0 - 0.92 * 0.92), length = std::sqrt(0.92 * 0.92 + depth * depth);
+            const double nl = (-0.92 * lx - depth * lz) / length;
+            const double wrapN = std::fmin(1.0, (nl + 0.5) / 1.5), wrapFlat = (-lz + 0.5) / 1.5;
+            float today[3];
+            const float anyNormal[3] = {0.0f, 1.0f, 0.0f};
+            lookAt(look, at, anyNormal, Facing::PositionOnly, today);
+            const double lightOnly = today[0] - 0.5;
+            const double expected = lightOnly * (wrapN / wrapFlat) - lightOnly;
+            t.IsTrue(std::fabs(left[0] - expected) < 1.0e-4, "the left outline by hand: " + number(expected) + ", got " + number(left[0]));
+        }
+        // The mirror camera (cross(up, view) to the left of the screen): the same lean on the screen is the other way in the world.
+        float mirrored[3];
+        wrestlerShapeAt(look, at, eye, -1.0f, 0.0f, kWrestlerLean, -1.0f, mirrored);
+        t.IsTrue(std::fabs(mirrored[0] - right[0]) < 1.0e-5f, "the right-hand sign turns the lean round");
+        // The rim alone: nothing well inside, light on the side that faces the light, none on the far side, never less than 0.
+        look = shapeLook(0.0f, 1.0f);
+        float rimFlat[3], rimLeft[3], rimRight[3];
+        wrestlerShapeAt(look, at, eye, 0.0f, 0.0f, 0.0f, 1.0f, rimFlat);
+        wrestlerShapeAt(look, at, eye, -1.0f, 0.0f, kWrestlerLean, 1.0f, rimLeft);
+        wrestlerShapeAt(look, at, eye, 1.0f, 0.0f, kWrestlerLean, 1.0f, rimRight);
+        t.IsTrue(rimFlat[0] == 0.0f && rimLeft[0] > 0.1f && rimRight[0] == 0.0f, "the rim: 0 inside, " + number(rimLeft[0]) + " towards the light, 0 away from it");
+        look = shapeLook(0.0f, 0.0f);
+        wrestlerShapeAt(look, at, eye, -1.0f, 0.0f, kWrestlerLean, 1.0f, left);
+        t.IsTrue(left[0] == 0.0f && left[1] == 0.0f && left[2] == 0.0f, "both strengths at 0: no change anywhere");
+        look = shapeLook(1.0f, 1.0f);
+        look.lights.clear();
+        wrestlerShapeAt(look, at, eye, -1.0f, 0.0f, kWrestlerLean, 1.0f, left);
+        t.IsTrue(left[0] == 0.0f, "no lights: no change");
+    });
+
+    tc.Run("wrestler shape on the GPU renderer: at strength 0 the lit picture's bytes; with it, only the card changes, its lit edge gains and its far edge loses, a post in front cuts no edge", [](TestCase &t)
+    {
+        if (!SDL_Init(SDL_INIT_VIDEO))
+        {
+            SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "offscreen");
+            if (!SDL_Init(SDL_INIT_VIDEO))
+            {
+                std::cout << "    (skipped: no SDL video driver)" << std::endl;
+                return;
+            }
+        }
+        const SDL_GPUShaderFormat formats = SDL_GPU_SHADERFORMAT_SPIRV | SDL_GPU_SHADERFORMAT_DXIL | SDL_GPU_SHADERFORMAT_MSL;
+        SDL_GPUDevice *device = SDL_CreateGPUDevice(formats, false, nullptr);
+        if (!device)
+        {
+            std::cout << "    (skipped: no GPU device: " << SDL_GetError() << ")" << std::endl;
+            return;
+        }
+        {
+            ps2x_settings::resetForTest();
+            ps2x_postfx::Params off;
+            off.enabled = false;
+            ps2x_postfx::setLive(off);
+            GSMem::InitLookupTables();
+            setEnvVar("PS2X_LIGHT_SHAPE", nullptr);
+            const Field plain = renderLitField(device, false, true, true, shapeLook(1.0f, 1.0f), false, 1);
+            const Field flat = renderLitField(device, true, true, true, shapeLook(0.0f, 0.0f), false, 1);
+            const uint32_t passesFlat = ps2x_postfx::status().lastPasses.load();
+            const Field shaped = renderLitField(device, true, true, true, shapeLook(1.0f, 0.0f), false, 1);
+            const uint32_t passesShaped = ps2x_postfx::status().lastPasses.load();
+            const Field rimmed = renderLitField(device, true, true, true, shapeLook(0.0f, 1.0f), false, 1);
+            const Field noOverlay = renderLitField(device, true, true, false, shapeLook(1.0f, 0.0f), false, 1);
+            const Field flatPost = renderLitField(device, true, true, true, shapeLook(0.0f, 0.0f), false, 2);
+            const Field shapedPost = renderLitField(device, true, true, true, shapeLook(1.0f, 0.0f), false, 2);
+            setEnvVar("PS2X_LIGHT_SHAPE", "0,0");
+            const Field byEnvironment = renderLitField(device, true, true, true, shapeLook(1.0f, 1.0f), false, 1);
+            setEnvVar("PS2X_LIGHT_SHAPE", nullptr);
+            const bool ok = plain.ok && flat.ok && shaped.ok && rimmed.ok && noOverlay.ok && flatPost.ok && shapedPost.ok && byEnvironment.ok;
+            t.IsTrue(ok, "eight fields were read back");
+            if (ok)
+            {
+                // The card is picture x 290 to 350, y 254 to 374. Rows 300 to 330 are clear of its top and bottom edge.
+                t.IsTrue(near3(plain.at(320, 314), 120, 120, 120, 1), "lights off: the card in its own grey, " + rgbText(plain.at(320, 314)));
+                t.IsTrue(flat.px == byEnvironment.px, "PS2X_LIGHT_SHAPE=0,0 over a look that asks for shape: the bytes of the look with both strengths at 0");
+                t.IsTrue(passesFlat == 1u && passesShaped == 4u, "the chain: 1 pass at strength 0, 4 with shape (two for the mask's blur, one to light the card again, the multiply): " +
+                                                                    std::to_string(passesFlat) + ", " + std::to_string(passesShaped));
+                // Outside the card nothing changes, to the byte.
+                uint32_t outside = 0, inside = 0;
+                for (uint32_t y = 0; y < 448; ++y)
+                    for (uint32_t x = 0; x < 640; ++x)
+                    {
+                        const bool onCard = x >= 289 && x <= 351 && y >= 252 && y <= 376;
+                        const bool differs = std::memcmp(shaped.at(x, y), flat.at(x, y), 4) != 0 || std::memcmp(rimmed.at(x, y), flat.at(x, y), 4) != 0;
+                        (onCard ? inside : outside) += differs ? 1u : 0u;
+                    }
+                t.IsTrue(outside == 0u && inside > 500u, "shape and rim change pixels of the card (" + std::to_string(inside) + ") and none outside it (" + std::to_string(outside) + ")");
+                t.IsTrue(std::memcmp(shaped.at(530, 64), plain.at(530, 64), 4) == 0, "the overlay box: the game's own pixels");
+                // The middle of the card is flat-on: as at strength 0. The light is to the left: the left edge gains, the right edge loses.
+                const int mid = shaped.at(320, 314)[0] - flat.at(320, 314)[0];
+                const int left = shaped.at(291, 314)[0] - flat.at(291, 314)[0], right = shaped.at(348, 314)[0] - flat.at(348, 314)[0];
+                t.IsTrue(std::abs(mid) <= 1, "the middle of the card keeps today's light (" + std::to_string(mid) + " levels)");
+                t.IsTrue(left >= 8 && right <= -8, "the edge towards the light gains (" + std::to_string(left) + " levels), the far edge loses (" + std::to_string(right) + ")");
+                // Against the reference arithmetic: at the left edge's outermost pixel the blurred mask is about 1/2, so the lean is its
+                // full 0.92, straight to the left (the edge is upright and far from the corners).
+                {
+                    const double eye[3] = {0.0, 0.0, -1000.0};
+                    const float at[3] = {-59.0f, -90.0f, 0.0f}; // picture (290, 314)
+                    const Look look = shapeLook(1.0f, 0.0f);
+                    float change[3], today[3];
+                    const float anyNormal[3] = {0.0f, 1.0f, 0.0f};
+                    wrestlerShapeAt(look, at, eye, -1.0f, 0.0f, kWrestlerLean, 1.0f, change);
+                    lookAt(look, at, anyNormal, Facing::PositionOnly, today);
+                    const int expected = linearToSrgb8(srgbToLinear(120 / 255.0) * (today[0] + change[0]));
+                    const int got = shaped.at(290, 314)[0];
+                    t.IsTrue(std::abs(got - expected) <= 6, "the outermost pixel of the lit edge: " + std::to_string(got) + " for the reference's " + std::to_string(expected));
+                }
+                // The rim alone: light on the left edge only.
+                const int rimLeft = rimmed.at(290, 314)[0] - flat.at(290, 314)[0], rimMid = rimmed.at(320, 314)[0] - flat.at(320, 314)[0],
+                          rimRight = rimmed.at(349, 314)[0] - flat.at(349, 314)[0];
+                t.IsTrue(rimLeft >= 8 && rimMid == 0 && rimRight == 0, "the rim alone: " + std::to_string(rimLeft) + " levels on the lit edge, " + std::to_string(rimMid) +
+                                                                           " in the middle, " + std::to_string(rimRight) + " on the far edge");
+                t.IsTrue(differing(shaped, noOverlay, 0, 100, 640, 448) == 0u, "a field without an overlay is shaped the same (the chain runs at the field copy)");
+                // A post in front of the card (picture x 316 to 324): the card's pixels beside it are as without the post, because the
+                // mask is drawn with no depth test; the post's own pixels are not shaped.
+                uint32_t beside = 0, onPost = 0;
+                for (uint32_t y = 300; y < 330; ++y)
+                {
+                    for (uint32_t x = 292; x < 314; ++x)
+                        beside += std::memcmp(shapedPost.at(x, y), shaped.at(x, y), 4) != 0 ? 1u : 0u;
+                    for (uint32_t x = 327; x < 348; ++x)
+                        beside += std::memcmp(shapedPost.at(x, y), shaped.at(x, y), 4) != 0 ? 1u : 0u;
+                    for (uint32_t x = 318; x < 323; ++x)
+                        onPost += std::memcmp(shapedPost.at(x, y), flatPost.at(x, y), 4) != 0 ? 1u : 0u;
+                }
+                t.IsTrue(beside == 0u, "a post in front cuts no edge into the card: the card beside it is as without the post (" + std::to_string(beside) + " pixels differ)");
+                t.IsTrue(onPost == 0u, "and the post's own pixels are not shaped (" + std::to_string(onPost) + " differ)");
             }
         }
         SDL_DestroyGPUDevice(device);
