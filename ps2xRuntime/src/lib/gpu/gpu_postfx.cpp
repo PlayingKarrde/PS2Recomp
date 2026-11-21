@@ -664,6 +664,7 @@ namespace ps2x_postfx
             r.v[kBloom][1] = job.rimPaint;
             r.v[kBloom][2] = job.rimCrease;
             r.v[kBloom][3] = job.rimOutline;
+            r.v[kTilt][2] = job.rimTexel; // (only the pass with the maps reads it: the tagged parts' crease rule)
         }
         {
             SDL_GPUColorTargetInfo ct = {};

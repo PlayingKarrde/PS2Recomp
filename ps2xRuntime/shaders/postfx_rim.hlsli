@@ -43,9 +43,49 @@ float SigmasInside(float b)
     return 1.41421356f * sqrt(max(sqrt(max(t * t - ln / a, 0.0f)) - t, 0.0f));
 }
 
+// The game's tag (task lt3-T2). A card that carries it writes, in the alpha of Where, 4 x (1 + part class) on top of its mask channel
+// (GSGpuBackend: Draw::rimPart). `group` is the whole part of that alpha: 1 to 4 for a card without a tag.
+float PartOf(float group)
+{
+    return floor((group - 1.0f) * 0.25f); // 0: no tag; else 1 + the part class
+}
+
+// ps2x_lighting::partsJoined: true when two part classes (0 head, 1 chest, 2 waist, 3 upper arm, 4 forearm, 5 shin, 6 thigh,
+// 7 hand, 8 foot) are joined in the body or are the same class, and for anything that is not one of the nine.
+bool PartsJoined(float a, float b)
+{
+    if (a > 8.5f || b > 8.5f || a == b)
+        return true;
+    const float lo = min(a, b), hi = max(a, b);
+    return (lo == 0.0f && hi == 1.0f) || (lo == 1.0f && hi == 2.0f) || (lo == 1.0f && hi == 3.0f) || (lo == 3.0f && hi == 4.0f) ||
+           (lo == 4.0f && hi == 7.0f) || (lo == 2.0f && hi == 6.0f) || (lo == 5.0f && hi == 6.0f) || (lo == 5.0f && hi == 8.0f);
+}
+
+// 1 when the rounded edge of the tagged part at pixel `q` must be kept although it lies inside the wrestler: just past the part's
+// own edge (the way its bulge leans, as far as the bulge says the edge is, and PROBE_PAST texels more) lies another tagged part of
+// the same wrestler that is not joined to this one in the body. That is a limb in front of the body (an arm across the chest), not
+// a joint. 0 otherwise, and always for a card without a tag (the `edgeKept` of ps2x_lighting::wrestlerTileLean).
+#define PROBE_PAST 2.0f
+float EdgeKept(int2 q, float2 bulge, float l, float group)
+{
+    const float part = PartOf(group);
+    if (part < 0.5f || l < 0.05f || Tilt.z <= 0.0f)
+        return 0.0f;
+    const float reach = (TILE_RADIUS * (1.0f - l) + PROBE_PAST) * Tilt.z; // target pixels
+    const int2 at = q + int2(round(bulge / l * reach));
+    const float4 there = Where.Load(int3(clamp(at, int2(0, 0), int2(Src.xy + Src.zw) - 1), 0));
+    if (there.a < 0.75f)
+        return 0.0f; // nothing of a wrestler there: this edge is on the outline, which the fade leaves alone anyway
+    const float groupThere = floor(there.a);
+    const float partThere = PartOf(groupThere);
+    if (partThere < 0.5f || groupThere - partThere * 4.0f != group - part * 4.0f)
+        return 0.0f; // no tag, or another wrestler (his outline is his own mask's)
+    return PartsJoined(part - 1.0f, partThere - 1.0f) ? 0.0f : 1.0f;
+}
+
 // What the tile's generated map adds to the lean at a pixel (ps2x_lighting::wrestlerTileLean). `lean` is the card shader's fourth
-// output, `b` the blurred mask of the pixel's wrestler.
-float2 TileLean(float4 lean, float b)
+// output, `b` the blurred mask of the pixel's wrestler, `q` the pixel and `group` the whole part of its Where alpha.
+float2 TileLean(float4 lean, float b, int2 q, float group)
 {
     const float4 m = lean * 255.0f;
     const float2 bulge = (m.xy - 128.0f) / 127.0f;
@@ -54,7 +94,8 @@ float2 TileLean(float4 lean, float b)
     const float dTile = TILE_RADIUS * (1.0f - l);
     const float dOut = Bloom.w * SigmasInside(b);
     const float x = saturate((dOut - dTile - CREASE_START) / (CREASE_END - CREASE_START));
-    const float fade = 1.0f - Bloom.z * (x * x * (3.0f - 2.0f * x));
+    // (max: for a card without a tag EdgeKept is 0 and the fade is, bit for bit, what it was before the tag existed)
+    const float fade = max(1.0f - Bloom.z * (x * x * (3.0f - 2.0f * x)), EdgeKept(q, bulge, l, group));
     const float2 slope = bulge * (fade / sqrt(max(1.0f - l * l, 0.05f))) + Bloom.y * paint;
     return slope * (Bloom.x / sqrt(1.0f + dot(slope, slope)));
 }
@@ -75,8 +116,14 @@ float4 main(PSInput input) : SV_Target0
     const float4 where = Where.Load(int3(q, 0));
     if (where.a < 0.75f)
         return light; // not a wrestler's pixel
+#ifdef RIM_NORMALS
+    const float whole = floor(where.a);
+    const float group = whole - PartOf(whole) * 4.0f; // the mask channel, 1 to 4 (the game's tag sits above it: PartOf)
+    const float share = (where.a - whole) * 2.0f;
+#else
     const float group = floor(where.a);
     const float share = (where.a - group) * 2.0f;
+#endif
     const float4 channel = float4(group == 1.0f ? 1.0f : 0.0f, group == 2.0f ? 1.0f : 0.0f, group == 3.0f ? 1.0f : 0.0f, group >= 4.0f ? 1.0f : 0.0f);
 
     // The outline: how far down the blurred mask this pixel is, and which way the mask falls (y grows down the screen).
@@ -99,7 +146,7 @@ float4 main(PSInput input) : SV_Target0
     const float2 s = out2 * lean;
 #ifdef RIM_NORMALS
     // The generated map's lean is added to the outline's; together they never tip the surface further than LEAN_MOST.
-    const float2 tile = TileLean(Lean.Load(int3(q, 0)), b);
+    const float2 tile = TileLean(Lean.Load(int3(q, 0)), b, q, whole);
     float2 tip = s;
     float depth = sqrt(max(1.0f - lean * lean, 0.02f));
     if (tile.x != 0.0f || tile.y != 0.0f)

@@ -1529,6 +1529,142 @@ void register_gpu_lighting_tests()
         t.IsTrue(std::fabs(held[0] - most[0]) < 1.0e-5f, "the tip is held to kWrestlerLeanMost");
     });
 
+    tc.Run("the part tag: every tag reads back from both triangles of its quad whatever bytes it replaces; the game's own bytes never read as a tag", [](TestCase &t)
+    {
+        // The game's own byte for a corner is the low byte of the whole part of w + 1; the renderer has Q = 1 / w.
+        const auto qOf = [](float w) { return 1.0f / w; };
+        const auto ownByte = [](float w) { return static_cast<uint8_t>(static_cast<uint32_t>(std::floor(w + 1.0f)) & 0xFFu); };
+        // Every payload (wrestler 0-15, class 0-15, order 0-31, the referee flag), each against a few sets of bytes it may replace:
+        // corners at nearly the same depth (as a quad's are), and bytes that happen to equal the tag's own.
+        uint64_t tags = 0, refused = 0, wrongFirst = 0, wrongSecond = 0;
+        uint32_t seed = 12345u;
+        const auto next = [&]() { seed = seed * 1664525u + 1013904223u; return seed >> 8; };
+        for (uint32_t wrestler = 0; wrestler < 16u; ++wrestler)
+            for (uint32_t partClass = 0; partClass < 16u; ++partClass)
+                for (uint32_t order = 0; order < 32u; ++order)
+                    for (uint32_t referee = 0; referee < 2u; ++referee)
+                        for (int trial = 0; trial < 6; ++trial)
+                        {
+                            PartTag tag;
+                            tag.wrestler = static_cast<uint8_t>(wrestler);
+                            tag.partClass = static_cast<uint8_t>(partClass);
+                            tag.order = static_cast<uint8_t>(order);
+                            tag.referee = referee != 0u;
+                            float w[4];
+                            const float base = 300.0f + static_cast<float>(next() % 3000u);
+                            for (float &value : w)
+                                value = base + static_cast<float>(next() % 6000u) / 100.0f;
+                            uint8_t original[4], bytes[4];
+                            for (int i = 0; i < 4; ++i)
+                                original[i] = ownByte(w[i]);
+                            if (trial >= 4)
+                            {
+                                // The worst case for the game's side: the corners' own bytes are the very bytes one salt would write.
+                                const uint8_t data1 = static_cast<uint8_t>(wrestler | (partClass << 4));
+                                const uint8_t data2 = static_cast<uint8_t>(order | (referee << 5) | ((trial - 4u) << 6));
+                                const uint8_t same[4] = {partTagCheckFirst(data1, data2), data1, data2, partTagCheckLast(data1, data2)};
+                                for (int i = 0; i < 4; ++i)
+                                {
+                                    // a w whose own byte is that byte
+                                    w[i] = std::floor(base / 256.0f) * 256.0f + static_cast<float>(same[i]) - 1.0f + 0.5f;
+                                    original[i] = ownByte(w[i]);
+                                }
+                            }
+                            ++tags;
+                            if (!encodePartTag(tag, original, bytes))
+                            {
+                                ++refused;
+                                continue;
+                            }
+                            const float q[4] = {qOf(w[0]), qOf(w[1]), qOf(w[2]), qOf(w[3])};
+                            PartTag first, second;
+                            const bool a = decodePartTag(bytes, q, first), b = decodePartTag(bytes + 1, q + 1, second);
+                            const auto same = [&](const PartTag &x) {
+                                return x.wrestler == tag.wrestler && x.partClass == tag.partClass && x.order == tag.order && x.referee == tag.referee;
+                            };
+                            wrongFirst += (a && same(first)) ? 0u : 1u;
+                            wrongSecond += (b && same(second)) ? 0u : 1u;
+                        }
+        t.IsTrue(tags == 16u * 16u * 32u * 2u * 6u && refused == 0u, "every tag can be written (" + std::to_string(refused) + " of " + std::to_string(tags) + " refused)");
+        t.IsTrue(wrongFirst == 0u && wrongSecond == 0u,
+                 "every tag reads back from its first and its second triangle (" + std::to_string(wrongFirst) + " and " + std::to_string(wrongSecond) + " wrong)");
+        // For every pair of data bytes at least two of the four salts leave the second triangle unlike a first one, so that one
+        // of them is also clear of the bytes it replaces.
+        uint32_t fewest = 4;
+        for (uint32_t data1 = 0; data1 < 256u; ++data1)
+            for (uint32_t plain2 = 0; plain2 < 64u; ++plain2)
+            {
+                uint32_t free = 0;
+                for (uint32_t salt = 0; salt < 4u; ++salt)
+                {
+                    const uint8_t data2 = static_cast<uint8_t>(plain2 | (salt << 6));
+                    free += static_cast<uint8_t>(data1) != partTagCheckFirst(data2, partTagCheckLast(static_cast<uint8_t>(data1), data2)) ? 1u : 0u;
+                }
+                fewest = std::min(fewest, free);
+            }
+        t.IsTrue(fewest >= 2u, "at least two salts are free for every tag (fewest: " + std::to_string(fewest) + ")");
+        // The game's own bytes, at any depth and with the renderer's Q rounded as a float: never a tag.
+        uint64_t misread = 0, triangles = 0;
+        for (int i = 0; i < 400000; ++i)
+        {
+            float w[3];
+            const float base = 50.0f + static_cast<float>(next() % 600000u) / 100.0f;
+            uint8_t fog[3];
+            float q[3];
+            for (int k = 0; k < 3; ++k)
+            {
+                w[k] = base + static_cast<float>(next() % 8000u) / 100.0f;
+                fog[k] = ownByte(w[k]);
+                q[k] = qOf(w[k]);
+            }
+            PartTag tag;
+            ++triangles;
+            misread += decodePartTag(fog, q, tag) ? 1u : 0u;
+        }
+        t.IsTrue(misread == 0u, "none of " + std::to_string(triangles) + " untagged triangles reads as a tag (" + std::to_string(misread) + ")");
+        // The other emitter of the game (0x18D160) leaves w, not w + 1: still the game's own.
+        {
+            const float w[3] = {812.3f, 830.9f, 799.99f};
+            const uint8_t fog[3] = {static_cast<uint8_t>(static_cast<uint32_t>(w[0]) & 0xFFu), static_cast<uint8_t>(static_cast<uint32_t>(w[1]) & 0xFFu),
+                                    static_cast<uint8_t>(static_cast<uint32_t>(w[2]) & 0xFFu)};
+            const float q[3] = {qOf(w[0]), qOf(w[1]), qOf(w[2])};
+            PartTag tag;
+            t.IsTrue(!decodePartTag(fog, q, tag), "bytes made from w alone are not a tag either");
+        }
+    });
+
+    tc.Run("the part tag: which part classes are joined; a kept edge is not faded, and without one the fade is what it was", [](TestCase &t)
+    {
+        bool symmetric = true, selves = true;
+        int joins = 0;
+        for (uint32_t a = 0; a < kPartClassCount; ++a)
+        {
+            selves = selves && partsJoined(a, a);
+            for (uint32_t b = 0; b < kPartClassCount; ++b)
+            {
+                symmetric = symmetric && partsJoined(a, b) == partsJoined(b, a);
+                joins += (a < b && partsJoined(a, b)) ? 1 : 0;
+            }
+        }
+        t.IsTrue(symmetric && selves, "the table is the same both ways and a class is joined to itself");
+        t.IsTrue(joins == 8, "eight joints: neck, waist, two shoulders' worth (chest-upper arm), elbow, wrist, hip, knee, ankle (" + std::to_string(joins) + ")");
+        t.IsTrue(partsJoined(6, 2) && partsJoined(3, 4) && partsJoined(5, 8) && !partsJoined(5, 2) && !partsJoined(4, 1) && !partsJoined(7, 2) && !partsJoined(5, 1),
+                 "a thigh and the waist are joined, an upper arm and a forearm, a shin and a foot are; a shin and the waist, a forearm and the chest, a hand and the waist, a shin and the chest are not");
+        t.IsTrue(partsJoined(kPartObject, 1) && partsJoined(1, 12), "an object or an unknown class counts as joined: the fade stays as it was");
+        Look look = defaultLook();
+        look.wrestlerNormals = 1.0f;
+        look.wrestlerPaint = 0.0f;
+        const float edge[2] = {0.8f, 0.0f}, none[2] = {0.0f, 0.0f};
+        float faded[2], same[2], kept[2], atOutline[2];
+        wrestlerTileLean(look, edge, none, 1.0f, faded);
+        wrestlerTileLean(look, edge, none, 1.0f, same, 0.0f);
+        wrestlerTileLean(look, edge, none, 1.0f, kept, 1.0f);
+        wrestlerTileLean(look, edge, none, 0.55f, atOutline);
+        t.IsTrue(std::memcmp(faded, same, sizeof(faded)) == 0, "with no kept edge the result is bit for bit the one from before the tag");
+        t.IsTrue(std::fabs(faded[0]) < 1.0e-4f && std::fabs(kept[0] - atOutline[0]) < 1.0e-6f,
+                 "deep inside the wrestler a kept edge keeps the bulge it has on the outline");
+    });
+
     tc.Run("wrestler shape: a flat-on pixel keeps today's light under the first light; the lit side of the outline gains and the far side loses; the rim only adds", [](TestCase &t)
     {
         // The made-up camera's place and a point on a card in front of it; one light to the left and in front.

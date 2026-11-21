@@ -154,6 +154,8 @@ namespace ps2x_postfx
         float rimRightSign = 1.0f;           // +1 or -1: whether cross(up, view) points to the right of the screen
         float rimShape = 0.0f, rimStrength = 0.0f; // the look's wrestler_shape and wrestler_rim
         float rimSigma = 0.0f;               // the blur of the mask, in texels of the frame target
+        float rimTexel = 0.0f;               // one texel of a wrestler's pictures on the screen, in texels of the frame target (task lt3-T2: the shape pass
+                                             // looks past the edge of a tagged part to see which part lies there)
         float rimLean = 0.92f;               // how far the surface leans at the outline
         float rimLights[136] = {};           // the look's lights: a ps2x_lighting::LightUniforms (the block of the lit shaders)
         // Generated shape (task lt3-T3): with `rimLeanMap` the pass that lights the wrestlers again also reads what the generated normal

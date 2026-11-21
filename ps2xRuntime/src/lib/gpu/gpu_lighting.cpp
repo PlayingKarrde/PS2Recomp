@@ -755,19 +755,139 @@ namespace ps2x_lighting
         return 1.41421356f * std::sqrt(std::max(std::sqrt(std::max(t * t - ln / a, 0.0f)) - t, 0.0f));
     }
 
-    void wrestlerTileLean(const Look &look, const float bulge[2], const float paint[2], float blurredMask, float out[2])
+    void wrestlerTileLean(const Look &look, const float bulge[2], const float paint[2], float blurredMask, float out[2], float edgeKept)
     {
         const float length = std::min(std::sqrt(bulge[0] * bulge[0] + bulge[1] * bulge[1]), 1.0f);
         const float dTile = kTileBulgeRadius * (1.0f - length);
         const float dOut = look.wrestlerOutline * sigmasInside(blurredMask);
         const float x = std::clamp((dOut - dTile - kCreaseStart) / (kCreaseEnd - kCreaseStart), 0.0f, 1.0f);
-        const float fade = 1.0f - look.wrestlerCrease * (x * x * (3.0f - 2.0f * x));
+        const float fade = std::max(1.0f - look.wrestlerCrease * (x * x * (3.0f - 2.0f * x)), edgeKept);
         const float toSlope = fade / std::sqrt(std::max(1.0f - length * length, 0.05f));
         const float sx = bulge[0] * toSlope + look.wrestlerPaint * paint[0];
         const float sy = bulge[1] * toSlope + look.wrestlerPaint * paint[1];
         const float k = look.wrestlerNormals / std::sqrt(1.0f + sx * sx + sy * sy);
         out[0] = sx * k;
         out[1] = sy * k;
+    }
+
+    // ---- the tag on wrestler part quads (task lt3-T2)
+    namespace
+    {
+        // How far a fog byte is from another, round the 256 (0 to 128).
+        inline uint32_t byteDistance(uint32_t a, uint32_t b)
+        {
+            const uint32_t d = (a - b) & 0xFFu;
+            return d > 128u ? 256u - d : d;
+        }
+        // The fog byte the game writes for a corner that has no tag: the low byte of the whole part of w + 1 (the part emitter adds
+        // (0, 0, bias, 1) to the projected corner before it turns it into the packet's numbers). The renderer has Q = 1 / w.
+        // False when Q gives no w.
+        inline bool untaggedByte(float q, uint32_t &byte)
+        {
+            if (!(q > 1.0e-12f) || !(q < 1.0e12f))
+                return false;
+            const double w = 1.0 / static_cast<double>(q) + 1.0;
+            byte = static_cast<uint32_t>(static_cast<int64_t>(std::floor(w))) & 0xFFu;
+            return true;
+        }
+        constexpr uint32_t kUntaggedReach = 2; // the renderer: a byte this close to the worked-out one is the game's own
+        constexpr uint32_t kTaggedClear = 4;   // the game: a tag byte must be at least this far from the byte it replaces to count as clear of it
+
+        inline PartTag tagFromData(uint8_t data1, uint8_t data2)
+        {
+            PartTag tag;
+            tag.wrestler = data1 & 0x0Fu;
+            tag.partClass = data1 >> 4;
+            tag.order = data2 & 0x1Fu;
+            tag.referee = (data2 & 0x20u) != 0u;
+            return tag;
+        }
+    }
+
+    uint8_t partTagCheckFirst(uint8_t data1, uint8_t data2)
+    {
+        uint32_t x = static_cast<uint32_t>(data1) * 167u + static_cast<uint32_t>(data2) * 89u + 0x5Bu;
+        x ^= x >> 5;
+        x = x * 0x2Du + (static_cast<uint32_t>(data1 ^ data2) >> 3);
+        return static_cast<uint8_t>(x ^ (x >> 8));
+    }
+
+    uint8_t partTagCheckLast(uint8_t data1, uint8_t data2)
+    {
+        uint32_t x = static_cast<uint32_t>(data1) * 59u + static_cast<uint32_t>(data2) * 211u + 0xC6u;
+        x ^= x >> 4;
+        x = x * 0x35u + (static_cast<uint32_t>(data1) >> 2) + static_cast<uint32_t>(data2);
+        return static_cast<uint8_t>(x ^ (x >> 8));
+    }
+
+    bool encodePartTag(const PartTag &tag, const uint8_t original[4], uint8_t out[4])
+    {
+        const uint8_t data1 = static_cast<uint8_t>((tag.wrestler & 0x0Fu) | ((tag.partClass & 0x0Fu) << 4));
+        const uint8_t plain2 = static_cast<uint8_t>((tag.order > 31u ? 31u : tag.order) | (tag.referee ? 0x20u : 0u));
+        for (uint32_t salt = 0; salt < 4u; ++salt)
+        {
+            const uint8_t data2 = static_cast<uint8_t>(plain2 | (salt << 6));
+            const uint8_t bytes[4] = {partTagCheckFirst(data1, data2), data1, data2, partTagCheckLast(data1, data2)};
+            // The second triangle (data, data, check) must not read as a first one (check, data, data).
+            if (bytes[1] == partTagCheckFirst(bytes[2], bytes[3]))
+                continue;
+            // Neither triangle may have all three of its bytes near the bytes they replace.
+            const auto near = [&](int i) { return byteDistance(bytes[i], original[i]) < kTaggedClear; };
+            if ((near(0) && near(1) && near(2)) || (near(1) && near(2) && near(3)))
+                continue;
+            std::memcpy(out, bytes, 4);
+            return true;
+        }
+        std::memcpy(out, original, 4);
+        return false;
+    }
+
+    bool decodePartTag(const uint8_t fog[3], const float q[3], PartTag &tag)
+    {
+        // The game's own bytes?
+        bool own = true;
+        for (int i = 0; i < 3 && own; ++i)
+        {
+            uint32_t byte = 0;
+            own = untaggedByte(q[i], byte) && byteDistance(fog[i], byte) <= kUntaggedReach;
+        }
+        if (own)
+            return false;
+        if (fog[0] == partTagCheckFirst(fog[1], fog[2]))
+        {
+            tag = tagFromData(fog[1], fog[2]);
+            return true;
+        }
+        if (fog[2] == partTagCheckLast(fog[0], fog[1]))
+        {
+            tag = tagFromData(fog[0], fog[1]);
+            return true;
+        }
+        return false;
+    }
+
+    // The game's nine classes of body tiles, as seen in the tag view (docs/hd-lighting-tier3.md, "Built so far: T2"):
+    //   0 head, 1 chest, 2 waist, 3 upper arm, 4 forearm, 5 shin, 6 thigh, 7 hand, 8 foot.
+    // PartsJoined in shaders/postfx_rim.hlsli must stay the same.
+    bool partsJoined(uint32_t classA, uint32_t classB)
+    {
+        if (classA >= kPartClassCount || classB >= kPartClassCount)
+            return true; // an object, or a class the table does not know: as before the tag (the bulge fades)
+        if (classA == classB)
+            return true;
+        static const bool table[9][9] = {
+            //  head   chest  waist  u.arm  f.arm  shin   thigh  hand   foot
+            {true,  true,  false, false, false, false, false, false, false}, // head
+            {true,  true,  true,  true,  false, false, false, false, false}, // chest
+            {false, true,  true,  false, false, false, true,  false, false}, // waist
+            {false, true,  false, true,  true,  false, false, false, false}, // upper arm
+            {false, false, false, true,  true,  false, false, true,  false}, // forearm
+            {false, false, false, false, false, true,  true,  false, true},  // shin
+            {false, false, true,  false, false, true,  true,  false, false}, // thigh
+            {false, false, false, false, true,  false, false, true,  false}, // hand
+            {false, false, false, false, false, true,  false, false, true},  // foot
+        };
+        return table[classA][classB];
     }
 
     void generateTileNormals(const uint32_t *rgba, uint32_t w, uint32_t h, uint32_t alphaRef, uint8_t *out)
@@ -1693,6 +1813,28 @@ namespace ps2x_gs
     {
         if (matrix16)
             ps2x_lighting::channel().post(matrix16, gameFrame, buffer);
+    }
+
+    bool partTag(uint32_t wrestler, uint32_t partClass, uint32_t order, uint32_t flags, const uint8_t original[4], uint8_t out[4])
+    {
+        ps2x_lighting::PartTag tag;
+        tag.wrestler = static_cast<uint8_t>(wrestler & 0x0Fu);
+        tag.partClass = static_cast<uint8_t>(partClass & 0x0Fu);
+        tag.order = static_cast<uint8_t>(order > 31u ? 31u : order);
+        tag.referee = (flags & 1u) != 0u;
+        return ps2x_lighting::encodePartTag(tag, original, out);
+    }
+
+    bool partTagRead(const uint8_t fog[3], const float q[3], uint32_t &wrestler, uint32_t &partClass, uint32_t &order, uint32_t &flags)
+    {
+        ps2x_lighting::PartTag tag;
+        if (!ps2x_lighting::decodePartTag(fog, q, tag))
+            return false;
+        wrestler = tag.wrestler;
+        partClass = tag.partClass;
+        order = tag.order;
+        flags = tag.referee ? 1u : 0u;
+        return true;
     }
 
     void sceneKickBegin(uint32_t gameFrame, uint32_t buffer)

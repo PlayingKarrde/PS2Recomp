@@ -319,7 +319,9 @@ namespace ps2x_lighting
     //   dOut    how far it is from the wrestler's outline, from the blurred mask: outline x the inverse of the normal distribution
     //   fade    1 - wrestlerCrease x smoothstep(kCreaseStart, kCreaseEnd, dOut - dTile): the tile's edge is inside the wrestler
     //   slope   bulge as a slope x fade + wrestlerPaint x paint;  out = wrestlerNormals x slope / sqrt(1 + |slope|^2)
-    void wrestlerTileLean(const Look &look, const float bulge[2], const float paint[2], float blurredMask, float out[2]);
+    // (task lt3-T2) `edgeKept` is 1 where the shape pass found, just past the part's edge, a part of the same wrestler that is not
+    // joined to this one in the body (partsJoined, from the game's tag): the fade is then not applied. 0 gives the rule above.
+    void wrestlerTileLean(const Look &look, const float bulge[2], const float paint[2], float blurredMask, float out[2], float edgeKept = 0.0f);
     // The normal map of one wrestler tile (task lt3-T3). `rgba` is the tile as the renderer decodes it (w x h texels, r | g << 8 |
     // b << 16 | a << 24, alpha in the GS's scale: 128 is opaque); a texel is part of the figure when its alpha is at least
     // `alphaRef`. Everything outside the w x h texels counts as empty. `out` gets w x h x 4 bytes, per texel:
@@ -459,6 +461,51 @@ namespace ps2x_lighting
     // Where the current look came from, for the panel: "built-in", a path, "the environment", "edited".
     std::string lookSource();
 
+    // ---- the tag on wrestler part quads (task lt3-T2; docs/hd-lighting-tier3.md in the game's repository, "Built so far: T2").
+    // The renderer cannot tell from a part quad which wrestler it belongs to (two wrestlers in a hold stand in one plane) or which
+    // body part it is. The game knows both, and says so in four bytes the picture never uses: the fog byte of each of the quad's four
+    // corners (fog is never switched on; without the tag each byte is the low byte of the corner's w + 1). The game's side is
+    // src/overrides/fpwr_sprites.cpp, which calls ps2x_gs::partTag below; the renderer reads the tag back per triangle.
+    //
+    // The four bytes, corner 0 to corner 3 of the strip:
+    //   byte 0   a check of bytes 1 and 2 (partTagCheckFirst)
+    //   byte 1   bits 0-3 the wrestler's number (0 to 8 in the game's own table; 8 is the referee), bits 4-7 the part class
+    //   byte 2   bits 0-4 the part's order (the wrestler's first part quad of the frame is 0, the next 1 ...; 31 means 31 or later),
+    //            bit 5 a flag: the figure is the referee, bits 6-7 "salt" (any value; see below)
+    //   byte 3   another check of bytes 1 and 2 (partTagCheckLast)
+    // A quad is two triangles, corners 0-1-2 and 1-2-3, and the renderer gets one triangle at a time: both hold bytes 1 and 2 and
+    // one check byte, so each can be read alone (the first as check, data, data; the second as data, data, check).
+    //
+    // Telling a tag from the original bytes: the renderer works out the byte the game would have written from the corner's Q
+    // (1 / w). A triangle whose three bytes are all within 2 of that is not tagged. The game's side picks the salt so that neither
+    // triangle of a tagged quad can look like that, and so that the second triangle cannot be mistaken for a first one.
+    struct PartTag
+    {
+        uint8_t wrestler = 0;  // 0 to 15
+        uint8_t partClass = 0; // kPartHead ... kPartObject
+        uint8_t order = 0;     // 0 to 31
+        bool referee = false;
+    };
+    // The part classes: the game's own nine groups of body tiles (by image number; 0x142440 uses them for the wrestler's build),
+    // and one more for an image that is not a body tile. The names are ours, from pictures (hd-lighting-tier3.md).
+    enum PartClass : uint32_t
+    {
+        kPartClass0 = 0,
+        kPartClassCount = 9, // 0 to 8 are body tiles
+        kPartObject = 9,     // an image from the 512-wide sheet (image number 0x23E and up)
+    };
+    uint8_t partTagCheckFirst(uint8_t data1, uint8_t data2);
+    uint8_t partTagCheckLast(uint8_t data1, uint8_t data2);
+    // The game's side. `original` are the four fog bytes the game would write; `out` gets the tag's. False (and `out` = `original`)
+    // when no salt gives bytes that are safe to tell from the original; the tests show that cannot happen.
+    bool encodePartTag(const PartTag &tag, const uint8_t original[4], uint8_t out[4]);
+    // The renderer's side: the three fog bytes and Q values of one strip triangle, in the strip's order. False: not tagged.
+    bool decodePartTag(const uint8_t fog[3], const float q[3], PartTag &tag);
+    // True when two part classes are joined in the body (head and chest, thigh and shin ...) or are the same class: where one's
+    // rounded end lies over the other there is a joint, not a limb in front of the body. kPartsJoined in shaders/postfx_rim.hlsli
+    // is the same table.
+    bool partsJoined(uint32_t classA, uint32_t classB);
+
     // The colour of light number `index`'s markers ("show lights"): the same eight colours as shaders/gs_light.hlsli, MarkerColour.
     void markerColour(int index, float rgb[3]);
 
@@ -482,4 +529,9 @@ namespace ps2x_gs
     void sceneKickEnd(uint64_t packets);
     // The match loader is about to load arena `arena` (0x17DFA0): the look of that arena becomes the current one.
     void sceneArena(int arena);
+    // The tag of a wrestler part quad (task lt3-T2; ps2x_lighting::encodePartTag): `original` are the four fog bytes the game would
+    // write for the quad's corners, `out` gets the bytes to write instead. `flags` bit 0: the figure is the referee.
+    bool partTag(uint32_t wrestler, uint32_t partClass, uint32_t order, uint32_t flags, const uint8_t original[4], uint8_t out[4]);
+    // The reverse, for the game's own check of what it wrote (corner bytes and Q of one triangle). False: not a tag.
+    bool partTagRead(const uint8_t fog[3], const float q[3], uint32_t &wrestler, uint32_t &partClass, uint32_t &order, uint32_t &flags);
 }

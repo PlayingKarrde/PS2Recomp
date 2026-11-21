@@ -330,7 +330,10 @@ namespace
         float rimRightSign = 1.0f;
         // Wrestlers are told apart by the upright plane their cards stand in (all parts of one wrestler share it): the planes seen
         // so far in this field, as the distance of each from the arena's centre along the card's normal. Entry i uses mask channel i % 4.
+        // A card that carries the game's tag (task lt3-T2; ps2x_lighting::PartTag) goes by its wrestler's number instead: `rimIds` is that
+        // number for an entry made by a tagged card and -1 for one made by a plane. Two wrestlers in a hold then have a channel each.
         float rimPlanes[16] = {};
+        int8_t rimIds[16] = {};
         uint32_t rimPlaneCount = 0;
         bool procValid = false;        // `proc` holds this field's processed scene (and its overlay so far); nothing scene-like came after
         bool replayPending = false;    // the next overlay draw is the field's first: it clears procDepth
@@ -400,6 +403,8 @@ namespace
         uint8_t rimChannel = 0;  // a wrestler card drawn with shape (kCardKey): 1 + its wrestler's mask channel; such a draw is also drawn into the mask
         bool rimClear = false;   // the first such draw of its field: the target's rimWhere and rimMask start again at 0 before it
         SDL_GPUTexture *normal = nullptr; // a card drawn with generated shape (kNormalKey): its tile's normal map (or the flat one)
+        uint8_t rimPart = 0;     // ... and that carries the game's tag (task lt3-T2): 1 + its part class; 0: no tag. The card writes it beside its channel
+        float tagColour[4] = {0.0f, 0.0f, 0.0f, 0.0f}; // a draw with kTagKey (the tag view): the flat colour it is drawn in
     };
 
     SDL_GPUBlendFactor toSdl(BlendFactor f)
@@ -453,6 +458,9 @@ namespace
     // Generated shape (task lt3-T3): with kCardKey, the card's pipeline has a fourth colour target, the frame's rimLean, and one more
     // texture, the tile's normal map (gs_card_n.frag.hlsl, gs_rep_card_n.frag.hlsl).
     constexpr uint32_t kNormalKey = 1u << 17;
+    // The tag view (task lt3-T2, PS2X_LIGHT_DEBUG=tag|tagpart|tagorder): the pipeline of a wrestler card drawn in one flat colour that
+    // says what the game's tag on it is (the mask's shaders, gs_mask.frag.hlsl and gs_rep_mask.frag.hlsl, into the frame, not blended).
+    constexpr uint32_t kTagKey = 1u << 18;
     // The screen effects tell scene from overlay by the Z of the last vertex (docs/hd-lighting.md, "The boundary"): the scene's is below
     // 65536 (the highest seen in a whole match: 23,772), the overlay's (clock, pause panel, popups, fades) at or above it. 65536 / 2^24 is exact in a float.
     constexpr float kOverlayZ = 65536.0f * GSGpu::kDepthScale;
@@ -712,6 +720,17 @@ struct GSGpuBackend::Impl
     };
     static_assert(sizeof(LightVertex) == 24, "the second vertex stream is described to SDL_GPU by offset");
     uint32_t lightDebug = 0;   // 0 off, 1 position, 2 normal
+    // The game's tag on wrestler part quads (task lt3-T2; ps2x_lighting::decodePartTag). `tagDebug`: the tag view, 0 off, 1 by wrestler,
+    // 2 by part class, 3 by part order (PS2X_LIGHT_DEBUG=tag|tagpart|tagorder; the lights are off in it). `tagPending`: the strip
+    // triangle being submitted carries `tagNow`. `tagView`: it is a card of the tag view, to be drawn in `tagViewColour`.
+    uint32_t tagDebug = 0;
+    bool tagUse = true; // PS2X_LIGHT_TAGS=0 (a test aid): the tag is not read; every card goes by its plane, as before the tag
+    bool tagPending = false, tagView = false;
+    ps2x_lighting::PartTag tagNow;
+    float tagViewColour[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    // card-like strip triangles seen while the tag is read: with a tag, without, of those with fog switched on (never: the tag
+    // would then change the picture), the most wrestlers with a tag in a field, and cards per part class
+    uint64_t tagTriangles = 0, tagNone = 0, tagFogOn = 0, tagWrestlersMost = 0, tagByClass[16] = {};
     // The lights themselves (tasks lt2-L1, lt2-L2). `lightOn` is the switch as the renderer has it: the setting `light` (environment
     // PS2X_LIGHT; ps2x_lighting::lightsWanted), read at each VBlank, with the lit shaders made the first time it is on. `lightLook` is
     // the renderer's copy of the current look (ps2x_lighting::currentLook: the built-in one, the arena's file, or what the debug panel
@@ -1208,8 +1227,27 @@ bool GSGpuBackend::Impl::init(SDL_GPUDevice *device, uint32_t s, GSGpuBackend::F
             lightDebug = 1;
         else if (std::strcmp(view, "normal") == 0)
             lightDebug = 2;
+        else if (std::strcmp(view, "tag") == 0)
+            tagDebug = 1;
+        else if (std::strcmp(view, "tagpart") == 0)
+            tagDebug = 2;
+        else if (std::strcmp(view, "tagorder") == 0)
+            tagDebug = 3;
         else if (*view && std::strcmp(view, "0") != 0 && std::strcmp(view, "off") != 0)
-            std::fprintf(stderr, "[light] PS2X_LIGHT_DEBUG=%s is not position or normal; the debug view is off\n", view);
+            std::fprintf(stderr, "[light] PS2X_LIGHT_DEBUG=%s is not position, normal, tag, tagpart or tagorder; the debug view is off\n", view);
+        if (tagDebug != 0)
+        {
+            maskShader = ps2x::gpu::createShader(dev, ps2x::gpu::shaders::gs_mask_frag);
+            maskRepShader = ps2x::gpu::createShader(dev, ps2x::gpu::shaders::gs_rep_mask_frag);
+            if (!maskShader || !maskRepShader)
+            {
+                std::fprintf(stderr, "[light] the tag view's shaders could not be created; the debug view is off\n");
+                tagDebug = 0;
+            }
+            else
+                std::fprintf(stderr, "[light] debug view: the game's tag on wrestler parts, by %s (the lights are off in this view)\n",
+                             tagDebug == 1 ? "wrestler" : (tagDebug == 2 ? "part class" : "part order"));
+        }
         if (lightDebug != 0)
         {
             lightVertexShader = ps2x::gpu::createShader(dev, ps2x::gpu::shaders::gs_light_vert);
@@ -1223,6 +1261,12 @@ bool GSGpuBackend::Impl::init(SDL_GPUDevice *device, uint32_t s, GSGpuBackend::F
                 std::fprintf(stderr, "[light] debug view: %s (scene triangles of frames that have a camera)\n", lightDebug == 1 ? "position" : "normal");
         }
     }
+    if (const char *tags = std::getenv("PS2X_LIGHT_TAGS"))
+    {
+        tagUse = !(std::strcmp(tags, "0") == 0 || std::strcmp(tags, "off") == 0);
+        if (!tagUse)
+            std::fprintf(stderr, "[light] PS2X_LIGHT_TAGS=%s: the game's tag on wrestler parts is not read\n", tags);
+    }
     if (const char *file = std::getenv("PS2X_LIGHT_MATLOG"))
     {
         if (*file && (lightMatLog = std::fopen(file, "w")) != nullptr)
@@ -1234,7 +1278,7 @@ bool GSGpuBackend::Impl::init(SDL_GPUDevice *device, uint32_t s, GSGpuBackend::F
     }
     if (const char *file = std::getenv("PS2X_LIGHT_KEYS"))
         lightKeyPath = file;
-    lightRecover = lightDebug != 0 || lightMatLog != nullptr || lightTiming; // (and the lights, when they are on: lightRefresh)
+    lightRecover = lightDebug != 0 || tagDebug != 0 || lightMatLog != nullptr || lightTiming; // (and the lights, when they are on: lightRefresh)
     if (packStore || fontAtlas)
     {
         repShader = ps2x::gpu::createShader(dev, ps2x::gpu::shaders::gs_rep_frag);
@@ -1804,6 +1848,10 @@ SDL_GPUGraphicsPipeline *GSGpuBackend::Impl::pipeline(uint32_t key)
         ct.blend_state.alpha_blend_op = SDL_GPU_BLENDOP_ADD;
     }
 
+    // The tag view: a card in one flat colour, through the mask's shaders; never blended, the depth test and write as the game has them.
+    const bool tagCard = (key & kTagKey) != 0u;
+    if (tagCard)
+        ct.blend_state = {};
     SDL_GPUGraphicsPipelineCreateInfo info = {};
     info.vertex_shader = lit ? lightVertexShader : vertexShader;
     // A lit draw: with a debug view, the debug shader into the frame alone; with the lights, the plain shader's lit variant into the
@@ -1817,7 +1865,7 @@ SDL_GPUGraphicsPipeline *GSGpuBackend::Impl::pipeline(uint32_t key)
     cts[1].format = SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT;
     cts[2].format = SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT;
     cts[3].format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
-    info.fragment_shader = cardNormal ? (replaced ? cardRepNShader : cardNShader) : card ? (replaced ? cardRepShader : cardShader)
+    info.fragment_shader = tagCard ? (replaced ? maskRepShader : maskShader) : cardNormal ? (replaced ? cardRepNShader : cardNShader) : card ? (replaced ? cardRepShader : cardShader)
                                 : (litTwo ? (replaced ? litRepShader : litShader) : (lit ? lightDebugShader : (zrestore ? zcopyShader : (replaced ? repShader : fragmentShader))));
     info.vertex_input_state.vertex_buffer_descriptions = vbs;
     info.vertex_input_state.num_vertex_buffers = lit ? 2 : 1;
@@ -3034,6 +3082,12 @@ void GSGpuBackend::Impl::submitSetup(const GSDrawState &state, const Setup &setu
                 ++rimLitAfterCards; // (something lit drawn after a card: if it covers a card's pixel, that pixel is still shaped. Counted for the log.)
         }
     }
+    else if (tagView)
+    {
+        // The tag view: the card in its flat colour (its own cut-out, its own depth), in place of the game's colour.
+        d.pipeline = (d.pipeline & ~0x1FFu) | kTagKey;
+        std::memcpy(d.tagColour, tagViewColour, sizeof(d.tagColour));
+    }
     else if (lightPending && lightDebug != 0)
     {
         // The debug view draws the recovered data, not the game's colour: a replacement texture is not needed for that (the original's
@@ -3048,7 +3102,7 @@ void GSGpuBackend::Impl::submitSetup(const GSDrawState &state, const Setup &setu
     {
         Draw &last = draws.back();
         if (last.frame == d.frame && last.depth == d.depth && last.pipeline == d.pipeline && last.texture == d.texture && last.rep == d.rep &&
-            last.replay == d.replay && !d.replayFirst && last.lightFacing == d.lightFacing && last.lightStrength == d.lightStrength && last.lightGlow == d.lightGlow && !d.lightClear && last.rimChannel == d.rimChannel && !d.rimClear && last.normal == d.normal && last.sx == d.sx && last.sy == d.sy && last.sw == d.sw && last.sh == d.sh && last.uniforms == d.uniforms)
+            last.replay == d.replay && !d.replayFirst && last.lightFacing == d.lightFacing && last.lightStrength == d.lightStrength && last.lightGlow == d.lightGlow && !d.lightClear && last.rimChannel == d.rimChannel && !d.rimClear && last.normal == d.normal && last.rimPart == d.rimPart && std::memcmp(last.tagColour, d.tagColour, sizeof(d.tagColour)) == 0 && last.sx == d.sx && last.sy == d.sy && last.sw == d.sw && last.sh == d.sh && last.uniforms == d.uniforms)
         {
             last.vertexCount += setup.count;
             return;
@@ -3111,8 +3165,56 @@ void GSGpuBackend::Impl::submit(const GSPrimitiveBatch &batch)
         ++wc.filled;
     }
     LightVertex lightOut[3];
+    tagPending = tagView = false;
     if (lightRecover && setup.count == 3 && !batch.state.prim.fst && lightRecoverTriangle(batch, setup, lightOut))
     {
+        // The game's tag (task lt3-T2): a strip triangle that can be a wrestler card (textured, not a shadow, writes depth) is asked
+        // whether its three fog bytes are a tag. Only while wrestler shape or the tag view is on: nothing else uses it.
+        if (tagUse && (tagDebug != 0 || (lightLive && rimOn)) && batch.state.prim.type == GS_PRIM_TRISTRIP && batch.state.prim.tme && !batch.state.context.zbuf.zmask)
+        {
+            const GSVertex *v = batch.vertices.data();
+            if (!(v[0].r == 0u && v[0].g == 0u && v[0].b == 0u && v[1].r == 0u && v[1].g == 0u && v[1].b == 0u && v[2].r == 0u && v[2].g == 0u && v[2].b == 0u))
+            {
+                const uint8_t fog[3] = {v[0].fog, v[1].fog, v[2].fog};
+                const float q[3] = {v[0].q, v[1].q, v[2].q};
+                tagPending = ps2x_lighting::decodePartTag(fog, q, tagNow);
+                if (tagPending)
+                {
+                    ++tagTriangles;
+                    ++tagByClass[tagNow.partClass & 15u];
+                    if (batch.state.prim.fge)
+                        ++tagFogOn;
+                }
+                else
+                    ++tagNone;
+                if (tagDebug != 0)
+                {
+                    // The tag view's colours. By wrestler: one colour each, the referee white. By part class: one colour each. By
+                    // order: from blue (drawn first) to red. A card with no tag is grey.
+                    static const float byWrestler[9][3] = {{1.0f, 0.25f, 0.2f}, {0.2f, 0.45f, 1.0f}, {0.2f, 0.85f, 0.3f}, {1.0f, 0.85f, 0.1f}, {0.9f, 0.3f, 0.9f},
+                                                           {0.1f, 0.85f, 0.85f}, {1.0f, 0.55f, 0.1f}, {0.55f, 0.35f, 1.0f}, {1.0f, 1.0f, 1.0f}};
+                    static const float byClass[10][3] = {{1.0f, 0.9f, 0.1f}, {1.0f, 0.2f, 0.2f}, {1.0f, 0.55f, 0.1f}, {0.2f, 0.85f, 0.3f}, {0.1f, 0.85f, 0.85f},
+                                                         {0.2f, 0.45f, 1.0f}, {0.6f, 0.35f, 1.0f}, {1.0f, 1.0f, 1.0f}, {0.95f, 0.4f, 0.8f}, {0.45f, 0.3f, 0.15f}};
+                    float c[3] = {0.5f, 0.5f, 0.5f};
+                    if (tagPending && tagDebug == 1)
+                        std::memcpy(c, byWrestler[tagNow.referee ? 8u : (tagNow.wrestler % 8u)], sizeof(c));
+                    else if (tagPending && tagDebug == 2)
+                        std::memcpy(c, byClass[std::min<uint32_t>(tagNow.partClass, 9u)], sizeof(c));
+                    else if (tagPending)
+                    {
+                        const float t = static_cast<float>(tagNow.order) / 15.0f;
+                        c[0] = std::clamp(t, 0.0f, 1.0f);
+                        c[1] = std::clamp(1.0f - std::fabs(t - 0.5f) * 2.0f, 0.0f, 1.0f);
+                        c[2] = std::clamp(1.0f - t, 0.0f, 1.0f);
+                    }
+                    tagView = true;
+                    tagViewColour[0] = c[0];
+                    tagViewColour[1] = c[1];
+                    tagViewColour[2] = c[2];
+                    tagViewColour[3] = 1.0f;
+                }
+            }
+        }
         if (lightDebug != 0)
             lightPending = lightOut;
         else if (lightLive)
@@ -3138,6 +3240,7 @@ void GSGpuBackend::Impl::submit(const GSPrimitiveBatch &batch)
     }
     submitSetup(batch.state, setup);
     lightPending = nullptr;
+    tagPending = tagView = false;
     if (vertices.size() >= kMaxVerticesPerFlush || stage.size() >= kMaxStageBytes)
         flushLocked(false);
 }
@@ -3435,7 +3538,9 @@ void GSGpuBackend::Impl::flushLocked(bool wait, const FieldCopy *fieldCopies, in
                 ps2x_lighting::LightUniforms lu = lightBlocks[std::min<uint32_t>(d.lightFacing, 2u)];
                 lu.rule[0] = static_cast<float>(d.lightFacing);
                 lu.rule[2] = d.lightStrength;
-                lu.rule[3] = d.rimChannel != 0u ? static_cast<float>(d.rimChannel) : d.lightGlow; // (a card is mode 2, which has no glow)
+                // (a card is mode 2, which has no glow. Its channel, 1 to 4, and above it 4 x (1 + part class) when it carries the game's tag:
+                // the card shader adds the pixel's share and writes the sum, and the shape pass takes the three apart again.)
+                lu.rule[3] = d.rimChannel != 0u ? static_cast<float>(d.rimChannel) + 4.0f * static_cast<float>(d.rimPart) : d.lightGlow;
                 SDL_PushGPUFragmentUniformData(cmd, 1, &lu, sizeof(lu));
             }
             SDL_DrawGPUPrimitives(pass, d.vertexCount, 1, 0, 0);
@@ -3448,6 +3553,8 @@ void GSGpuBackend::Impl::flushLocked(bool wait, const FieldCopy *fieldCopies, in
             SDL_BindGPUVertexBuffers(pass, 0, &vb, 1);
             litBinding = false;
         }
+        if ((d.pipeline & kTagKey) != 0u)
+            SDL_PushGPUFragmentUniformData(cmd, 1, d.tagColour, sizeof(d.tagColour)); // the tag view: the mask shader's "channel" is the colour
         SDL_DrawGPUPrimitives(pass, d.vertexCount, 1, d.firstVertex, 0);
         ++stats.drawCalls;
     };
@@ -4773,7 +4880,7 @@ void GSGpuBackend::Impl::lightKeyWrite()
 // that cannot render to half-float textures cannot have them.
 void GSGpuBackend::Impl::lightRefresh()
 {
-    bool want = lightDebug == 0 && !lightSetupFailed && ps2x_lighting::lightsWanted();
+    bool want = lightDebug == 0 && tagDebug == 0 && !lightSetupFailed && ps2x_lighting::lightsWanted();
     if (want && !litShader)
     {
         const bool halfFloat = SDL_GPUTextureSupportsFormat(dev, SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT, SDL_GPU_TEXTURETYPE_2D,
@@ -4800,7 +4907,7 @@ void GSGpuBackend::Impl::lightRefresh()
     if (want != lightOn)
         std::fprintf(stderr, "[light] lights %s\n", want ? "on" : "off");
     lightOn = want;
-    lightRecover = lightDebug != 0 || lightOn || lightMatLog != nullptr || lightTiming;
+    lightRecover = lightDebug != 0 || tagDebug != 0 || lightOn || lightMatLog != nullptr || lightTiming;
     const uint64_t generation = ps2x_lighting::lookGeneration();
     if (lightOn && (generation != lightLookGeneration || lightLookGeneration == 0u))
     {
@@ -4833,8 +4940,10 @@ void GSGpuBackend::Impl::lightRefresh()
     {
         cardShader = ps2x::gpu::createShader(dev, ps2x::gpu::shaders::gs_card_frag);
         cardRepShader = ps2x::gpu::createShader(dev, ps2x::gpu::shaders::gs_rep_card_frag);
-        maskShader = ps2x::gpu::createShader(dev, ps2x::gpu::shaders::gs_mask_frag);
-        maskRepShader = ps2x::gpu::createShader(dev, ps2x::gpu::shaders::gs_rep_mask_frag);
+        if (!maskShader)
+            maskShader = ps2x::gpu::createShader(dev, ps2x::gpu::shaders::gs_mask_frag);
+        if (!maskRepShader)
+            maskRepShader = ps2x::gpu::createShader(dev, ps2x::gpu::shaders::gs_rep_mask_frag);
         if (cardShader && cardRepShader && maskShader && maskRepShader)
         {
             // The mask: the plain vertex stream, one 8-bit target, no depth; the blend keeps the larger value of each channel.
@@ -5119,9 +5228,13 @@ void GSGpuBackend::Impl::rimNoteCard(FrameTarget &ft, Draw &d, const Setup &setu
             centre[k] += (std::fabs(q) > 1.0e-12f ? verts[i].worldQ[k] / q : 0.0f) / 3.0f;
     }
     const float plane = centre[0] * verts[0].normal[0] + centre[1] * verts[0].normal[1] + centre[2] * verts[0].normal[2];
+    // A card with the game's tag (task lt3-T2) goes by its wrestler's number instead, whatever plane he stands in: two wrestlers in a
+    // hold are then two outlines. A card without one (an old recording, a ring-side sprite) goes by its plane as before, among the
+    // entries that planes made.
+    const int8_t id = tagPending ? static_cast<int8_t>(tagNow.wrestler) : static_cast<int8_t>(-1);
     uint32_t index = ft.rimPlaneCount;
     for (uint32_t i = 0; i < ft.rimPlaneCount; ++i)
-        if (std::fabs(ft.rimPlanes[i] - plane) < 2.0f)
+        if (ft.rimIds[i] == id && (id >= 0 || std::fabs(ft.rimPlanes[i] - plane) < 2.0f))
         {
             index = i;
             break;
@@ -5129,10 +5242,20 @@ void GSGpuBackend::Impl::rimNoteCard(FrameTarget &ft, Draw &d, const Setup &setu
     if (index == ft.rimPlaneCount)
     {
         if (ft.rimPlaneCount < 16u)
+        {
+            ft.rimIds[ft.rimPlaneCount] = id;
             ft.rimPlanes[ft.rimPlaneCount++] = plane;
+        }
         else
             index = 15u; // more planes than the table holds: the rest share the last one's channel
         rimPlanesMost = std::max<uint64_t>(rimPlanesMost, ft.rimPlaneCount);
+        if (id >= 0)
+        {
+            uint64_t tagged = 0;
+            for (uint32_t i = 0; i < ft.rimPlaneCount; ++i)
+                tagged += ft.rimIds[i] >= 0 ? 1u : 0u;
+            tagWrestlersMost = std::max(tagWrestlersMost, tagged);
+        }
     }
     d.pipeline |= kCardKey;
     d.rimChannel = static_cast<uint8_t>(1u + (index & 3u));
@@ -5193,6 +5316,9 @@ void GSGpuBackend::Impl::rimNoteCard(FrameTarget &ft, Draw &d, const Setup &setu
         d.normal = texture ? tileNormals(*texture, state, u, v) : normalFlat;
         d.pipeline |= kNormalKey;
         ft.rimLeanValid = true;
+        // The part class goes with the pixel (only the shape pass with the generated maps reads it: the crease fade, postfx_rim.hlsli).
+        if (tagPending)
+            d.rimPart = static_cast<uint8_t>(1u + std::min<uint32_t>(tagNow.partClass, ps2x_lighting::kPartObject));
     }
     for (int k = 0; k < 3; ++k)
         ft.rimEye[k] = static_cast<float>(lightUnproject.eye[k]);
@@ -5221,6 +5347,7 @@ void GSGpuBackend::Impl::rimFillJob(const FrameTarget &ft, ps2x_postfx::Job &job
     // wrestler's own texels at any resolution and camera distance.
     const double texel = ft.rimAreaTexels > 1.0 ? std::sqrt(ft.rimAreaPixels / ft.rimAreaTexels) : static_cast<double>(scaleX);
     job.rimSigma = static_cast<float>(lightLook.wrestlerOutline * texel);
+    job.rimTexel = static_cast<float>(texel);
     if (normalsOn && ft.rimLeanValid && ft.rimLean)
     {
         // Generated shape: what the cards' normal maps said, and how to add it.
@@ -5388,6 +5515,15 @@ void GSGpuBackend::Impl::lightShutdown()
             std::fprintf(stderr, "[light] wrestler shape: %llu card triangles in %llu fields; most wrestler planes in a field %llu; %llu lit primitives that are not cards came after a card\n",
                          static_cast<unsigned long long>(rimCards), static_cast<unsigned long long>(rimFields), static_cast<unsigned long long>(rimPlanesMost),
                          static_cast<unsigned long long>(rimLitAfterCards));
+        if (tagTriangles != 0u || tagNone != 0u || tagDebug != 0)
+        {
+            std::fprintf(stderr, "[light] part tags: %llu card triangles with the game's tag, %llu without; with fog switched on %llu; most tagged wrestlers in a field %llu; by part class",
+                         static_cast<unsigned long long>(tagTriangles), static_cast<unsigned long long>(tagNone), static_cast<unsigned long long>(tagFogOn),
+                         static_cast<unsigned long long>(tagWrestlersMost));
+            for (int i = 0; i < 10; ++i)
+                std::fprintf(stderr, " %d:%llu", i, static_cast<unsigned long long>(tagByClass[i]));
+            std::fprintf(stderr, "\n");
+        }
         if (normalTilesMade != 0u)
             std::fprintf(stderr, "[light] generated shape: %llu normal maps made (%llu again for a larger part of their texture), %llu texels, %.1f us each on average (%.1f of them the arithmetic), "
                                  "%.1f us the slowest; most in one field %u; %.1f MiB held at the end\n",
