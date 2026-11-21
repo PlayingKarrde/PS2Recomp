@@ -92,10 +92,12 @@
 #include "gpu/gpu_shaders.h"
 #include "shaders/compiled/gs_frag.h"
 #include "shaders/compiled/gs_card_frag.h"
+#include "shaders/compiled/gs_card_n_frag.h"
 #include "shaders/compiled/gs_light_debug_frag.h"
 #include "shaders/compiled/gs_light_vert.h"
 #include "shaders/compiled/gs_mask_frag.h"
 #include "shaders/compiled/gs_rep_card_frag.h"
+#include "shaders/compiled/gs_rep_card_n_frag.h"
 #include "shaders/compiled/gs_rep_mask_frag.h"
 #include "shaders/compiled/gs_lit_frag.h"
 #include "shaders/compiled/gs_rep_lit_frag.h"
@@ -206,6 +208,12 @@ namespace
         // nothing, which is checked without looking at the tile map (most draws reuse an area some draw already decoded).
         TexelRect validRect;
         TexRep rep;
+        // Generated shape for wrestlers (task lt3-T3): the tile's normal map, a texture of this one's size made the first time a
+        // wrestler card is drawn with it while the look asks for generated shape (Impl::tileNormals), and released with it.
+        // `normalRect` is the part of the texture the map was made for (the texels the card shows; the rest is flat).
+        SDL_GPUTexture *normal = nullptr;
+        TexelRect normalRect;
+        bool normalFailed = false;
     };
 
     // A replacement picture on the GPU: S times the replaced rectangle, RGBA8 or (an index image) R8.
@@ -294,8 +302,12 @@ namespace
         // depth test, so it is the wrestlers' whole outline also behind ropes. The rest describes the field being drawn.
         SDL_GPUTexture *rimWhere = nullptr;
         SDL_GPUTexture *rimMask = nullptr;
+        // Generated shape (task lt3-T3): the cards' fourth colour target, what each card pixel's generated normal map says, turned to
+        // the screen (8 bits; gs_card.hlsli). Made at the first card drawn with a map; cleared with rimWhere.
+        SDL_GPUTexture *rimLean = nullptr;
         bool rimPending = true; // the field's next card is its first: both textures are cleared before it
         bool rimValid = false;  // this field has cards drawn with shape
+        bool rimLeanValid = false; // ... and they were drawn with generated shape from the field's first card on, so `rimLean` is the field's
         int32_t rimX0 = 0x7FFFFFFF, rimY0 = 0x7FFFFFFF, rimX1 = -1, rimY1 = -1; // the box the cards cover, target pixels
         double rimAreaPixels = 0.0, rimAreaTexels = 0.0; // of the cards so far: together they say how big a wrestler texel is on screen
         float rimEye[3] = {0.0f, 0.0f, 0.0f}; // the camera of the field's cards
@@ -371,6 +383,7 @@ namespace
         uint32_t lightFirst = 0; // a draw with kLightKey: its first vertex in Impl::lightVerts (as many as vertexCount, in the same order)
         uint8_t rimChannel = 0;  // a wrestler card drawn with shape (kCardKey): 1 + its wrestler's mask channel; such a draw is also drawn into the mask
         bool rimClear = false;   // the first such draw of its field: the target's rimWhere and rimMask start again at 0 before it
+        SDL_GPUTexture *normal = nullptr; // a card drawn with generated shape (kNormalKey): its tile's normal map (or the flat one)
     };
 
     SDL_GPUBlendFactor toSdl(BlendFactor f)
@@ -421,6 +434,9 @@ namespace
     // Wrestler shape (task lt3-T1): with kLightKey, the pipeline of a wrestler card. It has a third colour target, the frame's
     // rimWhere (gs_card.frag.hlsl, gs_rep_card.frag.hlsl), which is not blended.
     constexpr uint32_t kCardKey = 1u << 16;
+    // Generated shape (task lt3-T3): with kCardKey, the card's pipeline has a fourth colour target, the frame's rimLean, and one more
+    // texture, the tile's normal map (gs_card_n.frag.hlsl, gs_rep_card_n.frag.hlsl).
+    constexpr uint32_t kNormalKey = 1u << 17;
     // The screen effects tell scene from overlay by the Z of the last vertex (docs/hd-lighting.md, "The boundary"): the scene's is below
     // 65536 (the highest seen in a whole match: 23,772), the overlay's (clock, pause panel, popups, fades) at or above it. 65536 / 2^24 is exact in a float.
     constexpr float kOverlayZ = 65536.0f * GSGpu::kDepthScale;
@@ -700,7 +716,19 @@ struct GSGpuBackend::Impl
     SDL_GPUGraphicsPipeline *maskPipeline = nullptr, *maskRepPipeline = nullptr;
     float lightRightSign = 1.0f; // of the camera in lightUnproject: +1 when cross(up, view) points to the right of the screen
     uint64_t rimCards = 0, rimFields = 0, rimLitAfterCards = 0, rimPlanesMost = 0;
-    void rimNoteCard(FrameTarget &ft, Draw &d, const Setup &setup, const GSDrawState &state, const LightVertex *verts);
+    void rimNoteCard(FrameTarget &ft, Draw &d, const Setup &setup, const GSDrawState &state, const LightVertex *verts, GpuTexture *texture);
+    // Generated shape for wrestlers (task lt3-T3; docs/hd-lighting-tier3.md). `normalsOn`: wrestler shape is on, the look asks for
+    // the generated maps (wrestler_normals above 0) and their shaders exist. With it false no map is made, no card gets kNormalKey
+    // and the shape pass is T1's: the picture is T1's, byte for byte.
+    bool normalsOn = false, normalsSetupFailed = false;
+    SDL_GPUShader *cardNShader = nullptr, *cardRepNShader = nullptr;
+    SDL_GPUTexture *normalFlat = nullptr;        // 1 x 1, "no lean": for a card whose texture gets no map
+    SDL_GPUSampler *normalLinear = nullptr;      // the map read smoothly (wrestler_smooth); per texel it is read with `sampler`
+    uint64_t normalTilesMade = 0, normalTilesRemade = 0, normalTexelsMade = 0, normalNanos = 0, normalNanosMost = 0, normalBytes = 0, normalGenNanos = 0;
+    uint32_t normalMadeThisField = 0, normalMostInField = 0;
+    std::vector<uint32_t> normalScratch;
+    std::vector<uint8_t> normalBytesScratch;
+    SDL_GPUTexture *tileNormals(GpuTexture &g, const GSDrawState &state, const float u[3], const float v[3]);
     void rimFillJob(const FrameTarget &ft, ps2x_postfx::Job &job) const;
     uint32_t lightLitThisField = 0;
     void lightRefresh();
@@ -1389,7 +1417,11 @@ GSGpuBackend::Impl::~Impl()
     for (auto &p : pipelines)
         SDL_ReleaseGPUGraphicsPipeline(dev, p.second);
     for (auto &t : contentTextures)
+    {
         SDL_ReleaseGPUTexture(dev, t.second.tex);
+        if (t.second.normal)
+            SDL_ReleaseGPUTexture(dev, t.second.normal);
+    }
     for (auto &r : repTextures)
         SDL_ReleaseGPUTexture(dev, r.second.tex);
     for (auto &bucket : texturePool)
@@ -1404,6 +1436,8 @@ GSGpuBackend::Impl::~Impl()
             SDL_ReleaseGPUTexture(dev, f.rimWhere);
         if (f.rimMask)
             SDL_ReleaseGPUTexture(dev, f.rimMask);
+        if (f.rimLean)
+            SDL_ReleaseGPUTexture(dev, f.rimLean);
         if (f.proc)
             SDL_ReleaseGPUTexture(dev, f.proc);
         if (f.procDepth)
@@ -1758,10 +1792,13 @@ SDL_GPUGraphicsPipeline *GSGpuBackend::Impl::pipeline(uint32_t key)
     const bool litTwo = lit && lightDebug == 0;
     // A wrestler card drawn with shape has a third target (FrameTarget::rimWhere), written as it is: no blend.
     const bool card = litTwo && (key & kCardKey) != 0u;
-    SDL_GPUColorTargetDescription cts[3] = {ct, ct, {}};
+    // ... and with generated shape a fourth (FrameTarget::rimLean, 8 bits), also not blended.
+    const bool cardNormal = card && (key & kNormalKey) != 0u;
+    SDL_GPUColorTargetDescription cts[4] = {ct, ct, {}, {}};
     cts[1].format = SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT;
     cts[2].format = SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT;
-    info.fragment_shader = card ? (replaced ? cardRepShader : cardShader)
+    cts[3].format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
+    info.fragment_shader = cardNormal ? (replaced ? cardRepNShader : cardNShader) : card ? (replaced ? cardRepShader : cardShader)
                                 : (litTwo ? (replaced ? litRepShader : litShader) : (lit ? lightDebugShader : (zrestore ? zcopyShader : (replaced ? repShader : fragmentShader))));
     info.vertex_input_state.vertex_buffer_descriptions = vbs;
     info.vertex_input_state.num_vertex_buffers = lit ? 2 : 1;
@@ -1777,7 +1814,7 @@ SDL_GPUGraphicsPipeline *GSGpuBackend::Impl::pipeline(uint32_t key)
     info.depth_stencil_state.enable_depth_write = depthWrite;
     info.depth_stencil_state.compare_op = toSdlCompare(compare);
     info.target_info.color_target_descriptions = cts;
-    info.target_info.num_color_targets = card ? 3 : (litTwo ? 2 : 1);
+    info.target_info.num_color_targets = cardNormal ? 4 : (card ? 3 : (litTwo ? 2 : 1));
     info.target_info.has_depth_stencil_target = true;
     info.target_info.depth_stencil_format = SDL_GPU_TEXTUREFORMAT_D32_FLOAT;
     SDL_GPUGraphicsPipeline *p = SDL_CreateGPUGraphicsPipeline(dev, &info);
@@ -2689,6 +2726,13 @@ void GSGpuBackend::Impl::evictTextures()
         const uint32_t sizeKey = (it->second.w << 16) | it->second.h;
         missIndex.erase(it->second.tex); // the census forgets a texture that is gone (the pointer may be reused)
         textureBytes -= it->second.bytes;
+        if (it->second.normal)
+        {
+            // (its generated normal map goes with it; every draw that used it was submitted)
+            normalBytes -= static_cast<uint64_t>(it->second.w) * it->second.h * 4u;
+            textureBytes -= static_cast<uint64_t>(it->second.w) * it->second.h * 4u;
+            releaseTexture(it->second.normal);
+        }
         contentTextures.erase(it);
         ++stats.texturesEvicted;
         // Keep the GPU object for the next texture of its size, or release it when the pool is full. Every draw that
@@ -2918,7 +2962,7 @@ void GSGpuBackend::Impl::submitSetup(const GSDrawState &state, const Setup &setu
             // Wrestler shape: a card (a strip that is lit by position: wrestler parts, the referee, ring-side sprites) also writes
             // where it is and goes into the wrestler mask. Shadows, effects and strips with a material of another kind do not.
             if (rimOn && lightPendingKind.strip && !lightPendingKind.flatBlack && !lightPendingKind.depthWriteOff && lightChoice.mode == 2u)
-                rimNoteCard(ft, d, setup, state, lightPending);
+                rimNoteCard(ft, d, setup, state, lightPending, litTexture);
             else if (ft.rimValid)
                 ++rimLitAfterCards; // (something lit drawn after a card: if it covers a card's pixel, that pixel is still shaped. Counted for the log.)
         }
@@ -2937,7 +2981,7 @@ void GSGpuBackend::Impl::submitSetup(const GSDrawState &state, const Setup &setu
     {
         Draw &last = draws.back();
         if (last.frame == d.frame && last.depth == d.depth && last.pipeline == d.pipeline && last.texture == d.texture && last.rep == d.rep &&
-            last.replay == d.replay && !d.replayFirst && last.lightFacing == d.lightFacing && last.lightStrength == d.lightStrength && last.lightGlow == d.lightGlow && !d.lightClear && last.rimChannel == d.rimChannel && !d.rimClear && last.sx == d.sx && last.sy == d.sy && last.sw == d.sw && last.sh == d.sh && last.uniforms == d.uniforms)
+            last.replay == d.replay && !d.replayFirst && last.lightFacing == d.lightFacing && last.lightStrength == d.lightStrength && last.lightGlow == d.lightGlow && !d.lightClear && last.rimChannel == d.rimChannel && !d.rimClear && last.normal == d.normal && last.sx == d.sx && last.sy == d.sy && last.sw == d.sw && last.sh == d.sh && last.uniforms == d.uniforms)
         {
             last.vertexCount += setup.count;
             return;
@@ -3174,10 +3218,11 @@ void GSGpuBackend::Impl::flushLocked(bool wait, const FieldCopy *fieldCopies, in
             {
                 if (d.pipeline == kBoundaryKey)
                     continue;
-                d.pipeline &= ~(kLightKey | kCardKey);
+                d.pipeline &= ~(kLightKey | kCardKey | kNormalKey);
                 d.lightClear = false;
                 d.rimChannel = 0;
                 d.rimClear = false;
+                d.normal = nullptr;
             }
         }
     }
@@ -3188,6 +3233,7 @@ void GSGpuBackend::Impl::flushLocked(bool wait, const FieldCopy *fieldCopies, in
     uint32_t curFrame = ~0u, curDepth = ~0u;
     bool curLit = false; // the open pass has the frame's light buffer as its second colour target
     bool curCard = false; // ... and the frame's rimWhere as its third (wrestler cards drawn with shape)
+    bool curNormal = false; // ... and the frame's rimLean as its fourth (cards drawn with generated shape)
     uint32_t curPipeline = ~0u;
     SDL_GPUTexture *curTexture = reinterpret_cast<SDL_GPUTexture *>(~uintptr_t(0));
     SDL_GPUTexture *curRepTexture = reinterpret_cast<SDL_GPUTexture *>(~uintptr_t(0));
@@ -3201,9 +3247,9 @@ void GSGpuBackend::Impl::flushLocked(bool wait, const FieldCopy *fieldCopies, in
     };
     // Begins a render pass into `colorTex` / `depthTex` (the frame's own, or its processed picture's).
     auto beginPass = [&](uint32_t frame, SDL_GPUTexture *colorTex, SDL_GPUTexture *depthTex, SDL_GPULoadOp depthLoad, SDL_GPUTexture *lightTex = nullptr,
-                         bool lightClear = false, SDL_GPUTexture *whereTex = nullptr, bool whereClear = false)
+                         bool lightClear = false, SDL_GPUTexture *whereTex = nullptr, bool whereClear = false, SDL_GPUTexture *leanTex = nullptr)
     {
-        SDL_GPUColorTargetInfo colors[3] = {};
+        SDL_GPUColorTargetInfo colors[4] = {};
         SDL_GPUColorTargetInfo &color = colors[0];
         color.texture = colorTex;
         color.load_op = SDL_GPU_LOADOP_LOAD;
@@ -3223,6 +3269,14 @@ void GSGpuBackend::Impl::flushLocked(bool wait, const FieldCopy *fieldCopies, in
             colors[2].load_op = whereClear ? SDL_GPU_LOADOP_CLEAR : SDL_GPU_LOADOP_LOAD;
             colors[2].store_op = SDL_GPU_STOREOP_STORE;
             colors[2].clear_color = SDL_FColor{0.0f, 0.0f, 0.0f, 0.0f};
+            if (leanTex)
+            {
+                // Generated shape: what the cards' normal maps say. It starts at "no lean" (128 in every channel).
+                colors[3].texture = leanTex;
+                colors[3].load_op = whereClear ? SDL_GPU_LOADOP_CLEAR : SDL_GPU_LOADOP_LOAD;
+                colors[3].store_op = SDL_GPU_STOREOP_STORE;
+                colors[3].clear_color = SDL_FColor{128.0f / 255.0f, 128.0f / 255.0f, 128.0f / 255.0f, 128.0f / 255.0f};
+            }
         }
         SDL_GPUDepthStencilTargetInfo depth = {};
         depth.texture = depthTex;
@@ -3231,7 +3285,7 @@ void GSGpuBackend::Impl::flushLocked(bool wait, const FieldCopy *fieldCopies, in
         depth.store_op = SDL_GPU_STOREOP_STORE;
         depth.stencil_load_op = SDL_GPU_LOADOP_DONT_CARE;
         depth.stencil_store_op = SDL_GPU_STOREOP_DONT_CARE;
-        pass = SDL_BeginGPURenderPass(cmd, colors, lightTex ? (whereTex ? 3 : 2) : 1, &depth);
+        pass = SDL_BeginGPURenderPass(cmd, colors, lightTex ? (whereTex ? (leanTex ? 4 : 3) : 2) : 1, &depth);
         ++stats.renderPasses;
         const float globals[4] = {static_cast<float>(frames[frame].w), static_cast<float>(frames[frame].h), 0.0f, 0.0f};
         SDL_PushGPUVertexUniformData(cmd, 0, globals, sizeof(globals));
@@ -3269,6 +3323,14 @@ void GSGpuBackend::Impl::flushLocked(bool wait, const FieldCopy *fieldCopies, in
                 SDL_BindGPUFragmentSamplers(pass, 0, &binding, 1);
             }
             curTexture = d.texture;
+        }
+        if (d.normal)
+        {
+            // Generated shape: the tile's normal map after the draw's other textures, read per texel or smoothly as the look asks.
+            const SDL_GPUTextureSamplerBinding binding = {d.normal, (lightLook.wrestlerSmooth && normalLinear) ? normalLinear : sampler};
+            SDL_BindGPUFragmentSamplers(pass, rd ? 2u : 1u, &binding, 1);
+            if (!rd)
+                curRepTexture = reinterpret_cast<SDL_GPUTexture *>(~uintptr_t(0)); // (slot 1 no longer holds a replacement picture)
         }
         if (rd)
         {
@@ -3416,13 +3478,16 @@ void GSGpuBackend::Impl::flushLocked(bool wait, const FieldCopy *fieldCopies, in
         // A lit draw (the lights, not a debug view) needs the light buffer in its pass, and a plain draw must not have it.
         const bool litDraw = lightDebug == 0 && (d.pipeline & kLightKey) != 0u;
         const bool cardDraw = litDraw && (d.pipeline & kCardKey) != 0u;
-        if (!pass || d.frame != curFrame || d.depth != curDepth || litDraw != curLit || d.lightClear || cardDraw != curCard || d.rimClear)
+        const bool normalDraw = cardDraw && (d.pipeline & kNormalKey) != 0u;
+        if (!pass || d.frame != curFrame || d.depth != curDepth || litDraw != curLit || d.lightClear || cardDraw != curCard || d.rimClear || normalDraw != curNormal)
         {
             endPass();
             beginPass(d.frame, frames[d.frame].color, depths[d.depth].depth, depths[d.depth].needsClear ? SDL_GPU_LOADOP_CLEAR : SDL_GPU_LOADOP_LOAD,
-                      litDraw ? frames[d.frame].light : nullptr, d.lightClear, cardDraw ? frames[d.frame].rimWhere : nullptr, d.rimClear);
+                      litDraw ? frames[d.frame].light : nullptr, d.lightClear, cardDraw ? frames[d.frame].rimWhere : nullptr, d.rimClear,
+                      normalDraw ? frames[d.frame].rimLean : nullptr);
             curLit = litDraw;
             curCard = cardDraw;
+            curNormal = normalDraw;
             depths[d.depth].needsClear = false;
             curFrame = d.frame;
             curDepth = d.depth;
@@ -3450,6 +3515,7 @@ void GSGpuBackend::Impl::flushLocked(bool wait, const FieldCopy *fieldCopies, in
                 beginPass(d.frame, ft.proc, ft.procDepth, d.replayFirst ? SDL_GPU_LOADOP_CLEAR : SDL_GPU_LOADOP_LOAD);
                 curLit = false;
                 curCard = false;
+                curNormal = false;
                 curFrame = d.frame;
             }
             drawOne(d);
@@ -4358,6 +4424,7 @@ void GSGpuBackend::Impl::fxResetTarget(FrameTarget &t)
     t.lightValid = false;
     t.rimPending = true;
     t.rimValid = false;
+    t.rimLeanValid = false;
     t.rimX0 = t.rimY0 = 0x7FFFFFFF;
     t.rimX1 = t.rimY1 = -1;
     t.rimAreaPixels = t.rimAreaTexels = 0.0;
@@ -4685,6 +4752,14 @@ void GSGpuBackend::Impl::lightRefresh()
             said = true;
         }
     }
+    if (lightOn && lightLookGeneration != 0u && ps2x_lighting::wrestlerNormalsFromEnvironment(lightLook))
+    {
+        static bool saidNormals = false;
+        if (!saidNormals)
+            std::fprintf(stderr, "[light] PS2X_LIGHT_NORMALS: generated shape %.3g, paint %.3g, crease fade %.3g, %s, whatever the look says\n", lightLook.wrestlerNormals,
+                         lightLook.wrestlerPaint, lightLook.wrestlerCrease, lightLook.wrestlerSmooth ? "smooth" : "per texel");
+        saidNormals = true;
+    }
     // Wrestler shape (task lt3-T1): its shaders and the mask's two pipelines, the first time a look asks for it.
     bool wantRim = lightOn && !rimSetupFailed && ps2x_lighting::wrestlerShapeWanted(lightLook);
     if (wantRim && !cardShader)
@@ -4740,11 +4815,190 @@ void GSGpuBackend::Impl::lightRefresh()
     if (wantRim != rimOn)
         std::fprintf(stderr, "[light] wrestler shape %s\n", wantRim ? "on" : "off");
     rimOn = wantRim;
+    // Generated shape (task lt3-T3): the cards' shaders with the fourth output, a flat 1 x 1 map and the smooth sampler, the first time
+    // a look asks for it.
+    bool wantNormals = rimOn && !normalsSetupFailed && ps2x_lighting::wrestlerNormalsWanted(lightLook);
+    if (wantNormals && !cardNShader)
+    {
+        cardNShader = ps2x::gpu::createShader(dev, ps2x::gpu::shaders::gs_card_n_frag);
+        cardRepNShader = ps2x::gpu::createShader(dev, ps2x::gpu::shaders::gs_rep_card_n_frag);
+        SDL_GPUTextureCreateInfo ti = {};
+        ti.type = SDL_GPU_TEXTURETYPE_2D;
+        ti.format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
+        ti.usage = SDL_GPU_TEXTUREUSAGE_SAMPLER;
+        ti.width = ti.height = 1;
+        ti.layer_count_or_depth = 1;
+        ti.num_levels = 1;
+        ti.sample_count = SDL_GPU_SAMPLECOUNT_1;
+        normalFlat = SDL_CreateGPUTexture(dev, &ti);
+        if (normalFlat)
+        {
+            const size_t offset = allocateStage(4);
+            const uint32_t flat = 0x80808080u;
+            std::memcpy(stage.data() + offset, &flat, 4);
+            pendingUploads.push_back({normalFlat, 1, 1, offset});
+        }
+        SDL_GPUSamplerCreateInfo si = {};
+        si.min_filter = SDL_GPU_FILTER_LINEAR;
+        si.mag_filter = SDL_GPU_FILTER_LINEAR;
+        si.mipmap_mode = SDL_GPU_SAMPLERMIPMAPMODE_NEAREST;
+        si.address_mode_u = si.address_mode_v = si.address_mode_w = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
+        normalLinear = SDL_CreateGPUSampler(dev, &si);
+        if (!cardNShader || !cardRepNShader || !normalFlat || !normalLinear)
+        {
+            std::fprintf(stderr, "[light] generated wrestler shape cannot be set up (%s); the wrestlers keep the shape of their outline alone\n", SDL_GetError());
+            normalsSetupFailed = true;
+            wantNormals = false;
+        }
+    }
+    if (wantNormals != normalsOn)
+        std::fprintf(stderr, "[light] generated wrestler shape %s\n", wantNormals ? "on" : "off");
+    normalsOn = wantNormals;
+}
+
+// Generated shape (task lt3-T3): the normal map of the wrestler tile in `g`, made here the first time a card shows the tile (and again
+// if a later card shows more of the texture than the map was made for). `u`, `v` are the texel coordinates of the card triangle's
+// corners: the map is made for the rectangle they span, and everything outside it counts as empty (a 48 x 48 tile sits in a 64 x 64
+// texture whose other texels are whatever was in GS memory). Returns the flat map for a texture that gets none.
+SDL_GPUTexture *GSGpuBackend::Impl::tileNormals(GpuTexture &g, const GSDrawState &state, const float u[3], const float v[3])
+{
+    if (g.normalFailed || g.w > ps2x_lighting::kTileNormalMaxSide || g.h > ps2x_lighting::kTileNormalMaxSide || g.w == 0u || g.h == 0u)
+        return normalFlat;
+    TexelRect want;
+    want.x0 = std::clamp(static_cast<int32_t>(std::floor(std::min({u[0], u[1], u[2]}) + 0.01f)), 0, static_cast<int32_t>(g.w) - 1);
+    want.y0 = std::clamp(static_cast<int32_t>(std::floor(std::min({v[0], v[1], v[2]}) + 0.01f)), 0, static_cast<int32_t>(g.h) - 1);
+    want.x1 = std::clamp(static_cast<int32_t>(std::ceil(std::max({u[0], u[1], u[2]}) - 0.01f)) - 1, want.x0, static_cast<int32_t>(g.w) - 1);
+    want.y1 = std::clamp(static_cast<int32_t>(std::ceil(std::max({v[0], v[1], v[2]}) - 0.01f)) - 1, want.y0, static_cast<int32_t>(g.h) - 1);
+    if (g.normal && want.x0 >= g.normalRect.x0 && want.y0 >= g.normalRect.y0 && want.x1 <= g.normalRect.x1 && want.y1 <= g.normalRect.y1)
+        return g.normal;
+    const uint64_t start = nowNanos();
+    if (g.normal)
+    {
+        // A card shows texels the map was not made for: make it again for both rectangles together.
+        want.x0 = std::min(want.x0, g.normalRect.x0);
+        want.y0 = std::min(want.y0, g.normalRect.y0);
+        want.x1 = std::max(want.x1, g.normalRect.x1);
+        want.y1 = std::max(want.y1, g.normalRect.y1);
+        ++normalTilesRemade;
+    }
+    else
+    {
+        SDL_GPUTextureCreateInfo ti = {};
+        ti.type = SDL_GPU_TEXTURETYPE_2D;
+        ti.format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
+        ti.usage = SDL_GPU_TEXTUREUSAGE_SAMPLER;
+        ti.width = g.w;
+        ti.height = g.h;
+        ti.layer_count_or_depth = 1;
+        ti.num_levels = 1;
+        ti.sample_count = SDL_GPU_SAMPLECOUNT_1;
+        // A map is a texture like the tile's own (same size and format), so it comes from the same pool of textures made ahead
+        // (createTexture): making one here costs several times the arithmetic.
+        if (poolEnabled)
+        {
+            std::lock_guard<std::mutex> lock(poolMutex);
+            poolWanted[(g.w << 16) | g.h] = flushIndex;
+            const auto bucket = texturePool.find((g.w << 16) | g.h);
+            if (bucket != texturePool.end() && !bucket->second.empty())
+            {
+                const PooledTexture pooled = bucket->second.back();
+                bucket->second.pop_back();
+                g.normal = pooled.tex;
+                poolBytes -= pooled.bytes;
+                if (pooled.bytes <= kSmallTextureBytes)
+                {
+                    poolSmallBytes -= pooled.bytes;
+                    --poolSmallCount;
+                }
+            }
+            if (makerEnabled)
+                wishFor((g.w << 16) | g.h);
+        }
+        if (!g.normal)
+            g.normal = SDL_CreateGPUTexture(dev, &ti);
+        if (!g.normal)
+        {
+            std::fprintf(stderr, "[light] cannot create a %ux%u normal map: %s\n", g.w, g.h, SDL_GetError());
+            g.normalFailed = true;
+            return normalFlat;
+        }
+        normalBytes += static_cast<uint64_t>(g.w) * g.h * 4u;
+        textureBytes += static_cast<uint64_t>(g.w) * g.h * 4u; // (a map counts towards the texture budget like the tile it belongs to)
+    }
+    g.normalRect = want;
+    // The rectangle's texels as the renderer decodes them (decodeTexels): from GS memory, through the palette.
+    const GSTex0Reg &t = state.context.tex0;
+    const uint32_t rw = static_cast<uint32_t>(want.x1 - want.x0 + 1), rh = static_cast<uint32_t>(want.y1 - want.y0 + 1);
+    normalScratch.resize(static_cast<size_t>(rw) * rh);
+    const bool indexed = isFourBitIndexedPsm(t.psm) || isEightBitIndexedPsm(t.psm);
+    uint32_t palette[256];
+    if (indexed)
+    {
+        const uint32_t count = isFourBitIndexedPsm(t.psm) ? 16u : 256u;
+        for (uint32_t i = 0; i < 256u; ++i)
+            palette[i] = LookupClutEntry(clut.data(), state.texa, static_cast<uint8_t>(i % count), t.cpsm, t.csm, t.csa, t.psm);
+    }
+    GSMem::TexturePageCache cache;
+    for (uint32_t y = 0; y < rh; ++y)
+        for (uint32_t x = 0; x < rw; ++x)
+        {
+            const uint32_t raw = GSMem::ReadTexture(cache, vram, t.psm, t.tbp0, t.tbw, static_cast<uint32_t>(want.x0) + x, static_cast<uint32_t>(want.y0) + y);
+            uint32_t texel;
+            switch (t.psm)
+            {
+            case GS_PSM_CT32:
+            case GS_PSM_CT24:
+                texel = applyTexa(state.texa, t.psm, raw);
+                break;
+            case GS_PSM_CT16:
+            case GS_PSM_CT16S:
+                texel = applyTexa(state.texa, t.psm, Rgba5551ToRgba8888(static_cast<uint16_t>(raw)));
+                break;
+            case GS_PSM_T8:
+            case GS_PSM_T8H:
+                texel = palette[raw & 0xFFu];
+                break;
+            case GS_PSM_T4:
+            case GS_PSM_T4HL:
+            case GS_PSM_T4HH:
+                texel = palette[raw & 0x0Fu];
+                break;
+            default:
+                texel = 0u;
+                break;
+            }
+            normalScratch[static_cast<size_t>(y) * rw + x] = texel;
+        }
+    // A texel is part of the figure when it passes the card's alpha test (a wrestler tile: alpha at least 16); without a test, when it
+    // is not fully transparent.
+    const uint64_t test = state.context.test;
+    const uint32_t atst = static_cast<uint32_t>((test >> 1) & 7u), aref = static_cast<uint32_t>((test >> 4) & 0xFFu);
+    const uint32_t alphaRef = (test & 1ull) != 0u ? (atst == 5u ? aref : (atst == 6u ? aref + 1u : 1u)) : 1u;
+    // The whole texture is written: the rectangle's map, flat around it.
+    const size_t offset = allocateStage(static_cast<size_t>(g.w) * g.h * 4u);
+    uint8_t *out = stage.data() + offset;
+    std::memset(out, 0x80, static_cast<size_t>(g.w) * g.h * 4u);
+    std::vector<uint8_t> &bytes = normalBytesScratch;
+    bytes.resize(static_cast<size_t>(rw) * rh * 4u);
+    const uint64_t genStart = nowNanos();
+    ps2x_lighting::generateTileNormals(normalScratch.data(), rw, rh, alphaRef, bytes.data());
+    normalGenNanos += nowNanos() - genStart;
+    for (uint32_t y = 0; y < rh; ++y)
+        std::memcpy(out + (static_cast<size_t>(want.y0 + static_cast<int32_t>(y)) * g.w + static_cast<size_t>(want.x0)) * 4u, bytes.data() + static_cast<size_t>(y) * rw * 4u,
+                    static_cast<size_t>(rw) * 4u);
+    pendingUploads.push_back({g.normal, g.w, g.h, offset, 0, 0});
+    const uint64_t took = nowNanos() - start;
+    normalNanos += took;
+    normalNanosMost = std::max(normalNanosMost, took);
+    ++normalTilesMade;
+    ++normalMadeThisField;
+    normalTexelsMade += static_cast<uint64_t>(rw) * rh;
+    return g.normal;
 }
 
 // Wrestler shape (task lt3-T1): one triangle of a wrestler card is about to be drawn into `ft`. Makes the frame's two textures on first
 // use, finds the wrestler the card belongs to (by its plane), and adds the card to what the field's shape pass needs to know.
-void GSGpuBackend::Impl::rimNoteCard(FrameTarget &ft, Draw &d, const Setup &setup, const GSDrawState &state, const LightVertex *verts)
+void GSGpuBackend::Impl::rimNoteCard(FrameTarget &ft, Draw &d, const Setup &setup, const GSDrawState &state, const LightVertex *verts, GpuTexture *texture)
 {
     if (!ft.rimWhere || !ft.rimMask)
     {
@@ -4805,8 +5059,37 @@ void GSGpuBackend::Impl::rimNoteCard(FrameTarget &ft, Draw &d, const Setup &setu
     d.pipeline |= kCardKey;
     d.rimChannel = static_cast<uint8_t>(1u + (index & 3u));
     d.rimClear = ft.rimPending;
+    // Generated shape: every card of a field, from its first on, also writes what its tile's normal map says (below, once the texel
+    // coordinates are known). A field whose first cards were drawn without it stays without it.
+    bool withNormals = normalsOn && (ft.rimPending || ft.rimLeanValid);
+    if (withNormals && !ft.rimLean)
+    {
+        SDL_GPUTextureCreateInfo ci = {};
+        ci.type = SDL_GPU_TEXTURETYPE_2D;
+        ci.format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
+        ci.usage = SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER;
+        ci.width = ft.w;
+        ci.height = ft.h;
+        ci.layer_count_or_depth = 1;
+        ci.num_levels = 1;
+        ci.sample_count = SDL_GPU_SAMPLECOUNT_1;
+        ft.rimLean = SDL_CreateGPUTexture(dev, &ci);
+        if (ft.rimLean)
+            frameTargetBytes += static_cast<uint64_t>(ft.w) * ft.h * 4u;
+        else
+        {
+            std::fprintf(stderr, "[light] cannot create the %ux%u texture for the wrestlers' generated shape: %s\n", ft.w, ft.h, SDL_GetError());
+            normalsSetupFailed = true;
+            normalsOn = false;
+            withNormals = false;
+        }
+    }
     if (ft.rimPending)
+    {
         ++rimFields;
+        normalMostInField = std::max(normalMostInField, normalMadeThisField);
+        normalMadeThisField = 0;
+    }
     ft.rimPending = false;
     ft.rimValid = true;
     ++rimCards;
@@ -4827,6 +5110,12 @@ void GSGpuBackend::Impl::rimNoteCard(FrameTarget &ft, Draw &d, const Setup &setu
     ft.rimAreaPixels += 0.5 * std::fabs(static_cast<double>(setup.v[1].x - setup.v[0].x) * (setup.v[2].y - setup.v[0].y) -
                                         static_cast<double>(setup.v[2].x - setup.v[0].x) * (setup.v[1].y - setup.v[0].y));
     ft.rimAreaTexels += 0.5 * std::fabs(static_cast<double>(u[1] - u[0]) * (v[2] - v[0]) - static_cast<double>(u[2] - u[0]) * (v[1] - v[0]));
+    if (withNormals)
+    {
+        d.normal = texture ? tileNormals(*texture, state, u, v) : normalFlat;
+        d.pipeline |= kNormalKey;
+        ft.rimLeanValid = true;
+    }
     for (int k = 0; k < 3; ++k)
         ft.rimEye[k] = static_cast<float>(lightUnproject.eye[k]);
     ft.rimRightSign = lightRightSign;
@@ -4854,6 +5143,15 @@ void GSGpuBackend::Impl::rimFillJob(const FrameTarget &ft, ps2x_postfx::Job &job
     // wrestler's own texels at any resolution and camera distance.
     const double texel = ft.rimAreaTexels > 1.0 ? std::sqrt(ft.rimAreaPixels / ft.rimAreaTexels) : static_cast<double>(scaleX);
     job.rimSigma = static_cast<float>(lightLook.wrestlerOutline * texel);
+    if (normalsOn && ft.rimLeanValid && ft.rimLean)
+    {
+        // Generated shape: what the cards' normal maps said, and how to add it.
+        job.rimLeanMap = ft.rimLean;
+        job.rimNormals = lightLook.wrestlerNormals;
+        job.rimPaint = lightLook.wrestlerPaint;
+        job.rimCrease = lightLook.wrestlerCrease;
+        job.rimOutline = lightLook.wrestlerOutline;
+    }
     static_assert(sizeof(job.rimLights) == sizeof(ps2x_lighting::LightUniforms), "Job::rimLights holds a LightUniforms");
     std::memcpy(job.rimLights, &lightBlocks[2], sizeof(job.rimLights));
 }
@@ -5012,6 +5310,13 @@ void GSGpuBackend::Impl::lightShutdown()
             std::fprintf(stderr, "[light] wrestler shape: %llu card triangles in %llu fields; most wrestler planes in a field %llu; %llu lit primitives that are not cards came after a card\n",
                          static_cast<unsigned long long>(rimCards), static_cast<unsigned long long>(rimFields), static_cast<unsigned long long>(rimPlanesMost),
                          static_cast<unsigned long long>(rimLitAfterCards));
+        if (normalTilesMade != 0u)
+            std::fprintf(stderr, "[light] generated shape: %llu normal maps made (%llu again for a larger part of their texture), %llu texels, %.1f us each on average (%.1f of them the arithmetic), "
+                                 "%.1f us the slowest; most in one field %u; %.1f MiB held at the end\n",
+                         static_cast<unsigned long long>(normalTilesMade), static_cast<unsigned long long>(normalTilesRemade), static_cast<unsigned long long>(normalTexelsMade),
+                         static_cast<double>(normalNanos) / 1000.0 / static_cast<double>(normalTilesMade),
+                         static_cast<double>(normalGenNanos) / 1000.0 / static_cast<double>(normalTilesMade), static_cast<double>(normalNanosMost) / 1000.0,
+                         std::max(normalMostInField, normalMadeThisField), static_cast<double>(normalBytes) / (1024.0 * 1024.0));
         std::fprintf(stderr, "[light] recovered %llu scene triangles in %llu frames with a camera (%llu with no area in the world), %llu drawn by the debug view",
                      static_cast<unsigned long long>(lightStats.triangles), static_cast<unsigned long long>(lightStats.cameras),
                      static_cast<unsigned long long>(lightStats.noNormal), static_cast<unsigned long long>(lightStats.drawn));
@@ -5036,9 +5341,16 @@ void GSGpuBackend::Impl::lightShutdown()
     for (SDL_GPUGraphicsPipeline *p : {maskPipeline, maskRepPipeline})
         if (p)
             SDL_ReleaseGPUGraphicsPipeline(dev, p);
-    for (SDL_GPUShader *sh : {cardShader, cardRepShader, maskShader, maskRepShader})
+    for (SDL_GPUShader *sh : {cardShader, cardRepShader, maskShader, maskRepShader, cardNShader, cardRepNShader})
         if (sh)
             SDL_ReleaseGPUShader(dev, sh);
+    if (normalFlat)
+        SDL_ReleaseGPUTexture(dev, normalFlat);
+    if (normalLinear)
+        SDL_ReleaseGPUSampler(dev, normalLinear);
+    normalFlat = nullptr;
+    normalLinear = nullptr;
+    cardNShader = cardRepNShader = nullptr;
     maskPipeline = maskRepPipeline = nullptr;
     cardShader = cardRepShader = maskShader = maskRepShader = nullptr;
     lightBuffer = nullptr;

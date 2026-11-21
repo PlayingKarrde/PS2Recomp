@@ -4,6 +4,7 @@
 #include "ps2_settings.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -661,7 +662,8 @@ namespace ps2x_lighting
         return choice;
     }
 
-    void wrestlerShapeAt(const Look &look, const float position[3], const double eye[3], float outX, float outY, float lean, float rightSign, float out[3])
+    void wrestlerShapeAt(const Look &look, const float position[3], const double eye[3], float outX, float outY, float lean, float rightSign, float out[3],
+                         const float *tileLean)
     {
         out[0] = out[1] = out[2] = 0.0f;
         const auto dot = [](const float a[3], const float b[3]) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; };
@@ -685,11 +687,24 @@ namespace ps2x_lighting
         for (int i = 0; i < 3; ++i)
             R[i] *= rightSign;
         const float sx = outX * lean, sy = outY * lean;
-        const float depth = std::sqrt(std::max(1.0f - lean * lean, 0.02f));
+        // The surface's tip: the outline's alone (T1), or with what the tile's generated map adds (T3), held to kWrestlerLeanMost.
+        float tx = sx, ty = sy, depth = std::sqrt(std::max(1.0f - lean * lean, 0.02f));
+        if (tileLean && (tileLean[0] != 0.0f || tileLean[1] != 0.0f))
+        {
+            tx += tileLean[0];
+            ty += tileLean[1];
+            const float length = std::sqrt(tx * tx + ty * ty);
+            if (length > kWrestlerLeanMost)
+            {
+                tx *= kWrestlerLeanMost / length;
+                ty *= kWrestlerLeanMost / length;
+            }
+            depth = std::sqrt(std::max(1.0f - (tx * tx + ty * ty), 0.02f));
+        }
         float N[3], N2[3], flat[3];
         for (int i = 0; i < 3; ++i)
         {
-            N[i] = sx * R[i] - sy * U[i] - depth * V[i];
+            N[i] = tx * R[i] - ty * U[i] - depth * V[i];
             N2[i] = sx * R[i] - sy * U[i] - 0.001f * V[i];
             flat[i] = -V[i];
         }
@@ -727,6 +742,188 @@ namespace ps2x_lighting
         }
         for (int i = 0; i < 3; ++i)
             out[i] = look.wrestlerShape * (shaped[i] * gain - today[i]) + look.wrestlerRim * lean * lean * rim[i];
+    }
+
+    // The inverse of the normal distribution for the upper half: how many sigmas into a blurred edge the value b (1/2 on the edge, 1
+    // far inside) lies. Through Winitzki's approximation of the inverse error function; held to about 3.9 sigmas.
+    static float sigmasInside(float b)
+    {
+        const float x = std::clamp(b * 2.0f - 1.0f, 0.0f, 0.9999f);
+        const float a = 0.147f;
+        const float ln = std::log(1.0f - x * x);
+        const float t = 2.0f / (3.14159265f * a) + ln * 0.5f;
+        return 1.41421356f * std::sqrt(std::max(std::sqrt(std::max(t * t - ln / a, 0.0f)) - t, 0.0f));
+    }
+
+    void wrestlerTileLean(const Look &look, const float bulge[2], const float paint[2], float blurredMask, float out[2])
+    {
+        const float length = std::min(std::sqrt(bulge[0] * bulge[0] + bulge[1] * bulge[1]), 1.0f);
+        const float dTile = kTileBulgeRadius * (1.0f - length);
+        const float dOut = look.wrestlerOutline * sigmasInside(blurredMask);
+        const float x = std::clamp((dOut - dTile - kCreaseStart) / (kCreaseEnd - kCreaseStart), 0.0f, 1.0f);
+        const float fade = 1.0f - look.wrestlerCrease * (x * x * (3.0f - 2.0f * x));
+        const float toSlope = fade / std::sqrt(std::max(1.0f - length * length, 0.05f));
+        const float sx = bulge[0] * toSlope + look.wrestlerPaint * paint[0];
+        const float sy = bulge[1] * toSlope + look.wrestlerPaint * paint[1];
+        const float k = look.wrestlerNormals / std::sqrt(1.0f + sx * sx + sy * sy);
+        out[0] = sx * k;
+        out[1] = sy * k;
+    }
+
+    void generateTileNormals(const uint32_t *rgba, uint32_t w, uint32_t h, uint32_t alphaRef, uint8_t *out)
+    {
+        if (w == 0u || h == 0u)
+            return;
+        // Every array here has one more texel all round than the tile (index (y + 1) * pw + x + 1), so the loops need no edge cases:
+        // the extra ring is empty for `inside` and the paint, and repeats the border texel for the bulge's height.
+        const int W = static_cast<int>(w), H = static_cast<int>(h), pw = W + 2, ph = H + 2;
+        const size_t count = static_cast<size_t>(pw) * static_cast<size_t>(ph);
+        const float R = kTileBulgeRadius;
+        const int reach = static_cast<int>(std::ceil(R + 0.5f)) + 1;
+        // (kept between calls: a match makes thousands of maps, on the thread that hands the game's primitives to the renderer)
+        static thread_local std::vector<uint8_t> insideStore;
+        static thread_local std::vector<float> store;
+        insideStore.assign(count, 0u);
+        store.assign(count * 5u, 0.0f);
+        uint8_t *const inside = insideStore.data();
+        float *const column = store.data(), *const height = column + count, *const smooth = height + count, *const paintA = smooth + count, *const paintB = paintA + count;
+        const uint32_t ref = std::max<uint32_t>(alphaRef, 1u);
+        // The display encoding of a channel to linear light (the palette's colours are sRGB), by a table.
+        static const std::array<float, 256> toLinear = [] {
+            std::array<float, 256> table{};
+            for (int i = 0; i < 256; ++i)
+            {
+                const float c = static_cast<float>(i) / 255.0f;
+                table[static_cast<size_t>(i)] = c <= 0.04045f ? c / 12.92f : std::pow((c + 0.055f) / 1.055f, 2.4f);
+            }
+            return table;
+        }();
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x)
+            {
+                const uint32_t c = rgba[static_cast<size_t>(y) * w + static_cast<size_t>(x)];
+                if ((c >> 24) < ref)
+                    continue;
+                const size_t i = static_cast<size_t>(y + 1) * pw + static_cast<size_t>(x + 1);
+                inside[i] = 1u;
+                paintA[i] = std::sqrt(0.2126f * toLinear[c & 0xFFu] + 0.7152f * toLinear[(c >> 8) & 0xFFu] + 0.0722f * toLinear[(c >> 16) & 0xFFu]) * R;
+            }
+        // The bulge's height: from the distance to the nearest empty texel (anything outside the tile is empty). First the distance
+        // up or down each column, then the nearest over the columns within reach: exact, and about 15 steps a texel.
+        for (int x = 1; x <= W; ++x)
+        {
+            float run = 0.0f;
+            for (int y = 1; y <= H; ++y)
+            {
+                run = inside[y * pw + x] ? run + 1.0f : 0.0f;
+                column[y * pw + x] = run;
+            }
+            run = 0.0f;
+            for (int y = H; y >= 1; --y)
+            {
+                run = inside[y * pw + x] ? run + 1.0f : 0.0f;
+                column[y * pw + x] = std::min(column[y * pw + x], run);
+            }
+        }
+        for (int y = 1; y <= H; ++y)
+            for (int x = 1; x <= W; ++x)
+            {
+                if (!inside[y * pw + x])
+                    continue;
+                float best = static_cast<float>(reach * reach);
+                const int lo = std::max(x - reach, 0), hi = std::min(x + reach, W + 1); // (columns 0 and W + 1 are empty: distance 0)
+                const float *row = column + y * pw;
+                for (int cx = lo; cx <= hi; ++cx)
+                {
+                    const float dx = static_cast<float>(cx - x), g = row[cx];
+                    best = std::min(best, dx * dx + g * g);
+                }
+                const float d = std::min(std::max(std::sqrt(best) - 0.5f, 0.0f), R);
+                height[y * pw + x] = std::sqrt(std::max(R * R - (R - d) * (R - d), 0.0f));
+            }
+        // Smoothed over 3 x 3 texels (the tile's border texels repeat outward, as the offline mock-up had it).
+        const auto repeatBorder = [&](float *a) {
+            for (int x = 1; x <= W; ++x)
+            {
+                a[x] = a[pw + x];
+                a[(H + 1) * pw + x] = a[H * pw + x];
+            }
+            for (int y = 0; y < ph; ++y)
+            {
+                a[y * pw] = a[y * pw + 1];
+                a[y * pw + W + 1] = a[y * pw + W];
+            }
+        };
+        repeatBorder(height);
+        for (int y = 1; y <= H; ++y)
+            for (int x = 1; x <= W; ++x)
+            {
+                const float *c = height + y * pw + x;
+                smooth[y * pw + x] = (c[-pw - 1] + c[-pw] + c[-pw + 1] + c[-1] + c[0] + c[1] + c[pw - 1] + c[pw] + c[pw + 1]) / 9.0f;
+            }
+        // The paint's height, smoothed twice over the texels of the figure only (empty texels hold 0 and are not counted).
+        const auto smoothInside = [&](const float *from, float *to) {
+            for (int y = 1; y <= H; ++y)
+                for (int x = 1; x <= W; ++x)
+                {
+                    const size_t i = static_cast<size_t>(y * pw + x);
+                    if (!inside[i])
+                    {
+                        to[i] = 0.0f;
+                        continue;
+                    }
+                    const float *c = from + i;
+                    const uint8_t *n = inside + i;
+                    const int taps = n[-pw - 1] + n[-pw] + n[-pw + 1] + n[-1] + n[0] + n[1] + n[pw - 1] + n[pw] + n[pw + 1];
+                    to[i] = (c[-pw - 1] + c[-pw] + c[-pw + 1] + c[-1] + c[0] + c[1] + c[pw - 1] + c[pw] + c[pw + 1]) / static_cast<float>(taps);
+                }
+        };
+        smoothInside(paintA, paintB);
+        smoothInside(paintB, paintA);
+        const auto toByte = [](float v) { return static_cast<uint8_t>(std::clamp(static_cast<int>(std::lround(v * 127.0f)) + 128, 1, 255)); };
+        for (int y = 1; y <= H; ++y)
+            for (int x = 1; x <= W; ++x)
+            {
+                const size_t i = static_cast<size_t>(y * pw + x);
+                // The bulge: central differences of the smoothed height (one-sided at the tile's border).
+                const int xl = std::max(x - 1, 1), xr = std::min(x + 1, W), yu = std::max(y - 1, 1), yd = std::min(y + 1, H);
+                const float gx = (smooth[y * pw + xr] - smooth[y * pw + xl]) / static_cast<float>(std::max(xr - xl, 1));
+                const float gy = (smooth[yd * pw + x] - smooth[yu * pw + x]) / static_cast<float>(std::max(yd - yu, 1));
+                const float inv = 1.0f / std::sqrt(gx * gx + gy * gy + 1.0f);
+                // The paint: differences between texels of the figure only.
+                float px = 0.0f, py = 0.0f;
+                if (inside[i])
+                {
+                    const bool l = inside[i - 1] != 0u, r = inside[i + 1] != 0u, u = inside[i - pw] != 0u, d = inside[i + pw] != 0u;
+                    const float here = paintA[i];
+                    if (l || r)
+                        px = ((r ? paintA[i + 1] : here) - (l ? paintA[i - 1] : here)) / ((l && r) ? 2.0f : 1.0f);
+                    if (u || d)
+                        py = ((d ? paintA[i + pw] : here) - (u ? paintA[i - pw] : here)) / ((u && d) ? 2.0f : 1.0f);
+                }
+                uint8_t *o = out + (static_cast<size_t>(y - 1) * w + static_cast<size_t>(x - 1)) * 4u;
+                o[0] = toByte(-gx * inv);
+                o[1] = toByte(-gy * inv);
+                // (the paint is a height, so the surface leans away from where it rises: the stored value is minus the slope)
+                o[2] = toByte(std::clamp(-px, -kTilePaintRange, kTilePaintRange) / kTilePaintRange);
+                o[3] = toByte(std::clamp(-py, -kTilePaintRange, kTilePaintRange) / kTilePaintRange);
+            }
+    }
+
+    bool wrestlerNormalsFromEnvironment(Look &look)
+    {
+        const char *text = std::getenv("PS2X_LIGHT_NORMALS");
+        if (!text || !*text)
+            return false;
+        float v[4] = {look.wrestlerNormals, look.wrestlerPaint, look.wrestlerCrease, look.wrestlerSmooth ? 1.0f : 0.0f};
+        const int got = std::sscanf(text, "%f,%f,%f,%f", &v[0], &v[1], &v[2], &v[3]);
+        if (got < 1)
+            return false;
+        look.wrestlerNormals = std::clamp(v[0], 0.0f, 1.5f);
+        look.wrestlerPaint = std::clamp(v[1], 0.0f, 2.0f);
+        look.wrestlerCrease = std::clamp(v[2], 0.0f, 1.0f);
+        look.wrestlerSmooth = v[3] > 0.5f;
+        return true;
     }
 
     bool wrestlerShapeFromEnvironment(Look &look)
@@ -790,6 +987,9 @@ namespace ps2x_lighting
         std::snprintf(line, sizeof(line), "ambient %.9g %.9g %.9g\n", look.ambient[0], look.ambient[1], look.ambient[2]);
         out += line;
         std::snprintf(line, sizeof(line), "wrestler_shape %.9g\nwrestler_rim %.9g\nwrestler_outline %.9g\n", look.wrestlerShape, look.wrestlerRim, look.wrestlerOutline);
+        out += line;
+        std::snprintf(line, sizeof(line), "wrestler_normals %.9g\nwrestler_paint %.9g\nwrestler_crease %.9g\nwrestler_smooth %d\n", look.wrestlerNormals,
+                      look.wrestlerPaint, look.wrestlerCrease, look.wrestlerSmooth ? 1 : 0);
         out += line;
         for (const Light &l : look.lights)
         {
@@ -915,6 +1115,21 @@ namespace ps2x_lighting
                     parsed.wrestlerRim = clampNumber(v[0], 0.0f, 4.0f);
                 else
                     parsed.wrestlerOutline = clampNumber(v[0], 0.5f, 8.0f);
+                light = nullptr;
+            }
+            else if (word == "wrestler_normals" || word == "wrestler_paint" || word == "wrestler_crease" || word == "wrestler_smooth")
+            {
+                // The generated shape of the wrestlers (task lt3-T3). A file without these lines keeps the built-in values.
+                if (!numbers(1))
+                    return fail(word + " takes one number");
+                if (word == "wrestler_normals")
+                    parsed.wrestlerNormals = clampNumber(v[0], 0.0f, 1.5f);
+                else if (word == "wrestler_paint")
+                    parsed.wrestlerPaint = clampNumber(v[0], 0.0f, 2.0f);
+                else if (word == "wrestler_crease")
+                    parsed.wrestlerCrease = clampNumber(v[0], 0.0f, 1.0f);
+                else
+                    parsed.wrestlerSmooth = v[0] > 0.5f;
                 light = nullptr;
             }
             else if (word == "material")

@@ -1357,6 +1357,178 @@ void register_gpu_lighting_tests()
         setEnvVar("PS2X_LIGHT_SHAPE", nullptr);
     });
 
+    tc.Run("generated shape: the look file's four lines, the built-in values for a file without them, clamps; PS2X_LIGHT_NORMALS; when it is wanted", [](TestCase &t)
+    {
+        Look look = defaultLook();
+        t.IsTrue(look.wrestlerNormals == kWrestlerNormals && look.wrestlerPaint == kWrestlerPaint && look.wrestlerCrease == kWrestlerCrease && look.wrestlerSmooth == kWrestlerSmooth &&
+                     wrestlerNormalsWanted(look),
+                 "the built-in look has the built-in values, and they ask for generated shape");
+        look.wrestlerNormals = 0.25f;
+        look.wrestlerPaint = 1.5f;
+        look.wrestlerCrease = 0.5f;
+        look.wrestlerSmooth = true;
+        Look back;
+        std::string error;
+        const std::string text = formatLook(look);
+        t.IsTrue(text.find("wrestler_normals 0.25\n") != std::string::npos && text.find("wrestler_paint 1.5\n") != std::string::npos &&
+                     text.find("wrestler_crease 0.5\n") != std::string::npos && text.find("wrestler_smooth 1\n") != std::string::npos,
+                 "the four lines are written");
+        t.IsTrue(parseLook(text, back, &error) && back.wrestlerNormals == 0.25f && back.wrestlerPaint == 1.5f && back.wrestlerCrease == 0.5f && back.wrestlerSmooth &&
+                     formatLook(back) == text,
+                 "and read back the same" + (error.empty() ? std::string() : ": " + error));
+        // A file written before these lines existed (L2 or T1): the generated shape at the built-in values.
+        Look old;
+        old.wrestlerNormals = 0.0f;
+        old.wrestlerSmooth = true;
+        t.IsTrue(parseLook("look 1\nambient 0.3\nwrestler_shape 1\nwrestler_rim 0.8\n", old, &error) && old.wrestlerNormals == kWrestlerNormals && old.wrestlerPaint == kWrestlerPaint &&
+                     old.wrestlerCrease == kWrestlerCrease && old.wrestlerSmooth == kWrestlerSmooth,
+                 "a file without the lines gets the built-in values");
+        Look clamped;
+        t.IsTrue(parseLook("look 1\nwrestler_normals 9\nwrestler_paint -1\nwrestler_crease 3\nwrestler_smooth 0\n", clamped) && clamped.wrestlerNormals == 1.5f &&
+                     clamped.wrestlerPaint == 0.0f && clamped.wrestlerCrease == 1.0f && !clamped.wrestlerSmooth,
+                 "numbers out of range are clamped (weight 0 to 1.5, paint 0 to 2, crease 0 to 1)");
+        Look none;
+        t.IsTrue(parseLook("look 1\nwrestler_normals 0\n", none) && !wrestlerNormalsWanted(none) && wrestlerShapeWanted(none), "weight 0: no generated shape, the outline's stays");
+        Look flat;
+        t.IsTrue(parseLook("look 1\nwrestler_shape 0\n", flat) && !wrestlerNormalsWanted(flat), "shape 0: the maps would change nothing, so they are not wanted");
+        Look bad = defaultLook();
+        t.IsTrue(!parseLook("look 1\nwrestler_normals\n", bad, &error) && !parseLook("look 1\nwrestler_paint a\n", bad, &error) && formatLook(bad) == formatLook(defaultLook()),
+                 "wrong lines are refused and leave the look alone");
+
+        Look env = defaultLook();
+        setEnvVar("PS2X_LIGHT_NORMALS", nullptr);
+        t.IsFalse(wrestlerNormalsFromEnvironment(env), "PS2X_LIGHT_NORMALS unset: the look's values stay");
+        setEnvVar("PS2X_LIGHT_NORMALS", "0");
+        t.IsTrue(wrestlerNormalsFromEnvironment(env) && !wrestlerNormalsWanted(env) && env.wrestlerPaint == kWrestlerPaint, "PS2X_LIGHT_NORMALS=0 turns it off and keeps the rest");
+        setEnvVar("PS2X_LIGHT_NORMALS", "1,0.5,0.25,1");
+        t.IsTrue(wrestlerNormalsFromEnvironment(env) && env.wrestlerNormals == 1.0f && env.wrestlerPaint == 0.5f && env.wrestlerCrease == 0.25f && env.wrestlerSmooth,
+                 "four numbers set all four");
+        setEnvVar("PS2X_LIGHT_NORMALS", nullptr);
+    });
+
+    tc.Run("generated shape: a tile's normal map leans outward at its cut-out and is flat in the middle; paint leans away from the bright side; a mirrored tile gives the mirrored map", [](TestCase &t)
+    {
+        // A 32 x 32 tile: a disc of radius 13 texels, opaque (alpha 128), one grey. Around it transparent.
+        const uint32_t W = 32, H = 32;
+        const auto disc = [&](bool ramp, bool mirror) {
+            std::vector<uint32_t> px(W * H, 0u);
+            for (uint32_t y = 0; y < H; ++y)
+                for (uint32_t x = 0; x < W; ++x)
+                {
+                    const float dx = static_cast<float>(x) - 15.5f, dy = static_cast<float>(y) - 15.5f;
+                    if (dx * dx + dy * dy > 13.0f * 13.0f)
+                        continue;
+                    const uint32_t sx = mirror ? W - 1u - x : x;
+                    const uint32_t grey = ramp ? 40u + sx * 6u : 128u; // brighter to the right (before mirroring)
+                    px[y * W + x] = grey | (grey << 8) | (grey << 16) | (128u << 24);
+                }
+            return px;
+        };
+        const auto value = [](const std::vector<uint8_t> &m, uint32_t x, uint32_t y, int c) { return (static_cast<int>(m[(y * 32u + x) * 4u + static_cast<uint32_t>(c)]) - 128) / 127.0f; };
+        std::vector<uint8_t> plain(W * H * 4u), ramp(W * H * 4u), mirrored(W * H * 4u);
+        generateTileNormals(disc(false, false).data(), W, H, 16u, plain.data());
+        generateTileNormals(disc(true, false).data(), W, H, 16u, ramp.data());
+        generateTileNormals(disc(true, true).data(), W, H, 16u, mirrored.data());
+        t.IsTrue(std::fabs(value(plain, 15, 15, 0)) < 0.01f && std::fabs(value(plain, 16, 16, 1)) < 0.01f, "the middle of the disc (more than 5 texels inside) is flat");
+        t.IsTrue(value(plain, 3, 15, 0) < -0.5f && value(plain, 28, 15, 0) > 0.5f && std::fabs(value(plain, 3, 15, 1)) < 0.2f, "the left edge leans left, the right edge right");
+        t.IsTrue(value(plain, 15, 3, 1) < -0.5f && value(plain, 15, 28, 1) > 0.5f, "the top edge leans up (y is down in a texture), the bottom edge down");
+        t.IsTrue(value(plain, 6, 15, 0) < value(plain, 8, 15, 0) && value(plain, 8, 15, 0) < -0.02f, "the lean falls off inward");
+        bool noPaint = true;
+        for (size_t i = 0; i < plain.size(); i += 4)
+            noPaint = noPaint && plain[i + 2] == 128 && plain[i + 3] == 128;
+        t.IsTrue(noPaint, "one flat colour: the paint part is 0 everywhere, also along the cut-out (no cliff)");
+        t.IsTrue(value(ramp, 15, 15, 2) < -0.05f && std::fabs(value(ramp, 15, 15, 3)) < 0.02f, "brighter to the right counts as rising to the right: the surface leans left there");
+        t.IsTrue(std::fabs(value(ramp, 3, 15, 2)) < 0.6f && ramp[(15u * W + 1u) * 4u + 2u] == 128, "the paint part stays small at the cut-out and is 0 outside it");
+        bool same = true;
+        for (uint32_t y = 0; y < H && same; ++y)
+            for (uint32_t x = 0; x < W && same; ++x)
+                for (int c = 0; c < 4; ++c)
+                {
+                    const int a = ramp[(y * W + x) * 4u + static_cast<uint32_t>(c)] - 128, b = mirrored[(y * W + (W - 1u - x)) * 4u + static_cast<uint32_t>(c)] - 128;
+                    same = same && std::abs(((c & 1) == 0 ? -a : a) - b) <= 1;
+                }
+        t.IsTrue(same, "the mirrored tile's map is the mirror image with x turned round");
+        // A tile cut by the border of its texture: the border counts as empty, so the map leans out there too.
+        std::vector<uint32_t> full(W * H, 0x80808080u);
+        std::vector<uint8_t> whole(W * H * 4u);
+        generateTileNormals(full.data(), W, H, 16u, whole.data());
+        t.IsTrue(value(whole, 0, 15, 0) < -0.5f && value(whole, 31, 15, 0) > 0.5f && std::fabs(value(whole, 15, 15, 0)) < 0.01f, "a full tile: its border is its cut-out");
+        // The alpha test: texels below the reference are not part of the figure.
+        std::vector<uint32_t> faint(W * H, 0x08808080u);
+        generateTileNormals(faint.data(), W, H, 16u, whole.data());
+        bool allFlat = true;
+        for (uint8_t v : whole)
+            allFlat = allFlat && v == 128;
+        t.IsTrue(allFlat, "texels that fail the card's alpha test give a flat map");
+    });
+
+    tc.Run("generated shape: the bulge is kept at the wrestler's outline and faded where the tile's edge lies inside him; paint is not faded; the weight scales; with none the shape pass is T1's", [](TestCase &t)
+    {
+        Look look = defaultLook();
+        look.wrestlerNormals = 1.0f;
+        look.wrestlerPaint = 0.0f;
+        const float edge[2] = {0.8f, 0.0f}, none[2] = {0.0f, 0.0f}, paint[2] = {0.0f, 0.5f};
+        float atOutline[2], inside[2], unfaded[2], painted[2], half[2];
+        wrestlerTileLean(look, edge, none, 0.55f, atOutline); // one texel from the tile's edge, and the wrestler's outline is as near
+        wrestlerTileLean(look, edge, none, 1.0f, inside);     // the same texel of the tile, deep inside the wrestler
+        t.IsTrue(std::fabs(atOutline[0] - 0.8f) < 0.01f && atOutline[1] == 0.0f, "at the outline the bulge comes through as it is");
+        t.IsTrue(std::fabs(inside[0]) < 1.0e-4f, "deep inside the wrestler the same bulge is faded out: no crease at a joint");
+        look.wrestlerCrease = 0.0f;
+        wrestlerTileLean(look, edge, none, 1.0f, unfaded);
+        t.IsTrue(std::fabs(unfaded[0] - 0.8f) < 0.01f, "with the crease fade at 0 it is kept");
+        look.wrestlerCrease = 1.0f;
+        look.wrestlerPaint = 1.0f;
+        wrestlerTileLean(look, edge, paint, 1.0f, painted);
+        t.IsTrue(std::fabs(painted[0]) < 1.0e-4f && std::fabs(painted[1] - 0.5f / std::sqrt(1.25f)) < 1.0e-4f, "the painted part is not faded");
+        look.wrestlerNormals = 0.5f;
+        wrestlerTileLean(look, edge, paint, 1.0f, half);
+        t.IsTrue(std::fabs(half[1] - painted[1] * 0.5f) < 1.0e-5f, "the weight scales the result");
+        // A point halfway: the fade is partial and monotonic in how far inside the wrestler the pixel is.
+        look.wrestlerNormals = 1.0f;
+        look.wrestlerPaint = 0.0f;
+        float last = 1.0f;
+        bool falling = true;
+        for (float b = 0.5f; b <= 1.0f; b += 0.05f)
+        {
+            float v[2];
+            wrestlerTileLean(look, edge, none, b, v);
+            falling = falling && v[0] <= last + 1.0e-6f;
+            last = v[0];
+        }
+        t.IsTrue(falling, "the further inside the wrestler, the less of a tile edge's bulge is left");
+
+        // The shape pass: no tile lean, or (0, 0), is T1's result; a lean towards the light gains, away from it loses.
+        look = defaultLook();
+        look.lights.clear();
+        Light l;
+        l.type = LightType::Point;
+        l.position[0] = -600.0f; l.position[1] = 300.0f; l.position[2] = 0.0f;
+        l.radius = 3000.0f;
+        l.strength = 2.0f;
+        look.lights.push_back(l);
+        look.wrestlerRim = 0.0f;
+        const float at[3] = {0.0f, 150.0f, 0.0f};
+        const double eye[3] = {0.0, 400.0, -900.0};
+        float t1[3], zero[3], towards[3], away[3];
+        wrestlerShapeAt(look, at, eye, 0.0f, 0.0f, 0.0f, 1.0f, t1);
+        wrestlerShapeAt(look, at, eye, 0.0f, 0.0f, 0.0f, 1.0f, zero, none);
+        t.IsTrue(t1[0] == zero[0] && t1[1] == zero[1] && t1[2] == zero[2], "a tile lean of (0, 0) changes nothing");
+        // Which way is "towards the light" on the screen depends on the camera's handedness: take the side that gains.
+        const float leftLean[2] = {-0.6f, 0.0f}, rightLean[2] = {0.6f, 0.0f};
+        wrestlerShapeAt(look, at, eye, 0.0f, 0.0f, 0.0f, 1.0f, towards, leftLean);
+        wrestlerShapeAt(look, at, eye, 0.0f, 0.0f, 0.0f, 1.0f, away, rightLean);
+        float outlineLeft[3];
+        wrestlerShapeAt(look, at, eye, -1.0f, 0.0f, 0.6f, 1.0f, outlineLeft);
+        t.IsTrue((towards[0] - zero[0]) * (away[0] - zero[0]) < 0.0f, "leaning one way gains light and the other way loses it");
+        t.IsTrue(std::fabs(towards[0] - outlineLeft[0]) < 1.0e-5f, "a tile lean tips the surface exactly as the same lean of the outline does");
+        const float huge[2] = {-5.0f, 0.0f};
+        float held[3], most[3];
+        wrestlerShapeAt(look, at, eye, 0.0f, 0.0f, 0.0f, 1.0f, held, huge);
+        const float mostLean[2] = {-kWrestlerLeanMost, 0.0f};
+        wrestlerShapeAt(look, at, eye, 0.0f, 0.0f, 0.0f, 1.0f, most, mostLean);
+        t.IsTrue(std::fabs(held[0] - most[0]) < 1.0e-5f, "the tip is held to kWrestlerLeanMost");
+    });
+
     tc.Run("wrestler shape: a flat-on pixel keeps today's light under the first light; the lit side of the outline gains and the far side loses; the rim only adds", [](TestCase &t)
     {
         // The made-up camera's place and a point on a card in front of it; one light to the left and in front.

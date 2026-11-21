@@ -2251,11 +2251,15 @@ namespace
             if (ImGui::SmallButton(name.c_str()))
             {
                 // (a starting point is about the lights: the wrestlers' shape values below stay as they are)
-                const float shape = look.wrestlerShape, rim = look.wrestlerRim, outline = look.wrestlerOutline;
+                const Look before = look;
                 look = presetLook(name);
-                look.wrestlerShape = shape;
-                look.wrestlerRim = rim;
-                look.wrestlerOutline = outline;
+                look.wrestlerShape = before.wrestlerShape;
+                look.wrestlerRim = before.wrestlerRim;
+                look.wrestlerOutline = before.wrestlerOutline;
+                look.wrestlerNormals = before.wrestlerNormals;
+                look.wrestlerPaint = before.wrestlerPaint;
+                look.wrestlerCrease = before.wrestlerCrease;
+                look.wrestlerSmooth = before.wrestlerSmooth;
                 changed = true;
             }
         }
@@ -2293,6 +2297,23 @@ namespace
             changed = true;
         }
         ImGui::TextDisabled("Shows most with a low or coloured light from the side. Two wrestlers in a hold count as one outline.");
+
+        // Generated shape (task lt3-T3): a normal map made from each part picture, added to the outline's shape. At 0 it is the outline alone.
+        ImGui::SeparatorText("Wrestlers (shape generated from each part's picture)");
+        changed = ImGui::SliderFloat("Generated shape (0 = the outline alone)", &look.wrestlerNormals, 0.0f, 1.5f, "%.2f") || changed;
+        changed = ImGui::SliderFloat("Painted light and dark counted as height", &look.wrestlerPaint, 0.0f, 2.0f, "%.2f") || changed;
+        changed = ImGui::SliderFloat("Fade the bulge at joints and overlaps", &look.wrestlerCrease, 0.0f, 1.0f, "%.2f") || changed;
+        changed = ImGui::Checkbox("Smooth (off: the light steps with the pixel art)", &look.wrestlerSmooth) || changed;
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Defaults##wrestlerNormals"))
+        {
+            look.wrestlerNormals = kWrestlerNormals;
+            look.wrestlerPaint = kWrestlerPaint;
+            look.wrestlerCrease = kWrestlerCrease;
+            look.wrestlerSmooth = kWrestlerSmooth;
+            changed = true;
+        }
+        ImGui::TextDisabled("Needs Shape above 0. Every part picture gets its map the first time it is shown.");
 
         int removeAt = -1, duplicateAt = -1;
         for (size_t i = 0; i < look.lights.size(); ++i)

@@ -243,6 +243,23 @@ namespace ps2x_lighting
     constexpr float kWrestlerLean = 0.92f;   // how far the surface leans at the very outline (1 would be edge-on)
     constexpr float kWrestlerWrap = 0.5f;    // how far a light reaches past the edge of what faces it
 
+    // ---- generated shape for wrestlers (task lt3-T3). Every wrestler part picture ("tile") gets a normal map made from the picture
+    // itself the first time it is drawn (generateTileNormals below): a rounded bulge inward from the tile's cut-out, and a little of
+    // the painted light and dark taken as height. The card shader reads it, turns it by the way the tile lies on the screen
+    // (rotated, mirrored, upside down) and the shape pass adds it to the lean of the outline (wrestlerTileLean, wrestlerShapeAt).
+    // Where a tile's edge lies well inside the wrestler (a joint, a part tucked under another) the bulge is faded out, so that
+    // joints show no crease. The built-in values, which a look file without these lines gets too:
+    constexpr float kWrestlerNormals = 0.6f; // how much of the generated map's lean is added (0 = the outline alone, T1's picture exactly)
+    constexpr float kWrestlerPaint = 0.35f;  // how much of the painted light and dark counts as height
+    constexpr float kWrestlerCrease = 1.0f;  // how far the bulge is faded where a tile's edge lies inside the wrestler (0 = not at all)
+    constexpr bool kWrestlerSmooth = false;  // false: the map is read per texel (the light steps with the pixel art); true: smoothly
+    constexpr float kTileBulgeRadius = 5.0f; // the bulge reaches this many texels in from the tile's cut-out; flat beyond
+    constexpr float kTilePaintRange = 2.0f;  // the stored paint slope is clamped to this (height units per texel)
+    constexpr float kCreaseStart = 1.0f;     // the bulge starts to fade when the wrestler's outline is this many texels further away than
+    constexpr float kCreaseEnd = 3.0f;       // the tile's own edge, and is gone at this many
+    constexpr float kWrestlerLeanMost = 0.97f; // the outline's lean and the map's together never tip the surface further than this
+    constexpr uint32_t kTileNormalMaxSide = 128; // textures larger than this get no map (they are not body tiles)
+
     // A look: what multiplies the game's own colours. Ambient 1 and no lights leaves the picture as the game drew it.
     struct Look
     {
@@ -253,6 +270,11 @@ namespace ps2x_lighting
         float wrestlerShape = kWrestlerShape;     // 0 to 1
         float wrestlerRim = kWrestlerRim;         // 0 to 4
         float wrestlerOutline = kWrestlerOutline; // 0.5 to 8 texels
+        // Generated shape (above). Look file lines "wrestler_normals <n>", "wrestler_paint <n>", "wrestler_crease <n>", "wrestler_smooth 0|1".
+        float wrestlerNormals = kWrestlerNormals; // 0 to 1.5
+        float wrestlerPaint = kWrestlerPaint;     // 0 to 2
+        float wrestlerCrease = kWrestlerCrease;   // 0 to 1
+        bool wrestlerSmooth = kWrestlerSmooth;
     };
 
     // True when the look asks for wrestler shape at all. With both strengths at 0 the renderer does none of the work and the lit
@@ -260,6 +282,13 @@ namespace ps2x_lighting
     inline bool wrestlerShapeWanted(const Look &look)
     {
         return look.wrestlerShape > 0.0f || look.wrestlerRim > 0.0f;
+    }
+
+    // True when the look asks for the generated normal maps as well (task lt3-T3). They only change the shaped light, so they need
+    // wrestler_shape above 0. When false, no map is made and the wrestlers are drawn and lit exactly as T1 does it.
+    inline bool wrestlerNormalsWanted(const Look &look)
+    {
+        return look.wrestlerShape > 0.0f && look.wrestlerNormals > 0.0f;
     }
 
     // What one light adds at a point (not multiplied by the surface colour): colour x strength x falloff x cone x facing.
@@ -277,9 +306,34 @@ namespace ps2x_lighting
     //           surface under the look's first light that is on, so that surface keeps exactly today's brightness
     //   rim     sum of light x max(N2.L, 0) x lean^2, N2 the outward direction lying in the screen's plane
     //   out     wrestlerShape x (shaped - today's light by position) + wrestlerRim x rim
-    void wrestlerShapeAt(const Look &look, const float position[3], const double eye[3], float outX, float outY, float lean, float rightSign, float out[3]);
+    // (task lt3-T3) `tileLean`, when given, is what the generated normal map adds at the pixel (wrestlerTileLean below; x to the right
+    // of the screen, y down it): N is then tipped by (outX, outY) x lean + tileLean, held to kWrestlerLeanMost. The rim is the
+    // outline's alone. With no tileLean, or (0, 0), the result is T1's.
+    void wrestlerShapeAt(const Look &look, const float position[3], const double eye[3], float outX, float outY, float lean, float rightSign, float out[3],
+                         const float *tileLean = nullptr);
+    // What the generated map of a wrestler tile adds to the lean of the surface at one pixel (the reference for the same lines of
+    // shaders/postfx_rim.hlsli). `bulge` is the map's rounded-edge normal (its x and y, already turned to the screen: x right, y
+    // down), `paint` the slope of the painted light and dark, `blurredMask` the blurred wrestler mask at the pixel (1/2 on the
+    // outline, 1 well inside) and `outline` the blur's width in wrestler texels (Look::wrestlerOutline).
+    //   dTile   how far the pixel is from its own tile's cut-out: kTileBulgeRadius x (1 - |bulge|)
+    //   dOut    how far it is from the wrestler's outline, from the blurred mask: outline x the inverse of the normal distribution
+    //   fade    1 - wrestlerCrease x smoothstep(kCreaseStart, kCreaseEnd, dOut - dTile): the tile's edge is inside the wrestler
+    //   slope   bulge as a slope x fade + wrestlerPaint x paint;  out = wrestlerNormals x slope / sqrt(1 + |slope|^2)
+    void wrestlerTileLean(const Look &look, const float bulge[2], const float paint[2], float blurredMask, float out[2]);
+    // The normal map of one wrestler tile (task lt3-T3). `rgba` is the tile as the renderer decodes it (w x h texels, r | g << 8 |
+    // b << 16 | a << 24, alpha in the GS's scale: 128 is opaque); a texel is part of the figure when its alpha is at least
+    // `alphaRef`. Everything outside the w x h texels counts as empty. `out` gets w x h x 4 bytes, per texel:
+    //   0, 1   the bulge's normal, x and y in the texture's own axes (+x right, +y down): 128 + 127 x value
+    //   2, 3   the lean the painted light and dark gives, x and y (minus the slope of its height): 128 + 127 x value / kTilePaintRange
+    // The bulge: height sqrt(R^2 - (R - d)^2) for a texel d texels inside the cut-out (d = distance to the nearest empty texel's
+    // centre - 1/2, held to R = kTileBulgeRadius), 0 outside, smoothed over 3 x 3 texels; its normal is (-dh/dx, -dh/dy, 1) made
+    // unit length. The paint: the square root of the texel's linear brightness x R as a height, smoothed twice over the 3 x 3
+    // texels that are part of the figure; its slope is taken only between texels of the figure, so the cut-out adds no cliff.
+    void generateTileNormals(const uint32_t *rgba, uint32_t w, uint32_t h, uint32_t alphaRef, uint8_t *out);
     // PS2X_LIGHT_SHAPE=<shape>[,<rim>[,<outline>]] (a test aid): fixes those values whatever the look says. True when it is set.
     bool wrestlerShapeFromEnvironment(Look &look);
+    // PS2X_LIGHT_NORMALS=<weight>[,<paint>[,<crease>[,<smooth 0|1>]]] (a test aid): the same for the generated shape.
+    bool wrestlerNormalsFromEnvironment(Look &look);
 
     // ---- which rule a primitive gets (task lt2-L1). One table, so that later steps (materials by texture, L3) extend it in one place.
     // What the renderer knows about a scene primitive when it decides (GSGpuBackend::Impl::submit).
@@ -365,6 +419,7 @@ namespace ps2x_lighting
     //       cone 24 38
     //       range 2000
     //     wrestler_shape 1          (optional, with wrestler_rim and wrestler_outline: the shape of the wrestlers, see Look)
+    //     wrestler_normals 0.6      (optional, with wrestler_paint, wrestler_crease and wrestler_smooth 0|1: the generated shape, see Look)
     // `#` starts a comment. A light is `light spot|point [on|off]` and the lines after it; every field is optional. Numbers out of range
     // are clamped. Anything else (no `look 1` line, an unknown word, a missing or broken number, more than 8 lights) makes the whole
     // text bad: parseLook returns false with a reason and leaves `look` alone.

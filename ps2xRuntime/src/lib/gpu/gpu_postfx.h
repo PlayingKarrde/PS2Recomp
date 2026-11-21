@@ -156,6 +156,11 @@ namespace ps2x_postfx
         float rimSigma = 0.0f;               // the blur of the mask, in texels of the frame target
         float rimLean = 0.92f;               // how far the surface leans at the outline
         float rimLights[136] = {};           // the look's lights: a ps2x_lighting::LightUniforms (the block of the lit shaders)
+        // Generated shape (task lt3-T3): with `rimLeanMap` the pass that lights the wrestlers again also reads what the generated normal
+        // map of each wrestler pixel's tile says (postfx_rim_n.frag.hlsl). Null: that pass is T1's, unchanged.
+        SDL_GPUTexture *rimLeanMap = nullptr; // 8 bits, the frame target's size (the cards' fourth colour target)
+        float rimNormals = 0.0f, rimPaint = 0.0f, rimCrease = 0.0f; // the look's wrestler_normals, wrestler_paint, wrestler_crease
+        float rimOutline = 2.4f;             // the look's wrestler_outline (texels of the wrestler)
         float aspect = 4.0f / 3.0f;          // width over height as displayed
         float scale = 1.0f;                  // target pixels per GS pixel (the internal resolution)
         Params params;

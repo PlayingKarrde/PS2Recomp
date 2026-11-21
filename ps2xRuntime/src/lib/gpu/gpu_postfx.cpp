@@ -30,6 +30,7 @@
 #include "shaders/compiled/postfx_light_frag.h"
 #include "shaders/compiled/postfx_rim_blur_frag.h"
 #include "shaders/compiled/postfx_rim_frag.h"
+#include "shaders/compiled/postfx_rim_n_frag.h"
 #include "shaders/compiled/postfx_tilt_frag.h"
 #include "shaders/compiled/postfx_up_frag.h"
 #include "shaders/compiled/postfx_vert.h"
@@ -339,6 +340,10 @@ namespace ps2x_postfx
         SDL_GPUTexture *rimA = nullptr, *rimB = nullptr; // the mask blurred across, then down too: half-float, the picture's size
         SDL_GPUTexture *relit = nullptr;                 // the light buffer with the wrestlers lit again: half-float, the frame target's size
         bool ensureRim(const Job &job);
+        // Generated shape (task lt3-T3): the same pass reading the cards' normal maps as well. Made the first time a job asks.
+        SDL_GPUShader *fsRimN = nullptr;
+        SDL_GPUGraphicsPipeline *pipeRimN = nullptr;
+        bool rimNTried = false;
         SDL_GPUTexture *recordRim(SDL_GPUCommandBuffer *cmd, const Job &job, Stats &stats);
 
         // Sized for the picture (texW x texH); made again when the picture's size changes.
@@ -641,17 +646,36 @@ namespace ps2x_postfx
         r.v[kTilt][0] = job.rimShape;
         r.v[kTilt][1] = job.rimStrength;
         r.v[kTilt][3] = job.rimLean;
+        // Generated shape: the pass with the cards' normal maps, when the job has them and asks for them (postfx_rim_n.frag.hlsl).
+        bool withNormals = job.rimLeanMap && job.rimNormals > 0.0f && job.rimShape > 0.0f;
+        if (withNormals && !rimNTried)
+        {
+            rimNTried = true;
+            fsRimN = ps2x::gpu::createShader(dev, ps2x::gpu::shaders::postfx_rim_n_frag);
+            if (fsRimN)
+                pipeRimN = makePipeline(dev, vs, fsRimN, SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT);
+            if (!pipeRimN)
+                std::fprintf(stderr, "[light] the pass for the wrestlers' generated shape could not be set up; they keep the shape of their outline alone\n");
+        }
+        withNormals = withNormals && pipeRimN;
+        if (withNormals)
+        {
+            r.v[kBloom][0] = job.rimNormals;
+            r.v[kBloom][1] = job.rimPaint;
+            r.v[kBloom][2] = job.rimCrease;
+            r.v[kBloom][3] = job.rimOutline;
+        }
         {
             SDL_GPUColorTargetInfo ct = {};
             ct.texture = relit;
             ct.load_op = SDL_GPU_LOADOP_DONT_CARE; // the picture's rectangle is written whole, and the multiply pass reads nothing else
             ct.store_op = SDL_GPU_STOREOP_STORE;
             SDL_GPURenderPass *rp = SDL_BeginGPURenderPass(cmd, &ct, 1, nullptr);
-            SDL_BindGPUGraphicsPipeline(rp, pipeRim);
+            SDL_BindGPUGraphicsPipeline(rp, withNormals ? pipeRimN : pipeRim);
             const SDL_GPUViewport viewport = {static_cast<float>(job.x), static_cast<float>(job.y), w, h, 0.0f, 1.0f};
             SDL_SetGPUViewport(rp, &viewport);
-            const SDL_GPUTextureSamplerBinding bindings[3] = {{job.light, nearest}, {job.rimWhere, nearest}, {rimB, nearest}};
-            SDL_BindGPUFragmentSamplers(rp, 0, bindings, 3);
+            const SDL_GPUTextureSamplerBinding bindings[4] = {{job.light, nearest}, {job.rimWhere, nearest}, {rimB, nearest}, {job.rimLeanMap, nearest}};
+            SDL_BindGPUFragmentSamplers(rp, 0, bindings, withNormals ? 4 : 3);
             SDL_PushGPUFragmentUniformData(cmd, 0, &r, sizeof(r));
             SDL_PushGPUFragmentUniformData(cmd, 1, job.rimLights, sizeof(job.rimLights));
             SDL_DrawGPUPrimitives(rp, 3, 1, 0, 0);
@@ -837,10 +861,10 @@ namespace ps2x_postfx
     {
         releaseTextures();
         ps2x_gs::DefragGuard guard;
-        for (SDL_GPUGraphicsPipeline *p : {pipeTilt, pipeDown, pipeUp, pipeFinal, pipeLightHdr, pipeLightOut, pipeTiltHdr, pipeRimBlur, pipeRim})
+        for (SDL_GPUGraphicsPipeline *p : {pipeTilt, pipeDown, pipeUp, pipeFinal, pipeLightHdr, pipeLightOut, pipeTiltHdr, pipeRimBlur, pipeRim, pipeRimN})
             if (p)
                 SDL_ReleaseGPUGraphicsPipeline(dev, p);
-        for (SDL_GPUShader *s : {vs, fsTilt, fsDown, fsUp, fsFinal, fsLight, fsRimBlur, fsRim})
+        for (SDL_GPUShader *s : {vs, fsTilt, fsDown, fsUp, fsFinal, fsLight, fsRimBlur, fsRim, fsRimN})
             if (s)
                 SDL_ReleaseGPUShader(dev, s);
         if (linear)
