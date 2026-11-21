@@ -7,6 +7,7 @@
 #include "runtime/gs/gs_gpu_present.h"
 #include "runtime/gs/gs_presentation.h"
 #include "runtime/gs/gs_texel.h"
+#include "runtime/gs/gs_tex_keys.h"
 #include "runtime/gs/ps2_gs_memory.h"
 #include "runtime/gs/ps2_gs_transfer.h"
 
@@ -194,6 +195,137 @@ namespace
         hidden.context.test = (1ull << 16) | (2ull << 17);
         sprite(hidden, 320, 40, 340, 60, 10.0, 255, 255, 255, 0x80, 0, 0, 0, 0); // behind the textured sprite: rejected
         b.Flush();
+    }
+
+    // ---- the texture cache's footprint key (task lt3-P1)
+    void setEnvForTest(const char *name, const char *value)
+    {
+#if defined(_WIN32)
+        _putenv_s(name, value ? value : "");
+#else
+        if (value)
+            setenv(name, value, 1);
+        else
+            unsetenv(name);
+#endif
+    }
+
+    // What the cache scenario produced: a picture per step, and how many GPU textures the cache had made after each.
+    struct CacheRun
+    {
+        std::vector<std::vector<uint8_t>> pictures; // 640 x 224 RGBA after each step
+        std::vector<uint64_t> created;              // texturesCreated after each step
+        bool ok = false;
+    };
+
+    // A 32 x 32 CT32 texture (block 8000, TBW 1) holds a 16 x 16 picture at its corner and leftovers around it, as a wrestler's 48 x 48
+    // tile does in its 64 x 64 texture. The steps: the picture with some leftovers; the same picture with other leftovers; one texel of the
+    // picture changed; a draw that reaches the leftovers too; the changed picture again with new leftovers.
+    CacheRun runCacheScenario(SDL_GPUDevice *device, bool footprintKeying)
+    {
+        CacheRun run;
+        setEnvForTest("PS2X_GS_GPU_FOOTPRINT", footprintKeying ? nullptr : "0");
+        GSMem::InitLookupTables();
+        std::vector<uint8_t> vram(GSMem::MEMORY_SIZE, 0);
+        GSGpuBackend gpu(device, 1);
+        setEnvForTest("PS2X_GS_GPU_FOOTPRINT", nullptr);
+        if (!gpu.Ready())
+            return run;
+        gpu.Initialize(vram.data(), static_cast<uint32_t>(vram.size()));
+        auto upload = [&](uint32_t x, uint32_t y, uint32_t w, uint32_t h, const std::vector<uint32_t> &px)
+        {
+            GSTransferCommand cmd{};
+            cmd.bitbltbuf.dbp = 8000;
+            cmd.bitbltbuf.dbw = 1;
+            cmd.bitbltbuf.dpsm = GS_PSM_CT32;
+            cmd.trxpos.dsax = static_cast<uint16_t>(x);
+            cmd.trxpos.dsay = static_cast<uint16_t>(y);
+            cmd.trxreg = {static_cast<uint16_t>(w), static_cast<uint16_t>(h)};
+            cmd.direction = 0;
+            gpu.BeginTransfer(cmd);
+            gpu.UploadImage(reinterpret_cast<const uint8_t *>(px.data()), static_cast<uint32_t>(px.size() * 4));
+            gpu.TextureFlush();
+        };
+        auto noise = [](uint32_t count, uint32_t seed)
+        {
+            std::vector<uint32_t> v(count);
+            uint32_t x = seed * 2654435761u + 12345u;
+            for (uint32_t &e : v)
+            {
+                x = x * 1664525u + 1013904223u;
+                e = 0xFF000000u | (x >> 8);
+            }
+            return v;
+        };
+        auto leftovers = [&](uint32_t seed)
+        {
+            upload(16, 0, 16, 32, noise(16 * 32, seed));
+            upload(0, 16, 16, 16, noise(16 * 16, seed + 77u));
+        };
+        auto picture = [&](uint32_t seed) { upload(0, 0, 16, 16, noise(16 * 16, seed)); };
+        int slot = 0;
+        auto draw = [&](float u0, float u1)
+        {
+            GSContext ctx{};
+            ctx.frame = {0, 10, GS_PSM_CT32, 0};
+            ctx.zbuf = {140, GS_PSM_Z24, false};
+            ctx.scissor = {0, 639, 0, 223};
+            ctx.xyoffset = {static_cast<uint16_t>(1728u * 16u), static_cast<uint16_t>(1936u * 16u)};
+            ctx.test = 0;
+            ctx.tex0 = {8000, 1, GS_PSM_CT32, 5, 5, 1, 0, 0, 0, 0, 0, 0}; // 32 x 32, TCC, MODULATE
+            ctx.clamp = 1ull | (1ull << 2);                                // CLAMP in both directions
+            GSPrimitiveBatch p;
+            p.vertexCount = 2;
+            p.state.context = ctx;
+            p.state.prim.type = GS_PRIM_SPRITE;
+            p.state.prim.tme = true;
+            p.state.prim.fst = true;
+            p.state.textureWidth = 32;
+            p.state.textureHeight = 32;
+            const float x0 = 20.0f + 120.0f * static_cast<float>(slot), y0 = 20.0f;
+            ++slot;
+            p.vertices[0].x = 1728.0f + x0;
+            p.vertices[0].y = 1936.0f + y0;
+            p.vertices[0].u = static_cast<uint16_t>(u0 * 16.0f);
+            p.vertices[0].v = static_cast<uint16_t>(u0 * 16.0f);
+            p.vertices[1].x = 1728.0f + x0 + 100.0f;
+            p.vertices[1].y = 1936.0f + y0 + 100.0f;
+            p.vertices[1].u = static_cast<uint16_t>(u1 * 16.0f);
+            p.vertices[1].v = static_cast<uint16_t>(u1 * 16.0f);
+            p.vertices[1].z = 100.0;
+            p.vertices[1].r = p.vertices[1].g = p.vertices[1].b = p.vertices[1].a = 0x80;
+            gpu.Submit(p);
+        };
+        auto step = [&]()
+        {
+            const GSPresentationRequest request = makeRequest(0);
+            gpu.MarkPresentation(request);
+            gpu.Sync(GSSyncReason::Presentation);
+            PresentationFrame frame = gpu.Present(request);
+            if (frame && frame.width == 640 && frame.height == 224)
+                run.pictures.push_back(std::move(frame.pixels));
+            else
+                run.pictures.emplace_back();
+            run.created.push_back(gpu.GetStats().texturesCreated);
+        };
+        leftovers(1);
+        picture(10);
+        draw(2.0f, 13.0f);
+        step();
+        leftovers(2);
+        picture(10);
+        draw(2.0f, 13.0f);
+        step();
+        upload(0, 0, 4, 4, noise(16, 99));
+        draw(2.0f, 13.0f);
+        step();
+        draw(2.0f, 29.0f);
+        step();
+        leftovers(3);
+        draw(2.0f, 13.0f);
+        step();
+        run.ok = true;
+        return run;
     }
 
     SceneResult runScene(GSRasterBackend &b, std::vector<uint8_t> &vram, GSCpuBackend *cpu, GSGpuBackend *gpu)
@@ -1332,6 +1464,100 @@ void register_gs_gpu_tests()
                     t.Equals(differing, 0ull, "no picture differs");
                     t.IsTrue(compared == 14u, "14 pictures were compared (" + std::to_string(compared) + ")");
                     t.IsTrue(ties >= 2u, "the sequence contained ties (" + std::to_string(ties) + ")");
+                }
+            }
+            SDL_DestroyGPUDevice(device);
+        });
+
+        tc.Run("the blocks of a texture footprint hold every byte its texels are decoded from", [](TestCase &t)
+        {
+            // The cache hashes only these blocks (TexKeys::ForEachBlock) for a small texture. Overwrite every other byte of GS memory
+            // with something else: the texels of the footprint must decode as before.
+            GSMem::InitLookupTables();
+            struct Format
+            {
+                uint32_t psm;
+                const char *name;
+            };
+            const Format formats[] = {{GS_PSM_CT32, "CT32"}, {GS_PSM_CT24, "CT24"}, {GS_PSM_CT16, "CT16"}, {GS_PSM_CT16S, "CT16S"}, {GS_PSM_T8, "T8"},
+                                      {GS_PSM_T4, "T4"},     {GS_PSM_T8H, "T8H"},   {GS_PSM_T4HL, "T4HL"},  {GS_PSM_T4HH, "T4HH"}};
+            const uint32_t pointers[] = {0, 13, 6724, 6736, 8000, 16000};
+            const uint32_t widths[] = {1, 2, 4};
+            struct Rect
+            {
+                int x0, y0, x1, y1;
+            };
+            const Rect rects[] = {{0, 0, 47, 47}, {0, 0, 31, 31}, {16, 0, 47, 15}, {0, 16, 15, 63}, {16, 16, 31, 31}, {0, 0, 63, 63}};
+            uint32_t seed = 1;
+            auto next = [&]() { seed = seed * 1664525u + 1013904223u; return seed >> 11; };
+            int checks = 0;
+            bool allSame = true;
+            for (const Format &f : formats)
+                for (uint32_t bp : pointers)
+                    for (uint32_t bw : widths)
+                        for (const Rect &r : rects)
+                        {
+                            if (static_cast<uint32_t>(r.x1 + 1) > bw * 64u)
+                                continue; // the texture is wider than TBW * 64 texels: the cache does not key it by footprint
+                            std::vector<uint8_t> a(GSMem::MEMORY_SIZE);
+                            for (uint8_t &b : a)
+                                b = static_cast<uint8_t>(next());
+                            std::vector<bool> inside(TexKeys::kBlocks, false);
+                            TexKeys::ForEachBlock(f.psm, bp, bw, r.x0, r.y0, r.x1 - r.x0 + 1, r.y1 - r.y0 + 1,
+                                                  [&](uint32_t block, int, int, int, int) { inside[block] = true; });
+                            std::vector<uint8_t> b = a;
+                            for (uint32_t block = 0; block < TexKeys::kBlocks; ++block)
+                                if (!inside[block])
+                                    for (uint32_t i = 0; i < 256u; ++i)
+                                        b[block * 256u + i] = static_cast<uint8_t>(next());
+                            GSMem::TexturePageCache ca, cb;
+                            bool same = true;
+                            for (int y = r.y0; y <= r.y1 && same; ++y)
+                                for (int x = r.x0; x <= r.x1; ++x)
+                                    if (GSMem::ReadTexture(ca, a.data(), f.psm, bp, bw, static_cast<uint32_t>(x), static_cast<uint32_t>(y)) !=
+                                        GSMem::ReadTexture(cb, b.data(), f.psm, bp, bw, static_cast<uint32_t>(x), static_cast<uint32_t>(y)))
+                                    {
+                                        same = false;
+                                        break;
+                                    }
+                            ++checks;
+                            if (!same && allSame)
+                                t.Fail(std::string("a texel outside the blocks changed a decoded texel: ") + f.name + " tbp " + std::to_string(bp) + " tbw " + std::to_string(bw) +
+                                       " rect " + std::to_string(r.x0) + "," + std::to_string(r.y0) + ".." + std::to_string(r.x1) + "," + std::to_string(r.y1));
+                            allSame = allSame && same;
+                        }
+            t.IsTrue(checks > 400 && allSame, "every footprint decodes from its blocks alone (" + std::to_string(checks) + " cases)");
+        });
+
+        tc.Run("a small texture is keyed by its footprint: leftovers around the picture do not make a new texture, and no picture changes", [](TestCase &t)
+        {
+            if (!SDL_Init(SDL_INIT_VIDEO))
+            {
+                SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "offscreen");
+                if (!SDL_Init(SDL_INIT_VIDEO))
+                {
+                    std::cout << "    (skipped: no SDL video driver)" << std::endl;
+                    return;
+                }
+            }
+            const SDL_GPUShaderFormat formats = SDL_GPU_SHADERFORMAT_SPIRV | SDL_GPU_SHADERFORMAT_DXIL | SDL_GPU_SHADERFORMAT_MSL;
+            SDL_GPUDevice *device = SDL_CreateGPUDevice(formats, false, nullptr);
+            if (!device)
+            {
+                std::cout << "    (skipped: no GPU device: " << SDL_GetError() << ")" << std::endl;
+                return;
+            }
+            {
+                const CacheRun foot = runCacheScenario(device, true);
+                const CacheRun pages = runCacheScenario(device, false);
+                t.IsTrue(foot.ok && pages.ok && foot.pictures.size() == 5u && pages.pictures.size() == 5u, "both runs made five pictures");
+                if (foot.ok && pages.ok && foot.pictures.size() == 5u && pages.pictures.size() == 5u)
+                {
+                    for (size_t i = 0; i < 5u; ++i)
+                        t.IsTrue(!foot.pictures[i].empty() && foot.pictures[i] == pages.pictures[i], "picture " + std::to_string(i + 1) + " is the same under both keys");
+                    // by pages: a new texture for every change of memory in the texture's pages; by footprint: only for a change in the footprint
+                    t.IsTrue((pages.created == std::vector<uint64_t>{1, 2, 3, 3, 4}), "the page key makes 1, 2, 3, 3, 4 textures");
+                    t.IsTrue((foot.created == std::vector<uint64_t>{1, 1, 2, 3, 3}), "the footprint key makes 1, 1, 2, 3, 3 textures");
                 }
             }
             SDL_DestroyGPUDevice(device);

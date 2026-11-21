@@ -62,6 +62,13 @@
 //      touches with a new epoch).
 //   3. content: when the pages were written, hash their bytes (XXH64) together with the signature. The
 //      same bytes mean the same texture, so a re-upload of identical data costs a hash, not a decode.
+// A small texture (up to 64 x 64 texels: a wrestler's body-part tile is a 48 x 48 or 32 x 32 picture in such a texture) is keyed by
+// its FOOTPRINT instead (task lt3-P1): the 16 x 16 texel tiles the draw can reach, as a rectangle in the signature, and in level 3 the
+// bytes of the GS blocks those tiles live in, not the pages. The game uploads tile after tile to one place, and the texels of the
+// declared texture that no draw reaches keep whatever an earlier tile left there; hashed with the pages they made the same picture
+// look new (1,147 textures for 270 pictures in a 300-field match), and every copy got its own GPU texture and normal map. Such a
+// texture decodes exactly its footprint, so the key covers every texel it holds, and a draw whose footprint differs has another key.
+// PS2X_GS_GPU_FOOTPRINT=0 gives the page key again.
 // Only a miss on all three creates a GPU texture. Its texels are decoded on the CPU (GSMem::ReadTexture,
 // then TEXA or the CLUT) into RGBA8 lazily, in 16 x 16 texel tiles and only where a draw can sample (see
 // decodeTexels and GSGpu::TextureReach): a wrestler's portrait is declared 512 x 512 texels and a draw shows
@@ -134,6 +141,7 @@ namespace
 {
     constexpr uint32_t kPageCount = 512u;
     constexpr uint32_t kPageBytes = 8192u;
+    constexpr uint32_t kBlockBytes = 256u; // a GS block (32 to a page)
     constexpr uint32_t kTargetRows = 512u;                 // the most rows a frame or depth target can have (GS limit used by the CPU renderer)
     // Rows of a frame or depth target when PS2X_GS_TARGET_ROWS is not set. The game draws 640 x 224 fields (a 7-page-high
     // buffer, scissor rows 0..223) into three buffers, and the 512-row targets the first versions made were more than twice
@@ -214,6 +222,10 @@ namespace
         SDL_GPUTexture *normal = nullptr;
         TexelRect normalRect;
         bool normalFailed = false;
+        // Footprint keying (task lt3-P1, see the cache comment at the top): the texture was keyed by, and decodes, exactly `footprint`
+        // (tile aligned, inclusive); a draw that uses it reaches nothing outside.
+        bool footprintKeyed = false;
+        TexelRect footprint;
     };
 
     // A replacement picture on the GPU: S times the replaced rectangle, RGBA8 or (an index image) R8.
@@ -249,9 +261,12 @@ namespace
     {
         uint32_t tbp0, tbwPsm, size, texa;
         uint64_t clutHash;
+        // 0: the whole declared texture (level 3 hashes its pages). Else bit 31 and the tiles of the footprint, x0, y0, x1, y1 in 6 bits each
+        // (see the cache comment at the top of the file).
+        uint32_t footprint;
         bool operator==(const SigKey &o) const
         {
-            return tbp0 == o.tbp0 && tbwPsm == o.tbwPsm && size == o.size && texa == o.texa && clutHash == o.clutHash;
+            return tbp0 == o.tbp0 && tbwPsm == o.tbwPsm && size == o.size && texa == o.texa && clutHash == o.clutHash && footprint == o.footprint;
         }
     };
     struct SigKeyHash
@@ -261,6 +276,7 @@ namespace
             uint64_t h = k.clutHash;
             h ^= (static_cast<uint64_t>(k.tbp0) << 32 | k.tbwPsm) + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
             h ^= (static_cast<uint64_t>(k.size) << 32 | k.texa) + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
+            h ^= (static_cast<uint64_t>(k.footprint) | 0x5F00000000ull) + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
             return static_cast<size_t>(h);
         }
     };
@@ -674,6 +690,7 @@ struct GSGpuBackend::Impl
     uint64_t recentEpoch = 0;
     GpuTexture *recentEntry = nullptr; // an element of contentTextures: pointers to its elements stay valid until they are erased
     bool fullDecode = false;           // PS2X_GS_GPU_FULL_DECODE=1: decode every texture whole when a draw first uses it
+    bool footprintKeying = true;       // PS2X_GS_GPU_FOOTPRINT=0 (or FULL_DECODE=1): key small textures by their pages, as before task lt3-P1
     std::vector<TexelRect> fillRegions; // scratch for decodeTexels
     struct ClutMemo
     {
@@ -897,12 +914,12 @@ struct GSGpuBackend::Impl
     void markDepthDirty(const PageSpan &touched);
     void restoreDepth(uint32_t depthIdx, uint32_t frameIdx, uint32_t rows);
     SDL_GPUGraphicsPipeline *pipeline(uint32_t key);
-    GpuTexture *resolveTexture(const GSDrawState &state);
+    GpuTexture *resolveTexture(const GSDrawState &state, const Setup &setup);
     // The texture census's per-draw hook (gs_tex_census.h), kept out of line so that the draw path is unchanged when no census is on.
     void censusDraw(const GpuTexture &texture, const GSDrawState &state, const Setup &setup);
     void decodeTexels(GpuTexture &g, const GSDrawState &state, const Setup &setup);
     uint64_t clutHash(const GSDrawState &state);
-    GpuTexture *createTexture(const GSDrawState &state, uint64_t contentHash, uint32_t w, uint32_t h);
+    GpuTexture *createTexture(const GSDrawState &state, uint64_t contentHash, uint32_t w, uint32_t h, const TexelRect *footprint);
     size_t allocateStage(size_t bytes);
     void flushLocked(bool wait, const FieldCopy *fieldCopies = nullptr, int fieldCopyCount = 0);
     void evictTextures();
@@ -1145,6 +1162,8 @@ bool GSGpuBackend::Impl::init(SDL_GPUDevice *device, uint32_t s, GSGpuBackend::F
         statsOn = value && value[0] == '1';
         const char *full = std::getenv("PS2X_GS_GPU_FULL_DECODE"); // the old behaviour, as a reference for A/B runs
         fullDecode = full && full[0] == '1';
+        const char *foot = std::getenv("PS2X_GS_GPU_FOOTPRINT");
+        footprintKeying = !fullDecode && !(foot && foot[0] == '0');
         const char *pool = std::getenv("PS2X_GS_GPU_TEXTURE_POOL");
         poolEnabled = !(pool && pool[0] == '0');
         const char *precreate = std::getenv("PS2X_GS_GPU_PRECREATE");
@@ -1850,7 +1869,7 @@ uint64_t GSGpuBackend::Impl::clutHash(const GSDrawState &state)
     return clutMemo.hash;
 }
 
-GpuTexture *GSGpuBackend::Impl::createTexture(const GSDrawState &state, uint64_t contentHash, uint32_t w, uint32_t h)
+GpuTexture *GSGpuBackend::Impl::createTexture(const GSDrawState &state, uint64_t contentHash, uint32_t w, uint32_t h, const TexelRect *footprint)
 {
     const GSTex0Reg &t = state.context.tex0;
     SDL_GPUTextureCreateInfo ti = {};
@@ -1909,6 +1928,11 @@ GpuTexture *GSGpuBackend::Impl::createTexture(const GSDrawState &state, uint64_t
     g.h = h;
     g.bytes = bytes;
     g.lastUsedFlush = flushIndex;
+    if (footprint)
+    {
+        g.footprintKeyed = true;
+        g.footprint = *footprint;
+    }
     textureBytes += bytes;
     ++stats.texturesCreated;
     stats.textureBytesCreated += bytes;
@@ -1954,7 +1978,9 @@ void GSGpuBackend::Impl::decodeTexels(GpuTexture &g, const GSDrawState &state, c
     reach.x1 = static_cast<int32_t>(g.w) - 1;
     reach.y1 = static_cast<int32_t>(g.h) - 1;
     const bool whole = fullDecode || !tiled || static_cast<uint64_t>(g.w) * g.h <= kWholeTextureTexels;
-    if (!whole)
+    if (g.footprintKeyed)
+        reach = g.footprint; // the texture's key covers these tiles and no others (resolveTexture)
+    else if (!whole)
         reach = TextureReach(setup, state.context.clamp, g.w, g.h);
     if (reach.x0 >= g.validRect.x0 && reach.y0 >= g.validRect.y0 && reach.x1 <= g.validRect.x1 && reach.y1 <= g.validRect.y1)
         return;
@@ -2578,17 +2604,42 @@ uint32_t GSGpuBackend::Impl::addRepDraw(const GpuTexture &g)
     return static_cast<uint32_t>(repDraws.size());
 }
 
-GpuTexture *GSGpuBackend::Impl::resolveTexture(const GSDrawState &state)
+GpuTexture *GSGpuBackend::Impl::resolveTexture(const GSDrawState &state, const Setup &setup)
 {
     ++stats.texLookups;
     const GSTex0Reg &t = state.context.tex0;
     const bool indexed = isFourBitIndexedPsm(t.psm) || isEightBitIndexedPsm(t.psm);
+    const uint32_t w = std::max<uint32_t>(state.textureWidth, 1u);
+    const uint32_t h = std::max<uint32_t>(state.textureHeight, 1u);
     SigKey key;
     key.tbp0 = t.tbp0;
     key.tbwPsm = static_cast<uint32_t>(t.tbw) | (static_cast<uint32_t>(t.psm) << 8);
     key.size = static_cast<uint32_t>(state.textureWidth) | (static_cast<uint32_t>(state.textureHeight) << 16);
     key.texa = static_cast<uint32_t>(state.texa.ta0) | (static_cast<uint32_t>(state.texa.ta1) << 8) | (state.texa.aem ? 1u << 16 : 0u);
     key.clutHash = indexed ? clutHash(state) : 0u;
+    // A small texture is keyed by the tiles this draw can reach (the cache comment at the top). Only for formats whose block layout the
+    // tracker knows (every colour format the game uses), and only when the declared width is real data (TBW * 64 texels).
+    key.footprint = 0;
+    TexelRect footprint;
+    if (footprintKeying && static_cast<uint64_t>(w) * h <= kWholeTextureTexels && w <= (kTilesPerSide << kTileShift) && h <= (kTilesPerSide << kTileShift) &&
+        w <= static_cast<uint32_t>(t.tbw) * 64u)
+    {
+        TexKeys::Geom geometry;
+        if (TexKeys::GeometryOf(t.psm, geometry))
+        {
+            const TexelRect reach = TextureReach(setup, state.context.clamp, w, h);
+            if (!reach.Empty() && reach.x0 >= 0 && reach.y0 >= 0)
+            {
+                const uint32_t tx0 = static_cast<uint32_t>(reach.x0) >> kTileShift, ty0 = static_cast<uint32_t>(reach.y0) >> kTileShift;
+                const uint32_t tx1 = static_cast<uint32_t>(reach.x1) >> kTileShift, ty1 = static_cast<uint32_t>(reach.y1) >> kTileShift;
+                footprint.x0 = static_cast<int32_t>(tx0 << kTileShift);
+                footprint.y0 = static_cast<int32_t>(ty0 << kTileShift);
+                footprint.x1 = static_cast<int32_t>(std::min((tx1 + 1u) << kTileShift, w)) - 1;
+                footprint.y1 = static_cast<int32_t>(std::min((ty1 + 1u) << kTileShift, h)) - 1;
+                key.footprint = 0x80000000u | tx0 | (ty0 << 6) | (tx1 << 12) | (ty1 << 18);
+            }
+        }
+    }
 
     // 1. recent
     if (recentValid && recentEpoch == epoch && recentKey == key)
@@ -2597,8 +2648,6 @@ GpuTexture *GSGpuBackend::Impl::resolveTexture(const GSDrawState &state)
         return recentEntry;
     }
 
-    const uint32_t w = std::max<uint32_t>(state.textureWidth, 1u);
-    const uint32_t h = std::max<uint32_t>(state.textureHeight, 1u);
     GpuTexture *result = nullptr;
     auto touch = [&](uint64_t contentHash) -> bool
     {
@@ -2633,15 +2682,33 @@ GpuTexture *GSGpuBackend::Impl::resolveTexture(const GSDrawState &state)
     uint64_t hash = SigKeyHash{}(key);
     // PS2X_GS_GPU_HASH=xxh64 hashes the pages with XXH64, as before task g5, for comparing the cost (the hit and miss decisions
     // are the same; only the key values differ).
-    for (uint32_t i = 0; i < span.count; ++i)
+    uint64_t hashedBytes = 0;
+    if (key.footprint != 0)
     {
-        const uint8_t *page = vram + static_cast<size_t>((span.first + i) & (kPageCount - 1u)) * kPageBytes;
-        hash = slowHash ? GSRec::Hash64(page, kPageBytes, hash) : GSFastHash::Hash(page, kPageBytes, hash);
+        // The 256-byte blocks of GS memory that hold the texels of the footprint (TexKeys::ForEachBlock is the tracker's block layout),
+        // and nothing else of their pages.
+        TexKeys::ForEachBlock(t.psm, t.tbp0, std::max<uint32_t>(t.tbw, 1u), footprint.x0, footprint.y0, footprint.x1 - footprint.x0 + 1,
+                              footprint.y1 - footprint.y0 + 1,
+                              [&](uint32_t block, int, int, int, int)
+                              {
+                                  const uint8_t *bytes = vram + static_cast<size_t>(block) * kBlockBytes;
+                                  hash = slowHash ? GSRec::Hash64(bytes, kBlockBytes, hash) : GSFastHash::Hash(bytes, kBlockBytes, hash);
+                                  hashedBytes += kBlockBytes;
+                              });
+    }
+    else
+    {
+        for (uint32_t i = 0; i < span.count; ++i)
+        {
+            const uint8_t *page = vram + static_cast<size_t>((span.first + i) & (kPageCount - 1u)) * kPageBytes;
+            hash = slowHash ? GSRec::Hash64(page, kPageBytes, hash) : GSFastHash::Hash(page, kPageBytes, hash);
+        }
+        hashedBytes = static_cast<uint64_t>(span.count) * kPageBytes;
     }
     lastHashNs = nowNanos() - hashStart;
     ++stats.texContentLookups;
     stats.texHashNanos += lastHashNs;
-    stats.texHashBytes += static_cast<uint64_t>(span.count) * kPageBytes;
+    stats.texHashBytes += hashedBytes;
     if (touch(hash))
     {
         ++stats.texHitsContent;
@@ -2649,7 +2716,7 @@ GpuTexture *GSGpuBackend::Impl::resolveTexture(const GSDrawState &state)
     else
     {
         ++stats.texMisses;
-        result = createTexture(state, hash, w, h);
+        result = createTexture(state, hash, w, h, key.footprint != 0 ? &footprint : nullptr);
         if (!result)
             return nullptr;
     }
@@ -2859,7 +2926,7 @@ void GSGpuBackend::Impl::submitSetup(const GSDrawState &state, const Setup &setu
     GpuTexture *litTexture = nullptr; // (match lights: the texture's key picks its material)
     if (state.prim.tme)
     {
-        GpuTexture *texture = resolveTexture(state);
+        GpuTexture *texture = resolveTexture(state, setup);
         if (!texture)
             return;
         litTexture = texture;
@@ -4869,6 +4936,17 @@ SDL_GPUTexture *GSGpuBackend::Impl::tileNormals(GpuTexture &g, const GSDrawState
     want.y0 = std::clamp(static_cast<int32_t>(std::floor(std::min({v[0], v[1], v[2]}) + 0.01f)), 0, static_cast<int32_t>(g.h) - 1);
     want.x1 = std::clamp(static_cast<int32_t>(std::ceil(std::max({u[0], u[1], u[2]}) - 0.01f)) - 1, want.x0, static_cast<int32_t>(g.w) - 1);
     want.y1 = std::clamp(static_cast<int32_t>(std::ceil(std::max({v[0], v[1], v[2]}) - 0.01f)) - 1, want.y0, static_cast<int32_t>(g.h) - 1);
+    if (g.footprintKeyed)
+    {
+        // The texture was keyed by its footprint (task lt3-P1): texels outside it are not part of what the cache knows, so the map is
+        // never made from them. (A card's corners lie inside the footprint unless the texture's clamp mode moves them.)
+        want.x0 = std::max(want.x0, g.footprint.x0);
+        want.y0 = std::max(want.y0, g.footprint.y0);
+        want.x1 = std::min(want.x1, g.footprint.x1);
+        want.y1 = std::min(want.y1, g.footprint.y1);
+        if (want.Empty())
+            return normalFlat;
+    }
     if (g.normal && want.x0 >= g.normalRect.x0 && want.y0 >= g.normalRect.y0 && want.x1 <= g.normalRect.x1 && want.y1 <= g.normalRect.y1)
         return g.normal;
     const uint64_t start = nowNanos();
