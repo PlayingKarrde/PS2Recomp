@@ -2,11 +2,13 @@
 
 #include "ps2_log.h"
 #include "ps2_runtime_macros.h"
+#include "runtime/ee_rewrite_guard.h"
 #include "runtime/ps2_pause.h"
 
 #include <algorithm>
 #include <cassert>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -97,6 +99,314 @@ namespace
         return 0;
     }
 }
+
+// ---------------------------------------------------------------------------------------------------------------------------------
+// FPWR: the rewrite guard (include/runtime/ee_rewrite_guard.h, task e1g). The state and the reporting live in this file so that
+// ee_scheduler.h, which generated code includes, stays unchanged. The throw sites further down call blockingTransfer() and
+// deferPreemption() only while a hand-written rewrite is on the host stack (active()); with no rewrite bound the counter is never
+// raised and none of this runs.
+// ---------------------------------------------------------------------------------------------------------------------------------
+namespace ps2x_rewrite_guard
+{
+    namespace
+    {
+        constexpr uint32_t kStackSlots = 16u;
+        constexpr uint32_t kEventLines = 10u; // how many deferred pre-emptions are printed as they happen (PS2X_DECOMP_STATS=1)
+
+        struct StackEntry
+        {
+            uint32_t address;
+            const char *name;
+        };
+        thread_local uint32_t t_depth = 0u;
+        thread_local StackEntry t_stack[kStackSlots];
+
+        // Written and read by the EE executor thread only (guest code and every rewrite run there); printed on it as well.
+        Counts s_counts;
+        void (*s_statsHook)(std::FILE *) = nullptr;
+        StopHandler s_stopHandler = nullptr;
+        uint32_t s_eventLinesShown = 0u;
+        bool s_statsPrinted = false;
+
+        struct FirstEvent
+        {
+            bool seen = false;
+            int thread = 0;
+            int priority = 0;
+            uint32_t pc = 0, ra = 0, sp = 0;
+            uint32_t rewrite = 0;
+            const char *rewriteName = nullptr;
+            char call[128] = {};
+        };
+        FirstEvent s_first[kSiteCount];
+
+        bool statsWanted()
+        {
+            static const bool wanted = []()
+            {
+                const char *value = std::getenv("PS2X_DECOMP_STATS");
+                return value != nullptr && value[0] == '1';
+            }();
+            return wanted;
+        }
+
+        // How many stack entries hold data (the depth can exceed the slots; the deepest ones are then only counted).
+        uint32_t stored() { return t_depth < kStackSlots ? t_depth : kStackSlots; }
+
+        // "0x0016F140 applyMoveDamage <- 0x...": the rewrites on this host thread's stack, innermost first.
+        void describeRewrites(char *out, size_t size)
+        {
+            size_t used = 0;
+            out[0] = '\0';
+            const uint32_t count = stored();
+            for (uint32_t i = 0; i < count && used + 1u < size; ++i)
+            {
+                const StackEntry &e = t_stack[count - 1u - i];
+                const int n = std::snprintf(out + used, size - used, "%s0x%08X%s%s", i == 0u ? "" : " <- ", e.address,
+                                            e.name != nullptr ? " " : "", e.name != nullptr ? e.name : "");
+                if (n < 0)
+                    break;
+                used += static_cast<size_t>(n);
+            }
+            if (t_depth > kStackSlots && used + 1u < size)
+                std::snprintf(out + used, size - used, " (and %u more, not recorded)", t_depth - kStackSlots);
+        }
+
+        void fillEvent(FirstEvent &event, const GuestThread *self, const char *call)
+        {
+            event.seen = true;
+            event.thread = self != nullptr ? self->id : 0;
+            event.priority = self != nullptr ? self->currentPriority : 0;
+            if (self != nullptr)
+            {
+                const R5900Context &ctx = self->activeContext();
+                event.pc = ctx.pc;
+                event.ra = getRegU32(&ctx, 31);
+                event.sp = getRegU32(&ctx, 29);
+            }
+            if (stored() != 0u)
+            {
+                const StackEntry &inner = t_stack[stored() - 1u];
+                event.rewrite = inner.address;
+                event.rewriteName = inner.name;
+            }
+            std::snprintf(event.call, sizeof(event.call), "%s", call);
+        }
+
+        const char *statusName(EeThreadStatus status)
+        {
+            switch (status)
+            {
+            case EeThreadStatus::Running:
+                return "running";
+            case EeThreadStatus::Ready:
+                return "ready";
+            case EeThreadStatus::Waiting:
+                return "waiting";
+            case EeThreadStatus::WaitingSuspended:
+                return "waiting+suspended";
+            case EeThreadStatus::Suspended:
+                return "suspended";
+            case EeThreadStatus::Dormant:
+                return "dormant";
+            }
+            return "?";
+        }
+
+        const char *waitName(EeWaitReason reason)
+        {
+            switch (reason)
+            {
+            case EeWaitReason::None:
+                return "";
+            case EeWaitReason::Sleep:
+                return " sleep";
+            case EeWaitReason::Semaphore:
+                return " sema";
+            case EeWaitReason::EventFlag:
+                return " eventflag";
+            case EeWaitReason::VSync:
+                return " vsync";
+            case EeWaitReason::External:
+                return " external";
+            case EeWaitReason::Mpeg:
+                return " mpeg";
+            }
+            return "";
+        }
+
+        // The threads and semaphores as they are now (the scheduler's own snapshot): which threads exist, at which priorities, and
+        // what each waits for. Priority numbers: a lower number is more urgent.
+        void printKernel(std::FILE *out, const EeScheduler *scheduler)
+        {
+            if (scheduler == nullptr)
+                return;
+            const EeKernelSnapshot snap = scheduler->snapshot();
+            std::fprintf(out, "[rewrite-guard]   threads (id: priority, state, entry):");
+            for (const EeThreadSnapshot &t : snap.threads)
+                if (t.status != EeThreadStatus::Dormant)
+                    std::fprintf(out, " %d: p%d %s%s 0x%08X;", t.id, t.currentPriority, statusName(t.status), waitName(t.waitReason), t.entry);
+            std::fprintf(out, " (%zu in all, running %d)\n", snap.threads.size(), snap.runningThreadId);
+            std::fprintf(out, "[rewrite-guard]   semaphores (id: count, waiters):");
+            for (const EeSemaphoreSnapshot &sema : snap.semaphores)
+                std::fprintf(out, " %d: %d, %u;", sema.id, sema.count, sema.waiters);
+            std::fprintf(out, "\n");
+        }
+
+        void printCounts(std::FILE *out, const EeScheduler *scheduler)
+        {
+            std::fprintf(out, "[rewrite-guard] stats: %llu rewrite calls, deepest nesting %u\n", static_cast<unsigned long long>(s_counts.entries),
+                         s_counts.maxDepth);
+            for (int i = 0; i < kSiteCount; ++i)
+                std::fprintf(out, "[rewrite-guard]   site %-22s requested under a rewrite: %llu\n", siteName(static_cast<Site>(i)),
+                             static_cast<unsigned long long>(s_counts.requested[i]));
+            for (int i = 0; i < kSiteCount; ++i)
+            {
+                const FirstEvent &e = s_first[i];
+                if (!e.seen)
+                    continue;
+                std::fprintf(out, "[rewrite-guard]   first %s: %s; thread %d priority %d, guest pc 0x%08X ra 0x%08X sp 0x%08X, rewrite 0x%08X %s\n",
+                             siteName(static_cast<Site>(i)), e.call, e.thread, e.priority, e.pc, e.ra, e.sp, e.rewrite,
+                             e.rewriteName != nullptr ? e.rewriteName : "");
+            }
+            if (s_statsHook != nullptr)
+                s_statsHook(out);
+            printKernel(out, scheduler);
+            std::fflush(out);
+        }
+
+        // A blocking transfer was requested while a rewrite is on the stack: count it, say what and where, stop the game.
+        // `call` names the kernel call. Returns only if a test handler returns.
+        void blockingTransfer(Site site, const char *call, const GuestThread *self, const EeScheduler *scheduler)
+        {
+            ++s_counts.requested[static_cast<int>(site)];
+            FirstEvent &first = s_first[static_cast<int>(site)];
+            if (!first.seen)
+                fillEvent(first, self, call);
+            char rewrites[400];
+            describeRewrites(rewrites, sizeof(rewrites));
+            uint32_t pc = 0, ra = 0, sp = 0;
+            if (self != nullptr)
+            {
+                const R5900Context &ctx = self->activeContext();
+                pc = ctx.pc;
+                ra = getRegU32(&ctx, 31);
+                sp = getRegU32(&ctx, 29);
+            }
+            char text[2200];
+            std::snprintf(text, sizeof(text),
+                          "[rewrite-guard] STOPPED: the game asked to wait or switch threads while a hand-written rewrite is on the stack.\n"
+                          "[rewrite-guard]   call:       %s (%s)\n"
+                          "[rewrite-guard]   thread:     %d, priority %d\n"
+                          "[rewrite-guard]   guest pc:   0x%08X (where the thread would resume: the instruction after the kernel call), ra 0x%08X, sp 0x%08X\n"
+                          "[rewrite-guard]   rewrites:   %s (innermost first; the address is the game function each one stands in for)\n"
+                          "[rewrite-guard]   why:        a rewrite is plain C++ and cannot be resumed. The wait would throw its frame away and the thread would\n"
+                          "[rewrite-guard]               later continue the ORIGINAL function in the middle, with a stack frame it never made\n"
+                          "[rewrite-guard]               A rewrite must not call game code that can wait (CLAUDE.md \"Hand-written rewrites never sit above a\n"
+                          "[rewrite-guard]               wait\"; docs/decomp-guide.md \"Limits\").\n",
+                          call, siteName(site), self != nullptr ? self->id : 0, self != nullptr ? self->currentPriority : 0, pc, ra, sp, rewrites);
+            if (s_stopHandler != nullptr)
+            {
+                s_stopHandler(text);
+                return;
+            }
+            std::fputs(text, stdout);
+            std::fflush(stdout);
+            std::fputs(text, stderr);
+            std::fflush(stderr);
+            s_statsPrinted = true;
+            printCounts(stdout, scheduler);
+            std::_Exit(kExitCode);
+        }
+
+        // A pre-emption was due while a rewrite is on the stack: count it. The caller defers it (raises the checkpoint flag).
+        void deferPreemption(const GuestThread *self)
+        {
+            const int index = static_cast<int>(Site::Preemption);
+            ++s_counts.requested[index];
+            FirstEvent &first = s_first[index];
+            char rewrites[400];
+            describeRewrites(rewrites, sizeof(rewrites));
+            if (!first.seen)
+                fillEvent(first, self, "pre-emption after a kernel call (SignalSema, WakeupThread ...) or an expired time slice");
+            if (statsWanted() && s_eventLinesShown < kEventLines)
+            {
+                ++s_eventLinesShown;
+                uint32_t pc = 0, ra = 0;
+                if (self != nullptr)
+                {
+                    const R5900Context &ctx = self->activeContext();
+                    pc = ctx.pc;
+                    ra = getRegU32(&ctx, 31);
+                }
+                std::fprintf(stdout, "[rewrite-guard] pre-emption deferred (#%llu): thread %d priority %d, guest pc 0x%08X ra 0x%08X, rewrites %s\n",
+                             static_cast<unsigned long long>(s_counts.requested[index]), self != nullptr ? self->id : 0,
+                             self != nullptr ? self->currentPriority : 0, pc, ra, rewrites);
+                std::fflush(stdout);
+            }
+        }
+
+        // The end of EeScheduler::run(): print the counts once when PS2X_DECOMP_STATS=1.
+        void reportAtEnd(const EeScheduler *scheduler)
+        {
+            if (!statsWanted() || s_statsPrinted)
+                return;
+            s_statsPrinted = true;
+            printCounts(stdout, scheduler);
+        }
+    } // namespace
+
+    void enter(uint32_t address, const char *name) noexcept
+    {
+        if (t_depth < kStackSlots)
+            t_stack[t_depth] = StackEntry{address, name};
+        ++t_depth;
+        ++s_counts.entries;
+        if (t_depth > s_counts.maxDepth)
+            s_counts.maxDepth = t_depth;
+    }
+
+    void leave() noexcept
+    {
+        if (t_depth != 0u)
+            --t_depth;
+    }
+
+    bool active() noexcept { return t_depth != 0u; }
+    uint32_t depth() noexcept { return t_depth; }
+    Counts counts() noexcept { return s_counts; }
+
+    void resetCounts() noexcept
+    {
+        s_counts = Counts{};
+        for (FirstEvent &e : s_first)
+            e = FirstEvent{};
+        s_eventLinesShown = 0u;
+        s_statsPrinted = false;
+    }
+
+    const char *siteName(Site site) noexcept
+    {
+        switch (site)
+        {
+        case Site::BlockCurrent:
+            return "blockCurrent";
+        case Site::InvokeCurrent:
+            return "invokeCurrent";
+        case Site::InvokeCurrentSequence:
+            return "invokeCurrentSequence";
+        case Site::ExitCurrent:
+            return "exitCurrent";
+        case Site::Preemption:
+            return "transferIfRequested";
+        default:
+            return "?";
+        }
+    }
+
+    void setStatsHook(void (*hook)(std::FILE *out)) noexcept { s_statsHook = hook; }
+    void setStopHandler(StopHandler handler) noexcept { s_stopHandler = handler; }
+} // namespace ps2x_rewrite_guard
 
 EeScheduler::EeScheduler(PS2Runtime &runtime)
     : m_runtime(runtime)
@@ -364,6 +674,7 @@ void EeScheduler::run()
     m_running.store(false, std::memory_order_release);
     copyMainContextToRuntime();
     publishSnapshot();
+    ps2x_rewrite_guard::reportAtEnd(this); // PS2X_DECOMP_STATS=1: what the rewrite guard counted
 }
 
 void EeScheduler::requestStop()
@@ -583,6 +894,8 @@ int EeScheduler::startThread(int id, uint32_t arg, const R5900Context &caller, b
     assertExecutor();
     GuestThread *exiting = currentThread();
     assert(exiting != nullptr);
+    if (ps2x_rewrite_guard::active())
+        ps2x_rewrite_guard::blockingTransfer(ps2x_rewrite_guard::Site::ExitCurrent, "ExitThread / ExitDeleteThread", exiting, this);
     const int id = exiting->id;
     const uint32_t ownedStack = deleteThreadRecord && exiting->ownsStack ? exiting->stack : 0u;
     makeDormant(*exiting);
@@ -874,6 +1187,15 @@ void EeScheduler::transferIfRequested(bool interruptSafe)
     assertExecutor();
     if (interruptSafe || m_insideInterrupt || !m_rescheduleRequested)
     {
+        return;
+    }
+    // FPWR: a rewrite is on the host stack, so this thread cannot be thrown out to the dispatcher here (the rewrite's frame would
+    // be lost). Do what the interrupt-safe forms do: leave m_rescheduleRequested set and raise the checkpoint flag, so that the
+    // switch happens at the first checkpoint after the rewrite has returned to translated code.
+    if (ps2x_rewrite_guard::active())
+    {
+        ps2x_rewrite_guard::deferPreemption(currentThread());
+        m_checkpointPending.store(true, std::memory_order_release);
         return;
     }
     if (m_currentThreadId != 0)
@@ -1182,6 +1504,13 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
     assertExecutor();
     GuestThread *owner = currentThread();
     assert(owner != nullptr);
+    if (ps2x_rewrite_guard::active())
+    {
+        char call[128];
+        std::snprintf(call, sizeof(call), "a guest callback or handler is started on this thread (invocation kind %d, tag %llu, entry 0x%08X)",
+                      static_cast<int>(invocation.kind), static_cast<unsigned long long>(invocation.tag), invocation.context.pc);
+        ps2x_rewrite_guard::blockingTransfer(ps2x_rewrite_guard::Site::InvokeCurrent, call, owner, this);
+    }
     if (getRegU32(&invocation.context, 29) == 0u)
     {
         SET_GPR_U32(&invocation.context, 29, invocationStackTop());
@@ -1198,6 +1527,14 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
     GuestThread *owner = currentThread();
     assert(owner != nullptr);
     assert(!invocations.empty());
+    if (ps2x_rewrite_guard::active())
+    {
+        char call[128];
+        std::snprintf(call, sizeof(call), "%zu guest callbacks or handlers are started on this thread (first: kind %d, tag %llu, entry 0x%08X)",
+                      invocations.size(), static_cast<int>(invocations.front().kind),
+                      static_cast<unsigned long long>(invocations.front().tag), invocations.front().context.pc);
+        ps2x_rewrite_guard::blockingTransfer(ps2x_rewrite_guard::Site::InvokeCurrentSequence, call, owner, this);
+    }
     for (auto it = invocations.rbegin(); it != invocations.rend(); ++it)
     {
         if (getRegU32(&it->context, 29) == 0u)
@@ -1764,6 +2101,41 @@ void EeScheduler::blockCurrent(EeWaitState wait)
 {
     GuestThread *self = currentThread();
     assert(self != nullptr);
+    if (ps2x_rewrite_guard::active())
+    {
+        char call[128];
+        switch (wait.reason)
+        {
+        case EeWaitReason::Sleep:
+            std::snprintf(call, sizeof(call), "SleepThread");
+            break;
+        case EeWaitReason::Semaphore:
+        {
+            const EeSemaphoreWait *sema = std::get_if<EeSemaphoreWait>(&wait.payload);
+            std::snprintf(call, sizeof(call), "WaitSema on semaphore %d", sema != nullptr ? sema->id : -1);
+            break;
+        }
+        case EeWaitReason::EventFlag:
+        {
+            const EeEventFlagWait *flag = std::get_if<EeEventFlagWait>(&wait.payload);
+            std::snprintf(call, sizeof(call), "WaitEventFlag on event flag %d", flag != nullptr ? flag->id : -1);
+            break;
+        }
+        case EeWaitReason::VSync:
+            std::snprintf(call, sizeof(call), "a wait for the vertical blank (sceGsSyncV, the frame wait)");
+            break;
+        case EeWaitReason::External:
+            std::snprintf(call, sizeof(call), "a wait for an external completion (a disc read or similar)");
+            break;
+        case EeWaitReason::Mpeg:
+            std::snprintf(call, sizeof(call), "a wait for the MPEG decoder");
+            break;
+        default:
+            std::snprintf(call, sizeof(call), "a wait (reason %d)", static_cast<int>(wait.reason));
+            break;
+        }
+        ps2x_rewrite_guard::blockingTransfer(ps2x_rewrite_guard::Site::BlockCurrent, call, self, this);
+    }
     self->wait = std::move(wait);
     self->status = self->suspendCount == 0 ? EeThreadStatus::Waiting : EeThreadStatus::WaitingSuspended;
     m_currentThreadId = 0;

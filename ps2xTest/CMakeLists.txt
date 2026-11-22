@@ -47,6 +47,7 @@ add_library(ps2_test_lib STATIC
     src/gpu_lighting_tests.cpp
     src/rom_override_tests.cpp
     src/rom_model_mod_tests.cpp
+    src/ee_rewrite_guard_tests.cpp
 )
 
 # The mod layer's tests (src/lib/mods) exist when the build has the mod manager (PS2X_BUILD_MODS). The tests use only the

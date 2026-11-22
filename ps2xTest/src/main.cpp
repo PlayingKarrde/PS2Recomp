@@ -28,6 +28,7 @@ void register_postfx_tests();
 void register_gpu_lighting_tests();
 void register_rom_override_tests();
 void register_rom_model_mod_tests();
+void register_ee_rewrite_guard_tests();
 #if defined(PS2X_HAS_MODS_TESTS)
 void register_mod_manager_tests();
 void register_data_pack_tests();
@@ -76,6 +77,7 @@ int main()
     register_gpu_lighting_tests();
     register_rom_override_tests();
     register_rom_model_mod_tests();
+    register_ee_rewrite_guard_tests();
 #if defined(PS2X_HAS_MODS_TESTS)
     register_mod_manager_tests();
     register_data_pack_tests();
