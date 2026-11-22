@@ -7,6 +7,7 @@
 #include "mod_package.h"
 #include "mod_state.h"
 #include "ps2_runtime.h"
+#include "runtime/gs/gs_tex_pack.h"
 
 #include <algorithm>
 #include <atomic>
@@ -1225,6 +1226,28 @@ void register_mod_manager_tests()
             t.IsTrue(env.manager.restartNeeded(), "a restart would apply it too");
             t.IsTrue(env.manager.setEnabled("tex.one", true).ok, "texture pack on");
             t.IsTrue(env.manager.otherChangesPending(), "a change only a restart applies waits");
+        });
+
+        tc.Run("a texture pack may hold hand-made normal maps (<key>.nrm.png): the package accepts them and the texture pack index names them", [](TestCase &t)
+        {
+            Env env("sess_nrm");
+            writeMod(env.mods, "tex.fprmod", tomlFor("tex.one"),
+                     {{"assets/textures/0123456789abcdef.png", fakePng()}, {"assets/textures/0123456789abcdef.nrm.png", fakePng(10)}, {"assets/textures/fedcba9876543210.nrm.png", fakePng(20)}});
+            t.IsTrue(env.start(), "starts");
+            t.IsTrue(env.manager.setEnabled("tex.one", true).ok, "texture pack on");
+            env.manager.commitSession();
+            const auto files = env.manager.sessionFiles("assets/textures/");
+            t.Equals(files.size(), static_cast<size_t>(3), "the loader lists the normal maps with the pictures");
+            size_t normals = 0, pictures = 0;
+            for (const auto &f : files)
+            {
+                TexPack::ParsedName name;
+                const std::string base = f.path.substr(f.path.find_last_of('/') + 1);
+                if (TexPack::ParseFileName(base, name))
+                    (name.normal ? normals : pictures) += 1;
+            }
+            t.IsTrue(normals == 2 && pictures == 1, "two of them parse as normal maps, one as a picture");
+            t.IsTrue(env.manager.open("assets/textures/0123456789abcdef.nrm.png").has_value(), "and the file is served");
         });
 
         tc.Run("committing the data session clears the data change and leaves the restart-only one", [=](TestCase &t)

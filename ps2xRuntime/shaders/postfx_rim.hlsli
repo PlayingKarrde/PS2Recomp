@@ -88,6 +88,10 @@ float EdgeKept(int2 q, float2 bulge, float l, float group)
 float2 TileLean(float4 lean, float b, int2 q, float group)
 {
     const float4 m = lean * 255.0f;
+    // A hand-made map (task lt3-T4; ps2x_lighting::wrestlerHandLean): 0 in both of the last two bytes. Its first two are the lean as
+    // drawn, so there is no crease fade and no paint weight, only the overall weight.
+    if (m.z < 0.5f && m.w < 0.5f)
+        return Bloom.x * ((m.xy - 128.0f) / 127.0f);
     const float2 bulge = (m.xy - 128.0f) / 127.0f;
     const float2 paint = (m.zw - 128.0f) / 127.0f * PAINT_RANGE;
     const float l = min(length(bulge), 1.0f);

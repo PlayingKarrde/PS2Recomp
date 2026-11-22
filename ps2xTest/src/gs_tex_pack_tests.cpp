@@ -477,6 +477,11 @@ void register_gs_tex_pack_tests()
             t.IsFalse(TexPack::ParseFileName("0123456789abcdefg.png", n), "17 digits");
             t.IsFalse(TexPack::ParseFileName("0123456789abcdeg.png", n), "not hex");
             t.IsFalse(TexPack::ParseFileName("0123456789abcdef.jpg", n), "not a PNG");
+            t.IsTrue(TexPack::ParseFileName("0123456789abcdef.nrm.png", n) && n.key == 0x0123456789abcdefull && n.normal && !n.index, "a hand-made normal map (lt3-T4)");
+            t.IsTrue(TexPack::ParseFileName("0123456789ABCDEF.NRM.PNG", n) && n.normal, "... in capitals");
+            t.IsTrue(TexPack::ParseFileName("0123456789abcdef.png", n) && !n.normal, "a plain picture is not a normal map");
+            t.IsFalse(TexPack::ParseFileName("0123456789abcde.nrm.png", n), "a normal map needs the 16 digits too");
+            t.IsFalse(TexPack::ParseFileName("0123456789abcdef.nrm.idx.png", n), "no such combination");
             t.IsFalse(TexPack::ParseFileName("0123456789abcdef.pal.png", n), "the dumper's palette picture is not a pack file");
             t.IsFalse(TexPack::ParseFileName("0123456789abcdef__12345678.png", n), "nor is a numbered colouring");
             t.IsFalse(TexPack::ParseFileName("readme.txt", n), "other files");
@@ -550,6 +555,85 @@ void register_gs_tex_pack_tests()
             t.IsTrue(store.find(big, 0, 4, 4, true, 256).state == TexPack::Lookup::State::Ready, "but it does in a 256-entry one");
             t.IsTrue(store.find(good, 0, 4, 4, false, 0).state == TexPack::Lookup::State::Refused, "an index image for a texture without a palette");
             t.IsTrue(store.find(plain, 0, 4, 4, true, 16).state == TexPack::Lookup::State::Ready, "a plain picture for an indexed texture is fine");
+        });
+
+        tc.Run("hand-made normal maps: lookups, the size rule, independent of the colour file's scale", [](TestCase &t)
+        {
+            auto src = std::make_shared<MemorySource>();
+            const uint64_t both = 0xCCCC000000000001ull, only = 0xCCCC000000000002ull, odd = 0xCCCC000000000003ull, wide = 0xCCCC000000000004ull, huge = 0xCCCC000000000005ull;
+            src->add(hex16(both) + ".png", rgbaPng(8, 8, 1));      // the colour picture: 2x of a 4 x 4 rectangle
+            src->add(hex16(both) + ".nrm.png", rgbaPng(16, 16, 2)); // the normal map: 4x of the same rectangle
+            src->add(hex16(only) + ".nrm.png", rgbaPng(4, 4, 3, 17));
+            src->add(hex16(odd) + ".nrm.png", rgbaPng(9, 9, 4));    // not a whole number of times
+            src->add(hex16(wide) + ".nrm.png", rgbaPng(8, 4, 5));   // 2x in width, 1x in height
+            src->add(hex16(huge) + ".nrm.png", rgbaPng(36, 36, 6)); // 9x
+            src->add("notes.txt", {1});
+            TexPack::Store::Options opt;
+            opt.prefetch = false;
+            TexPack::Store store(src, opt);
+            t.Equals(store.stats().files, 6u, "the normal maps are indexed with the other texture files");
+            t.Equals(store.stats().normals, 5u, "and counted");
+            t.Equals(store.stats().ignored, 1u, "only the text file is ignored");
+            t.IsTrue(store.hasNormal(both) && store.hasNormal(only) && !store.hasNormal(0x1234), "hasNormal names the keys that have a file");
+            // lookups
+            t.IsTrue(store.findNormal(0x1234, 4, 4).state == TexPack::Lookup::State::None, "no file");
+            t.IsTrue(store.findNormal(0, 4, 4).state == TexPack::Lookup::State::None, "key 0");
+            t.IsTrue(store.findNormal(both, 4, 4).state == TexPack::Lookup::State::Pending, "first ask: pending");
+            for (uint64_t k : {only, odd, wide, huge})
+                store.findNormal(k, 4, 4);
+            store.waitIdle();
+            const TexPack::Lookup n = store.findNormal(both, 4, 4);
+            t.IsTrue(n.state == TexPack::Lookup::State::Ready && n.scale == 4 && n.image && n.image->kind == TexPack::Kind::Normal && n.image->width == 16, "ready at 4x");
+            const TexPack::Lookup c = store.find(both, 0, 4, 4, false, 0);
+            t.IsTrue(c.state == TexPack::Lookup::State::Pending || c.state == TexPack::Lookup::State::Ready, "the colour file is found as before");
+            store.waitIdle();
+            const TexPack::Lookup c2 = store.find(both, 0, 4, 4, false, 0);
+            t.IsTrue(c2.state == TexPack::Lookup::State::Ready && c2.scale == 2 && c2.image && c2.image->kind == TexPack::Kind::Rgba, "the colour picture is 2x: the two scales are independent");
+            const TexPack::Lookup o = store.findNormal(only, 4, 4);
+            t.IsTrue(o.state == TexPack::Lookup::State::Ready && o.scale == 1, "1x");
+            t.IsTrue(o.image && o.image->pixels[3] == 17, "the alpha is left as the file has it (not converted to the GS's scale, never read)");
+            t.IsTrue(store.find(only, 0, 4, 4, false, 0).state == TexPack::Lookup::State::None, "a key with only a normal map has no colour replacement");
+            // the size rule, with its reason
+            t.IsTrue(store.findNormal(odd, 4, 4).state == TexPack::Lookup::State::Refused, "9 x 9 for 4 x 4");
+            t.IsTrue(store.findNormal(wide, 4, 4).state == TexPack::Lookup::State::Refused, "different in x and y");
+            t.IsTrue(store.findNormal(huge, 4, 4).state == TexPack::Lookup::State::Refused, "9x");
+            t.IsTrue(store.findNormal(both, 5, 5).state == TexPack::Lookup::State::Refused, "a rectangle the file does not fit");
+            t.Equals(src->problems.size(), static_cast<size_t>(4), "each refusal reached the source once");
+            bool named = false, one = false;
+            for (const auto &p : src->problems)
+            {
+                named = named || (p.first == "mod.a" && p.second.find(".nrm.png") != std::string::npos && p.second.find("9x9") != std::string::npos);
+                one = one || p.second.find("both directions") != std::string::npos;
+            }
+            t.IsTrue(named, "the reason names the file and the size");
+            t.IsTrue(one, "the non-uniform one says so");
+            store.findNormal(odd, 4, 4);
+            t.Equals(src->problems.size(), static_cast<size_t>(4), "the same refusal is not repeated");
+        });
+
+        tc.Run("hand-made normal maps: a grey picture is refused, a paletted one is read", [](TestCase &t)
+        {
+            auto src = std::make_shared<MemorySource>();
+            const uint64_t grey = 0xDDDD000000000001ull, indexed = 0xDDDD000000000003ull;
+            src->add(hex16(grey) + ".nrm.png", greyPng(4, 4, 128));
+            {
+                std::vector<uint8_t> px(16, 1);
+                const std::vector<uint8_t> plte = {10, 20, 30, 200, 100, 50};
+                src->add(hex16(indexed) + ".nrm.png", GSPng::Encode(4, 4, 3, px, plte, {}));
+            }
+            TexPack::Store::Options opt;
+            opt.prefetch = false;
+            TexPack::Store store(src, opt);
+            for (uint64_t k : {grey, indexed})
+                store.findNormal(k, 4, 4);
+            store.waitIdle();
+            t.IsTrue(store.findNormal(grey, 4, 4).state == TexPack::Lookup::State::Refused, "greyscale");
+            bool said = false;
+            for (const auto &p : src->problems)
+                said = said || p.second.find("greyscale") != std::string::npos;
+            t.IsTrue(said, "the reason says why");
+            const TexPack::Lookup p = store.findNormal(indexed, 4, 4);
+            t.IsTrue(p.state == TexPack::Lookup::State::Ready && p.image && p.image->pixels[0] == 200 && p.image->pixels[1] == 100 && p.image->pixels[2] == 50, "a paletted PNG gives its colours");
         });
 
         tc.Run("k3_c wins over k3_i, and a refused k3_c falls back", [](TestCase &t)

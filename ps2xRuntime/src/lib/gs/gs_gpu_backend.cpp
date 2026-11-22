@@ -198,6 +198,7 @@ namespace
         uint64_t repId = 0;                // Attached: the replacement picture's id in Impl::repTextures
         int scale = 0;
         bool index = false;
+        bool normalFile = false;           // the store holds a hand-made normal map (<primary>.nrm.png) for this texture (task lt3-T4)
     };
 
     // A cached GPU texture. It is created at the size the game declared, but its texels are decoded from GS memory
@@ -222,6 +223,14 @@ namespace
         SDL_GPUTexture *normal = nullptr;
         TexelRect normalRect;
         bool normalFailed = false;
+        // A hand-made normal map (task lt3-T4: <k3_i>.nrm.png of a mod or the dev pack, Impl::handNormalOf): the picture laid over the
+        // whole texture (the texture's size times the picture's scale; outside the replaced rectangle the picture's edge repeats), in
+        // the generated maps' format. When it exists the card is drawn with it and no generated map is made. `handGeneration` is the pack
+        // store's generation it was asked under; `handPending`: the picture is still being decoded, ask again at the next draw.
+        SDL_GPUTexture *handNormal = nullptr;
+        uint64_t handBytes = 0;
+        uint64_t handGeneration = 0;
+        bool handPending = false;
         // Footprint keying (task lt3-P1, see the cache comment at the top): the texture was keyed by, and decodes, exactly `footprint`
         // (tile aligned, inclusive); a draw that uses it reaches nothing outside.
         bool footprintKeyed = false;
@@ -765,6 +774,21 @@ struct GSGpuBackend::Impl
     std::vector<uint32_t> normalScratch;
     std::vector<uint8_t> normalBytesScratch;
     SDL_GPUTexture *tileNormals(GpuTexture &g, const GSDrawState &state, const float u[3], const float v[3]);
+    // Hand-made normal maps (task lt3-T4; docs/modding-textures.md). `handNormalOf` returns the map a mod or the dev pack gives the tile in
+    // `g` (or null: none, refused, or still being decoded), made on first use and again after the packs were reloaded. They are only
+    // asked for where a card is about to read a normal map (tileNormals), so with the lights off, or wrestler_normals 0, they cost nothing.
+    SDL_GPUTexture *handNormalOf(GpuTexture &g);
+    void rimTexelsOf(const GSDrawState &state, int32_t x0, int32_t y0, uint32_t w, uint32_t h, std::vector<uint32_t> &out);
+    static uint32_t cardAlphaRef(const GSDrawState &state);
+    std::set<uint64_t> handAnnounced, handIgnoredNoted; // keys already named on the console (the first cleared when the packs are reloaded)
+    uint64_t handAnnouncedGeneration = 0;
+    uint64_t handMade = 0, handRetired = 0, handBytesNow = 0, handNanos = 0, handNanosMost = 0;
+    // `PS2X_NORMAL_TRACE=<file>` (a test aid): one row per card triangle drawn with generated shape: marker, key, colouring key, the
+    // game's wrestler tag, how the part lies on the screen (mirrored or not, the angles of the texture's two axes), which map it got
+    // and where its centre is (target pixels).
+    std::FILE *normalTrace = nullptr;
+    void dumpNormal(GpuTexture &g, const GSDrawState &state);
+    std::unordered_set<uint64_t> dumpNormalSeen;
     void rimFillJob(const FrameTarget &ft, ps2x_postfx::Job &job) const;
     uint32_t lightLitThisField = 0;
     void lightRefresh();
@@ -1278,6 +1302,14 @@ bool GSGpuBackend::Impl::init(SDL_GPUDevice *device, uint32_t s, GSGpuBackend::F
     }
     if (const char *file = std::getenv("PS2X_LIGHT_KEYS"))
         lightKeyPath = file;
+    if (const char *file = std::getenv("PS2X_NORMAL_TRACE"))
+    {
+        if (*file && (normalTrace = std::fopen(file, "w")) != nullptr)
+        {
+            std::setvbuf(normalTrace, nullptr, _IOLBF, 0); // (a live run reads it while the game runs)
+            std::fprintf(normalTrace, "marker,key,colouring,wrestler,part_class,mirrored,tex_w,angle_u,angle_v,px_per_texel_u,px_per_texel_v,map,x,y\n");
+        }
+    }
     lightRecover = lightDebug != 0 || tagDebug != 0 || lightMatLog != nullptr || lightTiming; // (and the lights, when they are on: lightRefresh)
     if (packStore || fontAtlas)
     {
@@ -1447,6 +1479,8 @@ void GSGpuBackend::Impl::makerLoop()
 
 GSGpuBackend::Impl::~Impl()
 {
+    if (normalTrace)
+        std::fclose(normalTrace);
     if (ownsTexTools)
     {
         census = nullptr;
@@ -1484,6 +1518,8 @@ GSGpuBackend::Impl::~Impl()
         SDL_ReleaseGPUTexture(dev, t.second.tex);
         if (t.second.normal)
             SDL_ReleaseGPUTexture(dev, t.second.normal);
+        if (t.second.handNormal)
+            SDL_ReleaseGPUTexture(dev, t.second.handNormal);
     }
     for (auto &r : repTextures)
         SDL_ReleaseGPUTexture(dev, r.second.tex);
@@ -2399,6 +2435,7 @@ void GSGpuBackend::Impl::startDump()
     dumpDir = folder;
     dumpOne = TexDump::Dumper::Create(folder + "/textures", folder);
     dumpSeen.clear();
+    dumpNormalSeen.clear();
     dumpCanvases.clear();
     dumpCells.clear();
     if (!dumpOne)
@@ -2455,11 +2492,33 @@ void GSGpuBackend::Impl::dumpDraw(GpuTexture &g, const GSDrawState &state, const
     keyInto(tmp, g, state, setup, dumpOne.get());
 }
 
+// The "Dump textures on this screen" of the texture tools (task lt3-T4): the first time a card draws a wrestler tile while the dump is capturing and the
+// lights ask for generated shape, the tile's normal map is also written, as textures/<k3_i>.nrm.png beside the pictures: the generated shape at
+// the look's paint weight, with no crease fade, at the tile's own size, in a hand-made map's convention (ps2x_lighting::generatedMapToPicture). An
+// author copies it into the dev pack with the picture and edits it. It is made by the same generator the renderer uses, from the tile as the
+// card sees it; nothing else makes one.
+void GSGpuBackend::Impl::dumpNormal(GpuTexture &g, const GSDrawState &state)
+{
+    if (!dumpOne || !g.rep.keyed || g.rep.primary == 0 || g.rep.key.rect.empty() || g.w > ps2x_lighting::kTileNormalMaxSide || g.h > ps2x_lighting::kTileNormalMaxSide)
+        return;
+    if (!dumpNormalSeen.insert(g.rep.primary).second)
+        return;
+    const TexKeys::Rect &rect = g.rep.key.rect;
+    const uint32_t rw = static_cast<uint32_t>(rect.width()), rh = static_cast<uint32_t>(rect.height());
+    std::vector<uint32_t> texels;
+    rimTexelsOf(state, rect.x0, rect.y0, rw, rh, texels);
+    std::vector<uint8_t> generated(static_cast<size_t>(rw) * rh * 4u), picture(static_cast<size_t>(rw) * rh * 3u);
+    ps2x_lighting::generateTileNormals(texels.data(), rw, rh, cardAlphaRef(state), generated.data());
+    ps2x_lighting::generatedMapToPicture(generated.data(), rw, rh, lightLook.wrestlerPaint, picture.data());
+    dumpOne->WriteNormal(g.rep.primary, rw, rh, picture);
+}
+
 void GSGpuBackend::Impl::finishDump()
 {
     std::vector<TexDump::Tile> tiles = dumpOne->TakePictures();
     const size_t textureTiles = tiles.size();
     const uint32_t textureFiles = dumpOne->FilesWritten();
+    const uint32_t normalFiles = dumpOne->NormalsWritten();
     dumpOne.reset();
     // glyphs
     std::set<uint32_t> written;
@@ -2535,8 +2594,9 @@ void GSGpuBackend::Impl::finishDump()
     if (!tiles.empty())
         TexDump::WriteContactSheet(dumpDir + "/contact-sheet.png", tiles, 96, 16);
     char message[480];
-    std::snprintf(message, sizeof(message), "Dumped %u texture files and %zu glyphs%s to %s (copy textures/ and font/ into the dev-pack folder to edit them)", textureFiles,
-                  written.size(), unknown ? (" (" + std::to_string(unknown) + " glyph cells could not be named)").c_str() : "", dumpDir.c_str());
+    std::snprintf(message, sizeof(message), "Dumped %u texture files%s and %zu glyphs%s to %s (copy textures/ and font/ into the dev-pack folder to edit them)", textureFiles,
+                  normalFiles ? (" (and " + std::to_string(normalFiles) + " normal maps, <key>.nrm.png)").c_str() : "", written.size(),
+                  unknown ? (" (" + std::to_string(unknown) + " glyph cells could not be named)").c_str() : "", dumpDir.c_str());
     (void)textureTiles;
     (void)sheetCells;
     std::fprintf(stderr, "[tex:dump] %s\n", message);
@@ -2555,8 +2615,10 @@ void GSGpuBackend::Impl::lookupReplacement(GpuTexture &g, const GSDrawState &sta
     TexRep &r = g.rep;
     r.storeGeneration = packStore->generation();
     r.state = TexRep::State::None;
+    r.normalFile = false;
     if (r.primary == 0 || r.key.rect.empty())
         return;
+    r.normalFile = packStore->hasNormal(r.primary); // (task lt3-T4: lets a lit draw that is not a wrestler part say the file does nothing)
     const GSTex0Reg &t = state.context.tex0;
     const bool indexed = isFourBitIndexedPsm(t.psm) || isEightBitIndexedPsm(t.psm);
     const TexPack::Lookup lookup = packStore->find(r.primary, r.k3c, r.key.rect.width(), r.key.rect.height(), indexed, r.paletteCount);
@@ -2848,6 +2910,13 @@ void GSGpuBackend::Impl::evictTextures()
             textureBytes -= static_cast<uint64_t>(it->second.w) * it->second.h * 4u;
             releaseTexture(it->second.normal);
         }
+        if (it->second.handNormal)
+        {
+            normalBytes -= it->second.handBytes;
+            textureBytes -= it->second.handBytes;
+            handBytesNow -= it->second.handBytes;
+            releaseTexture(it->second.handNormal);
+        }
         contentTextures.erase(it);
         ++stats.texturesEvicted;
         // Keep the GPU object for the next texture of its size, or release it when the pool is full. Every draw that
@@ -3076,10 +3145,14 @@ void GSGpuBackend::Impl::submitSetup(const GSDrawState &state, const Setup &setu
             ++lightLitThisField;
             // Wrestler shape: a card (a strip that is lit by position: wrestler parts, the referee, ring-side sprites) also writes
             // where it is and goes into the wrestler mask. Shadows, effects and strips with a material of another kind do not.
-            if (rimOn && lightPendingKind.strip && !lightPendingKind.flatBlack && !lightPendingKind.depthWriteOff && lightChoice.mode == 2u)
+            const bool cardLike = lightPendingKind.strip && !lightPendingKind.flatBlack && !lightPendingKind.depthWriteOff && lightChoice.mode == 2u;
+            if (rimOn && cardLike)
                 rimNoteCard(ft, d, setup, state, lightPending, litTexture);
             else if (ft.rimValid)
                 ++rimLitAfterCards; // (something lit drawn after a card: if it covers a card's pixel, that pixel is still shaped. Counted for the log.)
+            if (!cardLike && litTexture && litTexture->rep.normalFile && handIgnoredNoted.insert(litTexture->rep.primary).second)
+                std::fprintf(stderr, "[tex:pack] %s.nrm.png names a texture that is not a wrestler part: hand-made normal maps apply to wrestler parts only, so it is ignored\n",
+                             TexKeys::KeyName(litTexture->rep.primary).c_str());
         }
     }
     else if (tagView)
@@ -5032,13 +5105,171 @@ void GSGpuBackend::Impl::lightRefresh()
     normalsOn = wantNormals;
 }
 
+// The texels of a rectangle (x0, y0, w x h) of the texture the draw `state` samples, as the renderer decodes them (decodeTexels): from GS memory,
+// through the palette; r | g << 8 | b << 16 | a << 24 with the alpha in the GS's scale.
+void GSGpuBackend::Impl::rimTexelsOf(const GSDrawState &state, int32_t x0, int32_t y0, uint32_t rw, uint32_t rh, std::vector<uint32_t> &out)
+{
+    const GSTex0Reg &t = state.context.tex0;
+    out.resize(static_cast<size_t>(rw) * rh);
+    const bool indexed = isFourBitIndexedPsm(t.psm) || isEightBitIndexedPsm(t.psm);
+    uint32_t palette[256];
+    if (indexed)
+    {
+        const uint32_t count = isFourBitIndexedPsm(t.psm) ? 16u : 256u;
+        for (uint32_t i = 0; i < 256u; ++i)
+            palette[i] = LookupClutEntry(clut.data(), state.texa, static_cast<uint8_t>(i % count), t.cpsm, t.csm, t.csa, t.psm);
+    }
+    GSMem::TexturePageCache cache;
+    for (uint32_t y = 0; y < rh; ++y)
+        for (uint32_t x = 0; x < rw; ++x)
+        {
+            const uint32_t raw = GSMem::ReadTexture(cache, vram, t.psm, t.tbp0, t.tbw, static_cast<uint32_t>(x0) + x, static_cast<uint32_t>(y0) + y);
+            uint32_t texel;
+            switch (t.psm)
+            {
+            case GS_PSM_CT32:
+            case GS_PSM_CT24:
+                texel = applyTexa(state.texa, t.psm, raw);
+                break;
+            case GS_PSM_CT16:
+            case GS_PSM_CT16S:
+                texel = applyTexa(state.texa, t.psm, Rgba5551ToRgba8888(static_cast<uint16_t>(raw)));
+                break;
+            case GS_PSM_T8:
+            case GS_PSM_T8H:
+                texel = palette[raw & 0xFFu];
+                break;
+            case GS_PSM_T4:
+            case GS_PSM_T4HL:
+            case GS_PSM_T4HH:
+                texel = palette[raw & 0x0Fu];
+                break;
+            default:
+                texel = 0u;
+                break;
+            }
+            out[static_cast<size_t>(y) * rw + x] = texel;
+        }
+}
+
+// The alpha a texel needs to count as part of a wrestler tile's figure: the card's alpha test, or any alpha above 0 without one.
+uint32_t GSGpuBackend::Impl::cardAlphaRef(const GSDrawState &state)
+{
+    const uint64_t test = state.context.test;
+    const uint32_t atst = static_cast<uint32_t>((test >> 1) & 7u), aref = static_cast<uint32_t>((test >> 4) & 0xFFu);
+    return (test & 1ull) != 0u ? (atst == 5u ? aref : (atst == 6u ? aref + 1u : 1u)) : 1u;
+}
+
+// Hand-made normal maps (task lt3-T4). The tile in `g` has one when a mod or the dev pack holds <k3_i>.nrm.png for its key: the store checks the
+// size (the replaced rectangle times a whole number 1 to 8) and refuses a picture that does not fit or has no colour channels, with a reason on
+// the console and the Dev pack line; the generated map is then used. The picture is converted to the generated maps' format
+// (ps2x_lighting::handNormalTexel: the axes turned from +y up to +y down on load, a mark in the last two bytes) and laid over the whole
+// texture, S times its size, with the picture's edge repeated outside the replaced rectangle: the card shader reads it with the texture's
+// own coordinates and needs to know nothing of the rectangle or the scale. Asked once per texture and pack generation; a map from an older
+// generation is let go at the end of the flush (draws already collected may still name it).
+SDL_GPUTexture *GSGpuBackend::Impl::handNormalOf(GpuTexture &g)
+{
+    if (!packStore || !g.rep.keyed || g.rep.primary == 0 || g.rep.key.rect.empty())
+        return nullptr;
+    const uint64_t generation = packStore->generation();
+    if (g.handGeneration == generation && !g.handPending)
+        return g.handNormal;
+    if (g.handNormal)
+    {
+        transientTextures.push_back(g.handNormal);
+        normalBytes -= g.handBytes;
+        textureBytes -= g.handBytes;
+        handBytesNow -= g.handBytes;
+        ++handRetired;
+        g.handNormal = nullptr;
+        g.handBytes = 0;
+    }
+    g.handGeneration = generation;
+    g.handPending = false;
+    const TexKeys::Rect &rect = g.rep.key.rect;
+    const TexPack::Lookup lookup = packStore->findNormal(g.rep.primary, rect.width(), rect.height());
+    if (lookup.state == TexPack::Lookup::State::Pending)
+    {
+        g.handPending = true; // the picture is being decoded: the generated map this time, and ask again
+        return nullptr;
+    }
+    if (lookup.state != TexPack::Lookup::State::Ready || !lookup.image)
+        return nullptr; // no file, or a refused one (the store said why): the generated map
+    const TexPack::Image &img = *lookup.image;
+    const uint32_t S = static_cast<uint32_t>(lookup.scale);
+    const uint32_t tw = g.w * S, th = g.h * S;
+    const uint32_t rw = static_cast<uint32_t>(rect.width()) * S, rh = static_cast<uint32_t>(rect.height()) * S;
+    if (img.width != rw || img.height != rh || img.pixels.size() < static_cast<size_t>(rw) * rh * 4u)
+        return nullptr; // (the store checked this: only a rectangle that changed since could differ)
+    SDL_GPUTextureCreateInfo ti = {};
+    ti.type = SDL_GPU_TEXTURETYPE_2D;
+    ti.format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
+    ti.usage = SDL_GPU_TEXTUREUSAGE_SAMPLER;
+    ti.width = tw;
+    ti.height = th;
+    ti.layer_count_or_depth = 1;
+    ti.num_levels = 1;
+    ti.sample_count = SDL_GPU_SAMPLECOUNT_1;
+    SDL_GPUTexture *tex = SDL_CreateGPUTexture(dev, &ti);
+    if (!tex)
+    {
+        std::fprintf(stderr, "[tex:pack] cannot create a %ux%u normal map texture: %s\n", tw, th, SDL_GetError());
+        return nullptr;
+    }
+    const uint64_t start = nowNanos();
+    const size_t bytes = static_cast<size_t>(tw) * th * 4u;
+    std::vector<uint8_t> &converted = normalBytesScratch;
+    converted.resize(static_cast<size_t>(rw) * rh * 4u);
+    for (size_t i = 0, n = static_cast<size_t>(rw) * rh; i < n; ++i)
+        ps2x_lighting::handNormalTexel(&img.pixels[i * 4u], &converted[i * 4u]);
+    const size_t offset = allocateStage(bytes);
+    uint8_t *out = stage.data() + offset;
+    const int32_t ox = rect.x0 * static_cast<int32_t>(S), oy = rect.y0 * static_cast<int32_t>(S);
+    for (uint32_t y = 0; y < th; ++y)
+    {
+        const uint32_t sy = static_cast<uint32_t>(std::clamp<int32_t>(static_cast<int32_t>(y) - oy, 0, static_cast<int32_t>(rh) - 1));
+        for (uint32_t x = 0; x < tw; ++x)
+        {
+            const uint32_t sx = static_cast<uint32_t>(std::clamp<int32_t>(static_cast<int32_t>(x) - ox, 0, static_cast<int32_t>(rw) - 1));
+            std::memcpy(out + (static_cast<size_t>(y) * tw + x) * 4u, converted.data() + (static_cast<size_t>(sy) * rw + sx) * 4u, 4u);
+        }
+    }
+    pendingUploads.push_back({tex, tw, th, offset, 0, 0});
+    g.handNormal = tex;
+    g.handBytes = bytes;
+    normalBytes += bytes;
+    textureBytes += bytes; // (counts towards the texture budget, like a generated map)
+    handBytesNow += bytes;
+    ++handMade;
+    const uint64_t took = nowNanos() - start;
+    handNanos += took;
+    handNanosMost = std::max(handNanosMost, took);
+    if (handAnnouncedGeneration != generation)
+    {
+        handAnnounced.clear();
+        handAnnouncedGeneration = generation;
+    }
+    if (handAnnounced.insert(g.rep.primary).second)
+    {
+        const std::string name = img.path.substr(img.path.find_last_of('/') + 1);
+        std::fprintf(stderr, "[tex:pack] normal map %s (%ux the %dx%d part, from %s) is used for the wrestler part %s; its generated shape is not made\n", name.c_str(), S,
+                     rect.width(), rect.height(), img.provider.c_str(), TexKeys::KeyName(g.rep.primary).c_str());
+    }
+    return tex;
+}
+
 // Generated shape (task lt3-T3): the normal map of the wrestler tile in `g`, made here the first time a card shows the tile (and again
 // if a later card shows more of the texture than the map was made for). `u`, `v` are the texel coordinates of the card triangle's
 // corners: the map is made for the rectangle they span, and everything outside it counts as empty (a 48 x 48 tile sits in a 64 x 64
 // texture whose other texels are whatever was in GS memory). Returns the flat map for a texture that gets none.
 SDL_GPUTexture *GSGpuBackend::Impl::tileNormals(GpuTexture &g, const GSDrawState &state, const float u[3], const float v[3])
 {
-    if (g.normalFailed || g.w > ps2x_lighting::kTileNormalMaxSide || g.h > ps2x_lighting::kTileNormalMaxSide || g.w == 0u || g.h == 0u)
+    if (g.w > ps2x_lighting::kTileNormalMaxSide || g.h > ps2x_lighting::kTileNormalMaxSide || g.w == 0u || g.h == 0u)
+        return normalFlat;
+    // A hand-made map of a mod or the dev pack replaces the generated one (task lt3-T4): hand map, then generated, then flat.
+    if (SDL_GPUTexture *hand = handNormalOf(g))
+        return hand;
+    if (g.normalFailed)
         return normalFlat;
     TexelRect want;
     want.x0 = std::clamp(static_cast<int32_t>(std::floor(std::min({u[0], u[1], u[2]}) + 0.01f)), 0, static_cast<int32_t>(g.w) - 1);
@@ -5114,53 +5345,11 @@ SDL_GPUTexture *GSGpuBackend::Impl::tileNormals(GpuTexture &g, const GSDrawState
     }
     g.normalRect = want;
     // The rectangle's texels as the renderer decodes them (decodeTexels): from GS memory, through the palette.
-    const GSTex0Reg &t = state.context.tex0;
     const uint32_t rw = static_cast<uint32_t>(want.x1 - want.x0 + 1), rh = static_cast<uint32_t>(want.y1 - want.y0 + 1);
-    normalScratch.resize(static_cast<size_t>(rw) * rh);
-    const bool indexed = isFourBitIndexedPsm(t.psm) || isEightBitIndexedPsm(t.psm);
-    uint32_t palette[256];
-    if (indexed)
-    {
-        const uint32_t count = isFourBitIndexedPsm(t.psm) ? 16u : 256u;
-        for (uint32_t i = 0; i < 256u; ++i)
-            palette[i] = LookupClutEntry(clut.data(), state.texa, static_cast<uint8_t>(i % count), t.cpsm, t.csm, t.csa, t.psm);
-    }
-    GSMem::TexturePageCache cache;
-    for (uint32_t y = 0; y < rh; ++y)
-        for (uint32_t x = 0; x < rw; ++x)
-        {
-            const uint32_t raw = GSMem::ReadTexture(cache, vram, t.psm, t.tbp0, t.tbw, static_cast<uint32_t>(want.x0) + x, static_cast<uint32_t>(want.y0) + y);
-            uint32_t texel;
-            switch (t.psm)
-            {
-            case GS_PSM_CT32:
-            case GS_PSM_CT24:
-                texel = applyTexa(state.texa, t.psm, raw);
-                break;
-            case GS_PSM_CT16:
-            case GS_PSM_CT16S:
-                texel = applyTexa(state.texa, t.psm, Rgba5551ToRgba8888(static_cast<uint16_t>(raw)));
-                break;
-            case GS_PSM_T8:
-            case GS_PSM_T8H:
-                texel = palette[raw & 0xFFu];
-                break;
-            case GS_PSM_T4:
-            case GS_PSM_T4HL:
-            case GS_PSM_T4HH:
-                texel = palette[raw & 0x0Fu];
-                break;
-            default:
-                texel = 0u;
-                break;
-            }
-            normalScratch[static_cast<size_t>(y) * rw + x] = texel;
-        }
+    rimTexelsOf(state, want.x0, want.y0, rw, rh, normalScratch);
     // A texel is part of the figure when it passes the card's alpha test (a wrestler tile: alpha at least 16); without a test, when it
     // is not fully transparent.
-    const uint64_t test = state.context.test;
-    const uint32_t atst = static_cast<uint32_t>((test >> 1) & 7u), aref = static_cast<uint32_t>((test >> 4) & 0xFFu);
-    const uint32_t alphaRef = (test & 1ull) != 0u ? (atst == 5u ? aref : (atst == 6u ? aref + 1u : 1u)) : 1u;
+    const uint32_t alphaRef = cardAlphaRef(state);
     // The whole texture is written: the rectangle's map, flat around it.
     const size_t offset = allocateStage(static_cast<size_t>(g.w) * g.h * 4u);
     uint8_t *out = stage.data() + offset;
@@ -5316,6 +5505,27 @@ void GSGpuBackend::Impl::rimNoteCard(FrameTarget &ft, Draw &d, const Setup &setu
         d.normal = texture ? tileNormals(*texture, state, u, v) : normalFlat;
         d.pipeline |= kNormalKey;
         ft.rimLeanValid = true;
+        if (texture && dumpState.load(std::memory_order_relaxed) == 2)
+            dumpNormal(*texture, state); // the "Dump textures on this screen" of the texture tools also writes this tile's generated map
+        if (normalTrace && texture)
+        {
+            // How the part lies on the screen: the texture's u and v axes in target pixels (the affine map of the corners).
+            const float du1 = u[1] - u[0], dv1 = v[1] - v[0], du2 = u[2] - u[0], dv2 = v[2] - v[0];
+            const float det = du1 * dv2 - du2 * dv1;
+            if (std::fabs(det) > 1.0e-9f)
+            {
+                const float x1 = setup.v[1].x - setup.v[0].x, y1 = setup.v[1].y - setup.v[0].y, x2 = setup.v[2].x - setup.v[0].x, y2 = setup.v[2].y - setup.v[0].y;
+                const float dxdu = (x1 * dv2 - x2 * dv1) / det, dydu = (y1 * dv2 - y2 * dv1) / det;
+                const float dxdv = (-x1 * du2 + x2 * du1) / det, dydv = (-y1 * du2 + y2 * du1) / det;
+                const float toDegrees = 57.29577951f;
+                const char *which = d.normal == texture->handNormal && texture->handNormal ? "hand" : (d.normal == normalFlat ? "flat" : "generated");
+                std::fprintf(normalTrace, "%llu,%s,%s,%d,%d,%d,%d,%.1f,%.1f,%.3f,%.3f,%s,%.1f,%.1f\n", static_cast<unsigned long long>(markerSeq), TexKeys::KeyName(texture->rep.primary).c_str(),
+                             texture->rep.k3c ? TexKeys::KeyName(texture->rep.k3c).c_str() : "-", tagPending ? static_cast<int>(tagNow.wrestler) : -1,
+                             tagPending ? static_cast<int>(tagNow.partClass) : -1, (dxdu * dydv - dydu * dxdv) < 0.0f ? 1 : 0, static_cast<int>(texture->w),
+                             std::atan2(dydu, dxdu) * toDegrees, std::atan2(dydv, dxdv) * toDegrees, std::sqrt(dxdu * dxdu + dydu * dydu), std::sqrt(dxdv * dxdv + dydv * dydv), which,
+                             (setup.v[0].x + setup.v[1].x + setup.v[2].x) / 3.0f, (setup.v[0].y + setup.v[1].y + setup.v[2].y) / 3.0f);
+            }
+        }
         // The part class goes with the pixel (only the shape pass with the generated maps reads it: the crease fade, postfx_rim.hlsli).
         if (tagPending)
             d.rimPart = static_cast<uint8_t>(1u + std::min<uint32_t>(tagNow.partClass, ps2x_lighting::kPartObject));
@@ -5524,6 +5734,10 @@ void GSGpuBackend::Impl::lightShutdown()
                 std::fprintf(stderr, " %d:%llu", i, static_cast<unsigned long long>(tagByClass[i]));
             std::fprintf(stderr, "\n");
         }
+        if (handMade != 0u)
+            std::fprintf(stderr, "[light] hand-made normal maps: %llu made (%llu let go when the packs were reloaded), %.1f us each on average, %.1f us the slowest, %.2f MiB held at the end\n",
+                         static_cast<unsigned long long>(handMade), static_cast<unsigned long long>(handRetired), static_cast<double>(handNanos) / 1000.0 / static_cast<double>(handMade),
+                         static_cast<double>(handNanosMost) / 1000.0, static_cast<double>(handBytesNow) / (1024.0 * 1024.0));
         if (normalTilesMade != 0u)
             std::fprintf(stderr, "[light] generated shape: %llu normal maps made (%llu again for a larger part of their texture), %llu texels, %.1f us each on average (%.1f of them the arithmetic), "
                                  "%.1f us the slowest; most in one field %u; %.1f MiB held at the end\n",

@@ -7,6 +7,11 @@
 //   <key>.png       an RGBA replacement picture, for any colouring of the texture
 //   <key>.idx.png   an index image (8-bit greyscale or paletted PNG whose values are the original palette indices); the renderer
 //                   looks the colours up in the texture's live palette, so one image serves every colouring
+//   <key>.nrm.png   a hand-made normal map for a wrestler part (task lt3-T4): RGB = normal x 1/2 + 1/2, +x the texture's right, +y the
+//                   texture's UP, +z out of the picture; alpha is ignored. It is not a picture of the texture: it replaces the normal map
+//                   the lighting generates for the part (docs/hd-lighting-tier3.md "Built so far: T4"). Named by k3_i only (one map
+//                   serves every colouring), with the colour picture's size rule: the replaced rectangle times a whole number 1 to 8,
+//                   independent of the scale of the colour file.
 // A key is the live key k3_i, or k3_c when the file is for one colouring of an indexed texture only (the k3_c RGBA file wins over the
 // k3_i files whichever mod provides them). The picture's size must be the replaced rectangle's size times a whole number S from 1 to
 // 8, the same in both directions. Among files with the same key the one from the mod that loads last wins (an .idx.png beats a
@@ -36,9 +41,10 @@ namespace TexPack
     struct ParsedName
     {
         uint64_t key = 0;
-        bool index = false; // <key>.idx.png
+        bool index = false;  // <key>.idx.png
+        bool normal = false; // <key>.nrm.png (a hand-made normal map, task lt3-T4)
     };
-    // "0123456789abcdef.png" or "0123456789ABCDEF.idx.png" (any case); false for anything else.
+    // "0123456789abcdef.png", "0123456789ABCDEF.idx.png" or "0123456789abcdef.nrm.png" (any case); false for anything else.
     bool ParseFileName(const std::string &fileName, ParsedName &out);
     // The scale S of a picture of imgW x imgH for a replaced rectangle of rectW x rectH, or 0 with a one-line reason.
     int ScaleOf(uint32_t imgW, uint32_t imgH, int rectW, int rectH, std::string *reason = nullptr);
@@ -118,7 +124,8 @@ namespace TexPack
     // ---- the store ----
     // Ramp: a coverage picture (R8, 0..255) that the renderer looks up on the texture's live palette as a ramp: 255 is the palette's last
     // entry, 0 its first, in between the colours blend. The HD text atlas (gs_font.h) is one; it never comes from a file.
-    enum class Kind : uint8_t { Rgba, Index, Ramp };
+    // Normal: a hand-made normal map (task lt3-T4), RGBA as the PNG held it (the alpha is not converted and is ignored by the renderer).
+    enum class Kind : uint8_t { Rgba, Index, Ramp, Normal };
 
     // A decoded replacement picture. Rgba pixels are 4 bytes each with the alpha already in the GS's scale (0x80 = opaque); Index
     // pixels are the raw palette indices.
@@ -148,7 +155,8 @@ namespace TexPack
 
     struct Stats
     {
-        uint32_t files = 0;          // texture files indexed
+        uint32_t files = 0;          // texture files indexed (the normal maps included)
+        uint32_t normals = 0;        // ... of which hand-made normal maps (<key>.nrm.png)
         uint32_t ignored = 0;        // files under assets/textures/ whose names are not keys
         uint32_t decoded = 0;        // pictures decoded so far
         uint32_t refused = 0;        // distinct refusals
@@ -182,6 +190,14 @@ namespace TexPack
         // The replacement for a texture whose live keys are `k3i` and `k3c` (0 = none) and whose replaced rectangle is rectW x rectH.
         // `indexed`: the texture has a palette, so an index image fits (and `paletteSize`, 16 or 256, bounds its values).
         Lookup find(uint64_t k3i, uint64_t k3c, int rectW, int rectH, bool indexed, uint32_t paletteSize);
+
+        // The hand-made normal map (<key>.nrm.png) for the texture whose live key is `k3i` and whose replaced rectangle is rectW x rectH
+        // (task lt3-T4). The same states as find(); a picture whose size is not the rectangle times a whole number from 1 to kMaxScale, or
+        // that has no colour channels (greyscale), is Refused with the reason sent on like a colour file's. The scale is the map's own: it
+        // does not depend on the colour file's.
+        Lookup findNormal(uint64_t k3i, int rectW, int rectH);
+        // Whether a normal map file exists for the key (no decoding; lets the renderer say that one names a texture it does not use).
+        bool hasNormal(uint64_t k3i) const;
 
         // Waits until the worker has nothing left to decode (tests).
         void waitIdle() const;

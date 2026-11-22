@@ -9,6 +9,8 @@
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_gpu.h>
 
+#include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -1527,6 +1529,122 @@ void register_gpu_lighting_tests()
         const float mostLean[2] = {-kWrestlerLeanMost, 0.0f};
         wrestlerShapeAt(look, at, eye, 0.0f, 0.0f, 0.0f, 1.0f, most, mostLean);
         t.IsTrue(std::fabs(held[0] - most[0]) < 1.0e-5f, "the tip is held to kWrestlerLeanMost");
+    });
+
+    tc.Run("hand-made normal maps: the picture's axes (+x right, +y up, z out) become the generated maps' (+y down); blue is not read; the mark is 0 0 and never the generated maps' bytes", [](TestCase &t)
+    {
+        const auto texel = [](int r, int g, int b) {
+            const uint8_t rgb[3] = {static_cast<uint8_t>(r), static_cast<uint8_t>(g), static_cast<uint8_t>(b)};
+            std::array<uint8_t, 4> out{};
+            handNormalTexel(rgb, out.data());
+            return out;
+        };
+        const auto value = [](uint8_t byte) { return (static_cast<int>(byte) - 128) / 127.0f; };
+        const auto flat = texel(128, 128, 255);
+        t.IsTrue(flat[0] == 128 && flat[1] == 128, "(128, 128, 255) is flat");
+        t.IsTrue(flat[2] == 0 && flat[3] == 0, "and carries the mark: 0 in both of the last two bytes");
+        // a surface that faces to the right of the picture (x = +0.6, z = 0.8)
+        const auto right = texel(static_cast<int>(std::lround((0.6f * 0.5f + 0.5f) * 255.0f)), 128, static_cast<int>(std::lround((0.8f * 0.5f + 0.5f) * 255.0f)));
+        t.IsTrue(std::fabs(value(right[0]) - 0.6f) < 0.02f && right[1] == 128, "facing right: x is +0.6");
+        // a surface that faces UP in the picture (y = +0.6 with +y up): the generated maps count y downward, so it is negative there
+        const auto up = texel(128, static_cast<int>(std::lround((0.6f * 0.5f + 0.5f) * 255.0f)), 230);
+        t.IsTrue(std::fabs(value(up[1]) + 0.6f) < 0.02f && up[0] == 128, "facing up: y is -0.6 in the generated maps' axes (+y down)");
+        const auto down = texel(128, static_cast<int>(std::lround((-0.6f * 0.5f + 0.5f) * 255.0f)), 230);
+        t.IsTrue(value(down[1]) > 0.55f, "facing down: +y in the generated maps' axes");
+        // only x and y are read
+        const auto noBlue = texel(200, 70, 0), fullBlue = texel(200, 70, 255);
+        t.IsTrue(noBlue == fullBlue, "the blue channel is not read (a map saved with two channels works)");
+        // an un-normalized x, y is shortened to length 1
+        const auto big = texel(255, 255, 255);
+        t.IsTrue(std::fabs(value(big[0]) - 0.7071f) < 0.02f && std::fabs(value(big[1]) + 0.7071f) < 0.02f, "(1, 1) is shortened to (0.707, 0.707)");
+        // the bytes 0 and 1 are never 0 (a texel of a hand-made map is told apart by the last two alone, and these stay like the generated maps')
+        bool never0 = true;
+        for (int r = 0; r < 256; r += 5)
+            for (int g = 0; g < 256; g += 5)
+            {
+                const auto o = texel(r, g, 128);
+                never0 = never0 && o[0] >= 1 && o[1] >= 1 && o[2] == 0 && o[3] == 0;
+            }
+        t.IsTrue(never0, "bytes 0 and 1 are 1 to 255 and 2 and 3 are 0 for every colour");
+        // generated maps never write 0 into either of the last two bytes, whatever the tile: the pair 0 0 is only a hand-made map's
+        bool markFree = true;
+        uint32_t seed = 12345u;
+        for (int tile = 0; tile < 12; ++tile)
+        {
+            std::vector<uint32_t> px(32u * 32u);
+            for (uint32_t &p : px)
+            {
+                seed = seed * 1664525u + 1013904223u;
+                // random colours; a quarter of the texels (more for some tiles) are cut out
+                p = (seed & 0x00FFFFFFu) | (((seed >> 24) & static_cast<uint32_t>(tile % 4 + 1)) != 0u ? 0x80000000u : 0u);
+            }
+            std::vector<uint8_t> map(32u * 32u * 4u);
+            generateTileNormals(px.data(), 32u, 32u, 16u, map.data());
+            for (size_t i = 0; i < map.size(); i += 4)
+                markFree = markFree && map[i + 2] >= 1 && map[i + 3] >= 1;
+        }
+        t.IsTrue(markFree, "12 noisy tiles: no generated texel has a 0 in the last two bytes");
+    });
+
+    tc.Run("hand-made normal maps: a generated map written as a picture and read back is the same lean; at the paint weight it is the shape pass's own lean with the fade off; the weight scales", [](TestCase &t)
+    {
+        const uint32_t W = 32, H = 32;
+        std::vector<uint32_t> px(W * H, 0u);
+        for (uint32_t y = 0; y < H; ++y)
+            for (uint32_t x = 0; x < W; ++x)
+            {
+                const float dx = static_cast<float>(x) - 15.5f, dy = static_cast<float>(y) - 15.5f;
+                if (dx * dx + dy * dy > 13.0f * 13.0f)
+                    continue;
+                const uint32_t grey = 30u + x * 5u + y * 2u; // a ramp, so that there is paint as well as bulge
+                px[y * W + x] = grey | (grey << 8) | (grey << 16) | (128u << 24);
+            }
+        std::vector<uint8_t> generated(W * H * 4u), picture(W * H * 3u);
+        generateTileNormals(px.data(), W, H, 16u, generated.data());
+        // paint weight 0: the unit normal of the bulge alone, which is what the map stores
+        generatedMapToPicture(generated.data(), W, H, 0.0f, picture.data());
+        int worst = 0;
+        for (size_t i = 0; i < static_cast<size_t>(W) * H; ++i)
+        {
+            uint8_t back[4];
+            handNormalTexel(&picture[i * 3u], back);
+            worst = std::max({worst, std::abs(static_cast<int>(back[0]) - generated[i * 4u + 0]), std::abs(static_cast<int>(back[1]) - generated[i * 4u + 1])});
+        }
+        t.IsTrue(worst <= 2, "bulge only: the picture read back leans as the generated map does (largest difference " + std::to_string(worst) + " of 255)");
+        // a flat texel is the usual flat colour, and the picture is a unit normal pointing out of the picture (blue above half)
+        t.IsTrue(picture[(15u * W + 15u) * 3u + 2u] >= 250 && std::abs(static_cast<int>(picture[(15u * W + 15u) * 3u]) - 128) <= 2, "the middle of the disc is (128, 128, 255) or nearly");
+        // with the paint: the shape pass's arithmetic (crease fade off, whole weight, deep inside the wrestler)
+        Look look = defaultLook();
+        look.wrestlerNormals = 1.0f;
+        look.wrestlerPaint = 0.35f;
+        look.wrestlerCrease = 0.0f;
+        generatedMapToPicture(generated.data(), W, H, look.wrestlerPaint, picture.data());
+        float worstLean = 0.0f;
+        for (uint32_t y = 0; y < H; ++y)
+            for (uint32_t x = 0; x < W; ++x)
+            {
+                const uint8_t *g = &generated[(y * W + x) * 4u];
+                const float bulge[2] = {(static_cast<float>(g[0]) - 128.0f) / 127.0f, (static_cast<float>(g[1]) - 128.0f) / 127.0f};
+                const float paint[2] = {(static_cast<float>(g[2]) - 128.0f) / 127.0f * kTilePaintRange, (static_cast<float>(g[3]) - 128.0f) / 127.0f * kTilePaintRange};
+                float lean[2];
+                wrestlerTileLean(look, bulge, paint, 1.0f, lean);
+                uint8_t back[4];
+                handNormalTexel(&picture[(y * W + x) * 3u], back);
+                const float hand[2] = {(static_cast<float>(back[0]) - 128.0f) / 127.0f, (static_cast<float>(back[1]) - 128.0f) / 127.0f};
+                worstLean = std::max({worstLean, std::fabs(hand[0] - lean[0]), std::fabs(hand[1] - lean[1])});
+            }
+        t.IsTrue(worstLean < 0.02f, "with the paint: the same lean as wrestlerTileLean with the fade off, within a few steps of 255 (largest " + std::to_string(worstLean) + ")");
+        // the weight: a hand map's lean is the map's x and y times wrestler_normals, nothing else
+        const float hand[2] = {0.5f, -0.25f};
+        float lean[2];
+        look.wrestlerNormals = 0.6f;
+        look.wrestlerPaint = 2.0f;   // (no effect on a hand map)
+        look.wrestlerCrease = 1.0f;  // (neither)
+        wrestlerHandLean(look, hand, lean);
+        t.IsTrue(std::fabs(lean[0] - 0.3f) < 1.0e-6f && std::fabs(lean[1] + 0.15f) < 1.0e-6f, "weight 0.6 gives 0.6 of the map");
+        look.wrestlerNormals = 0.0f;
+        wrestlerHandLean(look, hand, lean);
+        t.IsTrue(lean[0] == 0.0f && lean[1] == 0.0f, "weight 0 gives nothing");
     });
 
     tc.Run("the part tag: every tag reads back from both triangles of its quad whatever bytes it replaces; the game's own bytes never read as a tag", [](TestCase &t)

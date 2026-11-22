@@ -332,6 +332,30 @@ namespace ps2x_lighting
     // unit length. The paint: the square root of the texel's linear brightness x R as a height, smoothed twice over the 3 x 3
     // texels that are part of the figure; its slope is taken only between texels of the figure, so the cut-out adds no cliff.
     void generateTileNormals(const uint32_t *rgba, uint32_t w, uint32_t h, uint32_t alphaRef, uint8_t *out);
+
+    // ---- hand-made normal maps (task lt3-T4; docs/modding-textures.md "Hand-made normal maps", docs/hd-lighting-tier3.md).
+    // A mod author may give one texture key (one wrestler part in one look) a normal map of their own, <k3_i>.nrm.png, which replaces
+    // the generated one. The picture's convention is the one Blender bakes by default ("OpenGL", tangent space):
+    //   RGB = normal x 1/2 + 1/2, with +x the texture's RIGHT, +y the texture's UP and +z out of the picture (towards the viewer);
+    //   alpha is not read, and neither is blue: z is rebuilt from x and y (so a map saved with two channels works, and rounding in
+    //   the blue channel does nothing). A flat texel is (128, 128, 255).
+    // The renderer keeps the map in the texture format the generated maps use (above), so the card shaders and the shape pass read
+    // both alike, with these differences:
+    //   bytes 0, 1  the unit normal's x and y in the texture's own axes with +y DOWN: 128 + 127 x value. The conversion from the
+    //               picture's +y up is done here, on load, not in a shader.
+    //   bytes 2, 3  both 0. A generated map never writes 0 into either byte (generateTileNormals clamps them to 1 or more), so the
+    //               pair marks a hand-made texel: the card shader then writes the same mark into the lean target (it never writes
+    //               that pair for a generated map) and the shape pass takes the lean as drawn: no crease fade, no paint weight.
+    // `rgb` is one pixel of the picture; `out` gets 4 bytes.
+    void handNormalTexel(const uint8_t rgb[3], uint8_t out[4]);
+    // The lean a hand-made map adds at a pixel, in the screen's axes (x right, y down) the card shader has turned it to: the map's
+    // x and y times wrestlerNormals (the reference for the hand branch of TileLean in shaders/postfx_rim.hlsli).
+    void wrestlerHandLean(const Look &look, const float hand[2], float out[2]);
+    // A starting file for an author: what the generated map of a tile (`generated`, w x h x 4 bytes as generateTileNormals writes it)
+    // adds to a flat surface at the given paint weight (Look::wrestlerPaint) with the crease fade off, written as a hand-made map's
+    // picture (`rgb`, w x h x 3 bytes: the convention above). The shape pass's own arithmetic: slope = bulge / sqrt(1 - |bulge|^2) +
+    // paintWeight x paint; the normal is (slope, 1) made unit length.
+    void generatedMapToPicture(const uint8_t *generated, uint32_t w, uint32_t h, float paintWeight, uint8_t *rgb);
     // PS2X_LIGHT_SHAPE=<shape>[,<rim>[,<outline>]] (a test aid): fixes those values whatever the look says. True when it is set.
     bool wrestlerShapeFromEnvironment(Look &look);
     // PS2X_LIGHT_NORMALS=<weight>[,<paint>[,<crease>[,<smooth 0|1>]]] (a test aid): the same for the generated shape.

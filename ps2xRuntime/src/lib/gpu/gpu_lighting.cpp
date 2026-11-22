@@ -1030,6 +1030,51 @@ namespace ps2x_lighting
             }
     }
 
+    void handNormalTexel(const uint8_t rgb[3], uint8_t out[4])
+    {
+        // Only x and y are read: z is whatever makes the normal unit length, so a map saved with two channels, or with a blue channel
+        // that rounding spoilt, gives the same lean. A texel whose x and y are longer than 1 (an author's tool that did not normalize) is
+        // shortened to length 1.
+        float x = static_cast<float>(rgb[0]) / 127.5f - 1.0f, y = static_cast<float>(rgb[1]) / 127.5f - 1.0f;
+        const float len = std::sqrt(x * x + y * y);
+        if (len > 1.0f)
+        {
+            x /= len;
+            y /= len;
+        }
+        const auto toByte = [](float v) { return static_cast<uint8_t>(std::clamp(static_cast<int>(std::lround(v * 127.0f)) + 128, 1, 255)); };
+        out[0] = toByte(x);
+        out[1] = toByte(-y); // the picture's +y is up, the generated maps' (and the card shader's) is down
+        out[2] = 0u;
+        out[3] = 0u;
+    }
+
+    void wrestlerHandLean(const Look &look, const float hand[2], float out[2])
+    {
+        out[0] = look.wrestlerNormals * hand[0];
+        out[1] = look.wrestlerNormals * hand[1];
+    }
+
+    void generatedMapToPicture(const uint8_t *generated, uint32_t w, uint32_t h, float paintWeight, uint8_t *rgb)
+    {
+        const size_t count = static_cast<size_t>(w) * h;
+        for (size_t i = 0; i < count; ++i)
+        {
+            const uint8_t *g = generated + i * 4u;
+            const float bx = (static_cast<float>(g[0]) - 128.0f) / 127.0f, by = (static_cast<float>(g[1]) - 128.0f) / 127.0f;
+            const float px = (static_cast<float>(g[2]) - 128.0f) / 127.0f * kTilePaintRange, py = (static_cast<float>(g[3]) - 128.0f) / 127.0f * kTilePaintRange;
+            const float l = std::min(std::sqrt(bx * bx + by * by), 1.0f);
+            const float k = 1.0f / std::sqrt(std::max(1.0f - l * l, 0.05f)); // (as the shape pass: the bulge as a slope)
+            const float sx = bx * k + paintWeight * px, sy = by * k + paintWeight * py;
+            const float inv = 1.0f / std::sqrt(1.0f + sx * sx + sy * sy);
+            const float nx = sx * inv, ny = sy * inv, nz = inv; // y down, the generated maps' axes
+            const auto toChannel = [](float v) { return static_cast<uint8_t>(std::clamp(static_cast<int>(std::lround((v * 0.5f + 0.5f) * 255.0f)), 0, 255)); };
+            rgb[i * 3u + 0] = toChannel(nx);
+            rgb[i * 3u + 1] = toChannel(-ny); // the picture's +y is up
+            rgb[i * 3u + 2] = toChannel(nz);
+        }
+    }
+
     bool wrestlerNormalsFromEnvironment(Look &look)
     {
         const char *text = std::getenv("PS2X_LIGHT_NORMALS");

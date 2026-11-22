@@ -58,7 +58,7 @@ namespace
 struct Dumper::Impl
 {
     std::string dir;
-    uint32_t maxFiles = 40000, files = 0, colouringsMax = 4;
+    uint32_t maxFiles = 40000, files = 0, normals = 0, colouringsMax = 4;
     std::FILE *csv = nullptr, *slotsCsv = nullptr;
     bool keepPictures = false;
     std::vector<Tile> pictures;
@@ -356,5 +356,32 @@ void Dumper::Seen(const Sighting &sighting)
 uint32_t Dumper::FilesWritten() const
 {
     return m->files;
+}
+
+uint32_t Dumper::NormalsWritten() const
+{
+    return m->normals;
+}
+
+bool Dumper::WriteNormal(uint64_t key, uint32_t w, uint32_t h, const std::vector<uint8_t> &rgb)
+{
+    if (key == 0 || w == 0 || h == 0 || rgb.size() < static_cast<size_t>(w) * h * 3u)
+        return false;
+    const std::string file = m->path(TexKeys::KeyName(key) + ".nrm.png");
+    std::error_code ec;
+    if (fs::exists(file, ec))
+        return false;
+    std::vector<uint8_t> rgba(static_cast<size_t>(w) * h * 4u);
+    for (size_t i = 0, n = static_cast<size_t>(w) * h; i < n; ++i)
+    {
+        rgba[i * 4u + 0] = rgb[i * 3u + 0];
+        rgba[i * 4u + 1] = rgb[i * 3u + 1];
+        rgba[i * 4u + 2] = rgb[i * 3u + 2];
+        rgba[i * 4u + 3] = 255u;
+    }
+    if (!writeFile(file, GSPng::Encode(w, h, 6, rgba)))
+        return false;
+    ++m->normals;
+    return true;
 }
 } // namespace TexDump

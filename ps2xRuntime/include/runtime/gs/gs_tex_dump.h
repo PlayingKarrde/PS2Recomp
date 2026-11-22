@@ -9,6 +9,8 @@
 //   <k3_i>.idx.png   indexed textures only: an 8-bit paletted PNG whose pixel values are the original palette indices (the file a
 //                    pack's HD index image replaces) and whose palette is the live palette of the first colouring seen
 //   <k3_i>.pal.png   indexed textures only: that palette as 8 x 8 swatches in 16 columns (to look at; not a pack file)
+//   <k3_i>.nrm.png   wrestler parts only, and only for the one-off dump with the lights on and generated shape asked for: the tile's generated
+//                    normal map as the picture of a hand-made one (written by WriteNormal; the file a pack's normal map replaces)
 //   <k3_c>.png       indexed textures only: the RGBA picture of a further colouring of the same texture (up to PS2X_TEX_DUMP_COLOURINGS
 //                    of them per key, default 4); named by the colouring's own key, so it is already a "this colouring only" override
 //   textures.csv     one row per file group: key, key type, the texture's place and format, the rectangle, how many writers made it,
@@ -79,6 +81,10 @@ namespace TexDump
 
         void Seen(const Sighting &sighting);
         uint32_t FilesWritten() const;
+        // Writes <key>.nrm.png beside the pictures (task lt3-T4): a normal map's picture, `rgb` = w x h x 3 bytes (RGB; the file is RGBA with
+        // alpha 255). A file that exists is left alone. False if it was not written. Counted in NormalsWritten(), not FilesWritten().
+        bool WriteNormal(uint64_t key, uint32_t w, uint32_t h, const std::vector<uint8_t> &rgb);
+        uint32_t NormalsWritten() const;
 
     private:
         struct Impl;

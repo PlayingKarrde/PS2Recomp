@@ -11,6 +11,10 @@
 // right on the screen and "up on the card" as up on the screen. The output is that lean with x to the right of the screen and y
 // down it, for the shape pass (postfx_rim.hlsli):
 //   rg  the rounded-edge ("bulge") part of the map;   ba  the painted light and dark part.   Each as 128/255 + value x 127/255.
+// A hand-made map (task lt3-T4: <key>.nrm.png of a mod, converted by ps2x_lighting::handNormalTexel) is stored in the same texture, in the
+// same axes (x right, y down) with 0 in both of the last two channels, which a generated map never has. Such a texel is turned the
+// same way; the output then carries 0 in both of its last two channels too (the mark the shape pass reads), and its first two are the
+// whole lean: no crease fade and no paint weight apply to it.
 // Without CARD_NORMALS this file compiles to exactly what T1 had.
 
 struct CardOutput
@@ -37,8 +41,9 @@ float4 CardLean(PSInput input)
     const float3 dwdx = ddx(world), dwdy = ddy(world);
     // The sampler is nearest (the light steps with the pixel art) or linear (smooth), as the look asks: the renderer binds one or the other.
     const float4 map = NormalTex.SampleLevel(NormalSamp, uv * TexInfo.zw, 0.0f) * 255.0f;
+    const bool hand = map.z < 0.5f && map.w < 0.5f; // a hand-made map's texel (above)
     const float2 bulge = (map.xy - 128.0f) / 127.0f;
-    const float2 paint = (map.zw - 128.0f) / 127.0f;
+    const float2 paint = hand ? float2(0.0f, 0.0f) : (map.zw - 128.0f) / 127.0f;
     // Where one texel to the right (T) and one texel down (B) in the texture lead in the arena.
     const float det = duvdx.x * duvdy.y - duvdy.x * duvdx.y;
     float4 lean = float4(0.0f, 0.0f, 0.0f, 0.0f);
@@ -59,7 +64,12 @@ float4 CardLean(PSInput input)
             lean = float4(dot(bulge, tr), -dot(bulge, tu), dot(paint, tr), -dot(paint, tu));
         }
     }
-    return saturate((lean * 127.0f + 128.0f) / 255.0f);
+    float4 packed = saturate((lean * 127.0f + 128.0f) / 255.0f);
+    if (hand)
+        packed.zw = float2(0.0f, 0.0f);
+    else if (packed.z * 255.0f < 0.5f && packed.w * 255.0f < 0.5f)
+        packed.w = 1.0f / 255.0f; // (a generated lean can only get here with paint slopes beyond the clamp in both axes: keep it from reading as hand-made)
+    return packed;
 }
 #endif
 

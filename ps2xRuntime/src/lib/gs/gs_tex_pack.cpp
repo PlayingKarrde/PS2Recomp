@@ -43,11 +43,16 @@ namespace
 bool ParseFileName(const std::string &fileName, ParsedName &out)
 {
     const std::string name = lower(fileName);
-    bool index = false;
+    bool index = false, normal = false;
     std::string stem;
     if (name.size() > 8 && name.compare(name.size() - 8, 8, ".idx.png") == 0)
     {
         index = true;
+        stem = name.substr(0, name.size() - 8);
+    }
+    else if (name.size() > 8 && name.compare(name.size() - 8, 8, ".nrm.png") == 0)
+    {
+        normal = true;
         stem = name.substr(0, name.size() - 8);
     }
     else if (name.size() > 4 && name.compare(name.size() - 4, 4, ".png") == 0)
@@ -69,6 +74,7 @@ bool ParseFileName(const std::string &fileName, ParsedName &out)
     }
     out.key = key;
     out.index = index;
+    out.normal = normal;
     return true;
 }
 
@@ -455,11 +461,11 @@ struct Store::Impl
     };
     struct KeyFiles
     {
-        bool hasRgba = false, hasIdx = false;
-        File rgba, idx;
+        bool hasRgba = false, hasIdx = false, hasNrm = false;
+        File rgba, idx, nrm;
     };
     std::unordered_map<uint64_t, KeyFiles> index;
-    uint32_t files = 0, ignored = 0, decoded = 0, refusedCount = 0;
+    uint32_t files = 0, normalFiles = 0, ignored = 0, decoded = 0, refusedCount = 0;
     uint64_t readNs = 0, decodeNs = 0;
     uint64_t generation = 1;
     std::atomic<uint64_t> generationShared{1};
@@ -504,7 +510,7 @@ struct Store::Impl
         prefetchQueue.clear();
         reported.clear();
         cacheBytes = 0;
-        files = ignored = decoded = refusedCount = 0;
+        files = normalFiles = ignored = decoded = refusedCount = 0;
         ++generation;
         generationShared.store(generation, std::memory_order_release);
         std::sort(list.begin(), list.end(), [](const FileSource::Entry &a, const FileSource::Entry &b) { return a.path < b.path; });
@@ -519,7 +525,14 @@ struct Store::Impl
             KeyFiles &k = index[parsed.key];
             File f{e.path, e.provider, e.order};
             // The same key and kind from two mods can not happen (one entry per path), but 0123.PNG and 0123.png can.
-            if (parsed.index)
+            if (parsed.normal)
+            {
+                if (!k.hasNrm || f.order >= k.nrm.order)
+                    k.nrm = f;
+                k.hasNrm = true;
+                ++normalFiles;
+            }
+            else if (parsed.index)
             {
                 if (!k.hasIdx || f.order >= k.idx.order)
                     k.idx = f;
@@ -561,7 +574,8 @@ struct Store::Impl
     void decodeOne(const std::string &path, bool demanded)
     {
         ParsedName parsed;
-        const Kind kind = (ParseFileName(baseName(path), parsed) && parsed.index) ? Kind::Index : Kind::Rgba;
+        const bool parsedOk = ParseFileName(baseName(path), parsed);
+        const Kind kind = (parsedOk && parsed.normal) ? Kind::Normal : (parsedOk && parsed.index) ? Kind::Index : Kind::Rgba;
         std::string provider;
         {
             std::lock_guard<std::mutex> lock(mutex);
@@ -576,7 +590,7 @@ struct Store::Impl
             if (idx != index.end())
                 k = &idx->second;
             if (k)
-                provider = (kind == Kind::Index ? k->idx : k->rgba).provider;
+                provider = (kind == Kind::Normal ? k->nrm : kind == Kind::Index ? k->idx : k->rgba).provider;
             if (!demanded && cacheBytes >= opt.cacheBytes / 2u)
                 return; // prefetch stops at half the cache
             if (it == cache.end())
@@ -600,8 +614,22 @@ struct Store::Impl
         else
         {
             GSPng::Image png;
-            if (kind == Kind::Rgba)
+            if (kind == Kind::Rgba || kind == Kind::Normal)
+            {
                 ok = GSPng::DecodeRgba(bytes.data(), bytes.size(), png, error);
+                if (ok && kind == Kind::Normal)
+                {
+                    // A normal map says its direction in colour: a grey picture (one number a pixel) cannot, so it is refused rather than read as
+                    // a normal that leans the same way in x, y and z.
+                    GSPng::Info info;
+                    std::string ignoredError;
+                    if (GSPng::ReadInfo(bytes.data(), bytes.size(), info, ignoredError) && (info.colorType == 0 || info.colorType == 4))
+                    {
+                        ok = false;
+                        error = "is a greyscale picture; a normal map needs colour channels (x in red, y in green, z in blue)";
+                    }
+                }
+            }
             else
                 ok = GSPng::DecodeIndex(bytes.data(), bytes.size(), png, error);
             if (ok)
@@ -609,13 +637,14 @@ struct Store::Impl
                 image->width = png.width;
                 image->height = png.height;
                 image->pixels = std::move(png.pixels);
+                // (a normal map keeps its colour channels as they are and its alpha is never read)
                 if (kind == Kind::Rgba)
                 {
                     // PNG alpha 0..255 to the GS's 0..0x80 (0x80 = opaque)
                     for (size_t i = 3; i < image->pixels.size(); i += 4)
                         image->pixels[i] = TexDump::FromPngAlpha(image->pixels[i]);
                 }
-                else
+                else if (kind == Kind::Index)
                 {
                     uint8_t top = 0;
                     for (uint8_t v : image->pixels)
@@ -780,6 +809,7 @@ Stats Store::stats() const
     std::lock_guard<std::mutex> lock(m->mutex);
     Stats s;
     s.files = m->files;
+    s.normals = m->normalFiles;
     s.ignored = m->ignored;
     s.decoded = m->decoded;
     s.refused = m->refusedCount;
@@ -847,6 +877,27 @@ Lookup Store::find(uint64_t k3i, uint64_t k3c, int rectW, int rectH, bool indexe
             return r2;
     }
     return r;
+}
+
+Lookup Store::findNormal(uint64_t k3i, int rectW, int rectH)
+{
+    std::lock_guard<std::mutex> lock(m->mutex);
+    Lookup result;
+    if (k3i == 0)
+        return result;
+    const auto it = m->index.find(k3i);
+    if (it == m->index.end() || !it->second.hasNrm)
+        return result;
+    // (the second of the two flags is only read for index images; a normal map fits any texture)
+    m->resolveFile(it->second.nrm, Kind::Normal, rectW, rectH, false, 0, result);
+    return result;
+}
+
+bool Store::hasNormal(uint64_t k3i) const
+{
+    std::lock_guard<std::mutex> lock(m->mutex);
+    const auto it = m->index.find(k3i);
+    return it != m->index.end() && it->second.hasNrm;
 }
 
 void Store::waitIdle() const
