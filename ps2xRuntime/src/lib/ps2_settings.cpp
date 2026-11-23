@@ -46,6 +46,8 @@ namespace ps2x_settings
             {"fx_bloom_threshold", "PS2X_FX_BLOOM_THRESHOLD", ""},
             {"fx_bloom_knee", "PS2X_FX_BLOOM_KNEE", ""},
             {"fx_bloom_intensity", "PS2X_FX_BLOOM_INTENSITY", ""},
+            {"fx_bloom_luma", "PS2X_FX_BLOOM_LUMA", ""},
+            {"fx_bloom_wrestler", "PS2X_FX_BLOOM_WRESTLER", ""},
             {"fx_exposure", "PS2X_FX_EXPOSURE", ""},
             {"fx_contrast", "PS2X_FX_CONTRAST", ""},
             {"fx_saturation", "PS2X_FX_SATURATION", ""},

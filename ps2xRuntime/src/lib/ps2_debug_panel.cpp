@@ -2449,7 +2449,7 @@ namespace
             if (ImGui::SmallButton(presetName(preset)))
             {
                 const Params kept = edited; // a preset sets the strengths, never which effects are on
-                edited = presetParams(preset);
+                edited = presetParams(preset, lightsOn());
                 edited.bloomOn = kept.bloomOn;
                 edited.gradingOn = kept.gradingOn;
                 edited.tiltOn = kept.tiltOn;

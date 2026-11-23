@@ -26,6 +26,7 @@
 #include "ps2_settings.h"
 #include "runtime/gs/gs_gpu_threads.h"
 #include "shaders/compiled/postfx_down_frag.h"
+#include "shaders/compiled/postfx_down_w_frag.h"
 #include "shaders/compiled/postfx_final_frag.h"
 #include "shaders/compiled/postfx_light_frag.h"
 #include "shaders/compiled/postfx_rim_blur_frag.h"
@@ -58,6 +59,8 @@ namespace ps2x_postfx
             {"bloom_threshold", "Bloom threshold", 0.0f, 1.0f, 0.01f, &Params::bloomThreshold},
             {"bloom_knee", "Bloom soft knee", 0.0f, 1.0f, 0.01f, &Params::bloomKnee},
             {"bloom_intensity", "Bloom intensity", 0.0f, 2.0f, 0.01f, &Params::bloomIntensity},
+            {"bloom_luma", "Bloom brightness (0 largest channel, 1 luminance)", 0.0f, 1.0f, 0.01f, &Params::bloomLuma},
+            {"bloom_wrestler", "Bloom kept on wrestlers (needs the lights)", 0.0f, 1.0f, 0.01f, &Params::bloomWrestler},
             {"exposure", "Exposure (stops)", -2.0f, 2.0f, 0.01f, &Params::exposure},
             {"contrast", "Contrast", 0.5f, 1.5f, 0.01f, &Params::contrast},
             {"saturation", "Saturation", 0.0f, 2.0f, 0.01f, &Params::saturation},
@@ -98,7 +101,7 @@ namespace ps2x_postfx
         return false;
     }
 
-    Params presetParams(Preset preset)
+    Params presetParams(Preset preset, bool lit)
     {
         Params p; // the neutral values: nothing changes the picture
         p.bloomIntensity = 0.0f;
@@ -156,6 +159,23 @@ namespace ps2x_postfx
             p.vignetteSoftness = 0.60f;
             break;
         }
+        if (lit && preset != Preset::Off)
+        {
+            // Task fx3: chosen from the comparison sheet (lowkey.look, tagged clip, 3x; docs/hd-lighting-tier3.md, "Bloom on lit wrestlers").
+            // Subtle with these clips 1.5-3.4% of the wrestlers' pixels to white, against 22-37% with the lights-off values.
+            p.bloomLuma = 1.0f;
+            p.bloomWrestler = 0.33f;
+            if (preset == Preset::Subtle)
+            {
+                p.contrast = 1.10f;
+                p.temperature = 0.10f;
+            }
+            else
+            {
+                p.contrast = 1.12f;
+                p.temperature = 0.12f;
+            }
+        }
         return p;
     }
 
@@ -196,11 +216,16 @@ namespace ps2x_postfx
         }
     }
 
+    bool lightsOn()
+    {
+        return isOn(settingText("light", "PS2X_LIGHT"));
+    }
+
     Params fromSettings()
     {
         Preset preset = Preset::Subtle;
         parsePreset(settingText("fx_preset", "PS2X_FX_PRESET"), preset);
-        Params p = presetParams(preset == Preset::Off ? Preset::Subtle : preset); // the values the overrides sit on
+        Params p = presetParams(preset == Preset::Off ? Preset::Subtle : preset, lightsOn()); // the values the overrides sit on
         const bool wanted = isOn(settingText("fx", "PS2X_FX")) && preset != Preset::Off;
         for (const Value &value : values())
         {
@@ -267,7 +292,7 @@ namespace ps2x_postfx
     {
         Preset preset = Preset::Subtle;
         parsePreset(ps2x_settings::get("fx_preset"), preset);
-        const Params base = presetParams(preset == Preset::Off ? Preset::Subtle : preset);
+        const Params base = presetParams(preset == Preset::Off ? Preset::Subtle : preset, lightsOn());
         int written = 0;
         for (const Value &value : values())
         {
@@ -345,6 +370,12 @@ namespace ps2x_postfx
         SDL_GPUGraphicsPipeline *pipeRimN = nullptr;
         bool rimNTried = false;
         SDL_GPUTexture *recordRim(SDL_GPUCommandBuffer *cmd, const Job &job, Stats &stats);
+        // The bloom's test switches (task fx3): the first down step with the luminance threshold and the wrestlers' hold-back
+        // (postfx_down_w.frag.hlsl). Made the first time a job asks; the plain shader and pipeline are used otherwise.
+        SDL_GPUShader *fsDownW = nullptr;
+        SDL_GPUGraphicsPipeline *pipeDownW = nullptr;
+        bool downWTried = false;
+        bool ensureDownW();
 
         // Sized for the picture (texW x texH); made again when the picture's size changes.
         uint32_t texW = 0, texH = 0;
@@ -595,6 +626,21 @@ namespace ps2x_postfx
         return rimA && rimB && relit;
     }
 
+    // The first bloom step with the test switches: the shader and pipeline, once. False when they could not be made (the plain step is used).
+    bool Chain::Impl::ensureDownW()
+    {
+        if (!downWTried)
+        {
+            downWTried = true;
+            fsDownW = ps2x::gpu::createShader(dev, ps2x::gpu::shaders::postfx_down_w_frag);
+            if (fsDownW)
+                pipeDownW = makePipeline(dev, vs, fsDownW, bloomFormat);
+            if (!pipeDownW)
+                std::fprintf(stderr, "[fx] the bloom's luminance threshold and wrestler hold-back (fx_bloom_luma, fx_bloom_wrestler) could not be set up; the plain bloom is used\n");
+        }
+        return pipeDownW != nullptr;
+    }
+
     // Wrestler shape: three passes; returns the texture the multiply pass reads in place of the light buffer (null: the light buffer).
     SDL_GPUTexture *Chain::Impl::recordRim(SDL_GPUCommandBuffer *cmd, const Job &job, Stats &stats)
     {
@@ -814,8 +860,24 @@ namespace ps2x_postfx
             PassParams d = base;
             d.v[kSrc][0] = inX; d.v[kSrc][1] = inY; d.v[kSrc][2] = w; d.v[kSrc][3] = h;
             d.v[kMode][0] = 1.0f; // the first step applies the threshold
-            SDL_GPUTextureSamplerBinding bd = {input, linear};
-            pass(cmd, pipeDown, down[1], &bd, 1, d, stats);
+            // The test switches (task fx3): the hold-back needs the wrestler mask in the job (lights and wrestler shape on, a card in the
+            // field); without it that switch does nothing. With neither switch set this is the plain step.
+            const bool holdBack = p.bloomWrestler < 0.999f && job.rimMask && job.targetW > 0 && job.targetH > 0;
+            if ((p.bloomLuma > 0.001f || holdBack) && ensureDownW())
+            {
+                d.v[kAux][0] = p.bloomLuma;
+                d.v[kAux][1] = holdBack ? p.bloomWrestler : 1.0f;
+                d.v[kAux][2] = static_cast<float>(job.x); d.v[kAux][3] = static_cast<float>(job.y); // where the picture starts in the mask
+                // The second slot must hold a texture even when the shader does not read it. `scratch` is free during the bloom: the
+                // tilt-shift's first step wrote it before and its last pass reads another, and the final pass has not run yet.
+                const SDL_GPUTextureSamplerBinding bw[2] = {{input, linear}, {holdBack ? job.rimMask : scratch, nearest}};
+                pass(cmd, pipeDownW, down[1], bw, 2, d, stats);
+            }
+            else
+            {
+                SDL_GPUTextureSamplerBinding bd = {input, linear};
+                pass(cmd, pipeDown, down[1], &bd, 1, d, stats);
+            }
             for (int k = 2; k <= levels; ++k)
             {
                 PassParams e = base;
@@ -862,10 +924,10 @@ namespace ps2x_postfx
     {
         releaseTextures();
         ps2x_gs::DefragGuard guard;
-        for (SDL_GPUGraphicsPipeline *p : {pipeTilt, pipeDown, pipeUp, pipeFinal, pipeLightHdr, pipeLightOut, pipeTiltHdr, pipeRimBlur, pipeRim, pipeRimN})
+        for (SDL_GPUGraphicsPipeline *p : {pipeTilt, pipeDown, pipeUp, pipeFinal, pipeLightHdr, pipeLightOut, pipeTiltHdr, pipeRimBlur, pipeRim, pipeRimN, pipeDownW})
             if (p)
                 SDL_ReleaseGPUGraphicsPipeline(dev, p);
-        for (SDL_GPUShader *s : {vs, fsTilt, fsDown, fsUp, fsFinal, fsLight, fsRimBlur, fsRim, fsRimN})
+        for (SDL_GPUShader *s : {vs, fsTilt, fsDown, fsUp, fsFinal, fsLight, fsRimBlur, fsRim, fsRimN, fsDownW})
             if (s)
                 SDL_ReleaseGPUShader(dev, s);
         if (linear)

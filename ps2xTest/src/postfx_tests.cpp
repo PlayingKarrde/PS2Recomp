@@ -45,6 +45,7 @@ namespace
         for (const ps2x_settings::Definition &def : ps2x_settings::definitions())
             if (std::strncmp(def.key, "fx", 2) == 0)
                 setEnvVar(def.envName, nullptr);
+        setEnvVar("PS2X_LIGHT", nullptr); // the presets take their lit values when it is on
     }
 
     std::string readAll(const fs::path &path)
@@ -185,6 +186,8 @@ namespace
             blendedBox(b, 0, 0, 40, 30, kOverlayZ, 0x40, 0x40, 0x40, 0x80, kBlendAdd);  // an additive box in the corner
         else if (extra == 3)
             blendedBox(b, 0, 0, 100, 60, kOverlayZ, 0x20, 0x20, 0x20, 0x00, kBlendOver); // a box that is fully transparent (its alpha is 0)
+        else if (extra == 5)
+            sprite(b, 420, 60, 460, 100, 1500.0, 0xFF, 0x00, 0x00); // a pure red box: bright by its largest channel, dark by its luminance (task fx3)
         else if (extra == 4)
             for (int i = 0; i < 8; ++i) // eight warm bars of rising brightness, the top ones as bright as a lit shoulder or a highlight on the mat
             {
@@ -287,7 +290,7 @@ void register_postfx_tests()
     tc.Run("the value table, the settings and the environment names agree", [](TestCase &t)
     {
         using namespace ps2x_postfx;
-        t.IsTrue(values().size() == 18, "18 values");
+        t.IsTrue(values().size() == 20, "20 values");
         for (const Value &v : values())
         {
             const std::string key = std::string("fx_") + v.name;
@@ -387,6 +390,40 @@ void register_postfx_tests()
         setEnvVar("PS2X_FX", "0");
         setEnvVar("PS2X_FX_PRESET", "subtle");
         t.IsFalse(fromSettings().enabled, "PS2X_FX=0 turns it off");
+        clearFxVariables();
+    });
+
+    tc.Run("lit presets (fx3): with the lights on Subtle and Strong set the luminance threshold, the wrestler hold-back and a gentler grading", [](TestCase &t)
+    {
+        using namespace ps2x_postfx;
+        ps2x_settings::resetForTest();
+        clearFxVariables();
+        for (Preset preset : {Preset::Off, Preset::Subtle, Preset::Strong})
+        {
+            const Params p = presetParams(preset);
+            t.IsTrue(p.bloomLuma == 0.0f && p.bloomWrestler == 1.0f, "lights off: the bloom as before fx3 (largest channel, no hold-back)");
+        }
+        const Params off = presetParams(Preset::Subtle), lit = presetParams(Preset::Subtle, true);
+        t.IsTrue(lit.bloomLuma == 1.0f && std::fabs(lit.bloomWrestler - 0.33f) < 1e-6f, "Subtle lit: luminance threshold, a third of the wrestlers' glow");
+        t.IsTrue(std::fabs(lit.contrast - 1.10f) < 1e-6f && std::fabs(lit.temperature - 0.10f) < 1e-6f, "Subtle lit: contrast 1.10, warmth 0.10 (column 6)");
+        t.IsTrue(lit.bloomIntensity == off.bloomIntensity && lit.tiltStrength == off.tiltStrength && lit.vignetteStrength == off.vignetteStrength,
+                 "the rest of Subtle is the same lit or not");
+        const Params strongLit = presetParams(Preset::Strong, true);
+        t.IsTrue(strongLit.bloomLuma == 1.0f && strongLit.contrast < presetParams(Preset::Strong).contrast && strongLit.contrast >= lit.contrast,
+                 "Strong lit: grades more gently than Strong, not more gently than Subtle lit");
+        t.IsTrue(presetParams(Preset::Off, true).bloomLuma == 0.0f && !presetParams(Preset::Off, true).enabled, "Off stays neutral lit");
+
+        setEnvVar("PS2X_FX", "1");
+        t.IsTrue(fromSettings().bloomLuma == 0.0f, "fromSettings: lights off by default, so the unlit values");
+        setEnvVar("PS2X_LIGHT", "1");
+        Params p = fromSettings();
+        t.IsTrue(lightsOn() && p.bloomLuma == 1.0f && std::fabs(p.contrast - 1.10f) < 1e-6f, "PS2X_LIGHT=1: the lit Subtle");
+        setEnvVar("PS2X_FX_BLOOM_WRESTLER", "0.5");
+        setEnvVar("PS2X_FX_BLOOM_LUMA", "0.25");
+        p = fromSettings();
+        t.IsTrue(std::fabs(p.bloomWrestler - 0.5f) < 1e-6f && std::fabs(p.bloomLuma - 0.25f) < 1e-6f, "fx_bloom_wrestler and fx_bloom_luma override like any value");
+        setEnvVar("PS2X_FX_BLOOM_WRESTLER", "7");
+        t.IsTrue(fromSettings().bloomWrestler == 1.0f, "and are clamped to their range");
         clearFxVariables();
     });
 
@@ -519,6 +556,34 @@ void register_postfx_tests()
                     const Picture bl = picture(gpu, true);
                     t.IsTrue(bl.ok && bl.at(346, 230)[1] > base.at(346, 230)[1] + 2, "bloom makes a glow next to the bright blob");
                     t.IsTrue(bl.ok && differing(base, bl, 500, 380, 560, 430) == 0, "the overlay box is untouched");
+
+                    // The luminance threshold (fx3): a pure red box is bright by its largest channel and dark by its luminance, so with the
+                    // luminance threshold it glows far less; the white blob glows as before. (The scene has no overlay: the box is scene.)
+                    {
+                        Params maxMode = neutral();
+                        maxMode.bloomThreshold = 0.5f;
+                        maxMode.bloomIntensity = 1.0f;
+                        Params lumaMode = maxMode;
+                        lumaMode.bloomLuma = 1.0f;
+                        setLive(neutral());
+                        const Picture redBase = picture(gpu, false, true, 0, 5);
+                        setLive(maxMode);
+                        const Picture redMax = picture(gpu, false, true, 0, 5);
+                        setLive(lumaMode);
+                        const Picture redLuma = picture(gpu, false, true, 0, 5);
+                        const int baseR = redBase.ok ? redBase.at(470, 160)[0] : 0, maxR = redMax.ok ? redMax.at(470, 160)[0] : 0, lumaR = redLuma.ok ? redLuma.at(470, 160)[0] : 0;
+                        t.IsTrue(redBase.ok && redMax.ok && redLuma.ok, "the pictures with the red box");
+                        t.IsTrue(maxR > baseR + 15, "max-channel threshold: the red box glows into its surroundings");
+                        t.IsTrue(lumaR - baseR < (maxR - baseR) / 3, "luminance threshold: the glow of the red box is under a third of that");
+                        const int baseG = redBase.ok ? redBase.at(346, 230)[1] : 0, maxG = redMax.ok ? redMax.at(346, 230)[1] : 0, lumaG = redLuma.ok ? redLuma.at(346, 230)[1] : 0;
+                        t.IsTrue(maxG > baseG + 2 && std::abs(lumaG - maxG) <= 1, "the white blob glows the same under both thresholds (for a grey the two measures agree)");
+                        // hold-back without a wrestler mask in the job does nothing (this scene has no wrestler cards)
+                        Params hold = maxMode;
+                        hold.bloomWrestler = 0.33f;
+                        setLive(hold);
+                        const Picture redHold = picture(gpu, false, true, 0, 5);
+                        t.IsTrue(redHold.ok && redMax.ok && differing(redMax, redHold, 0, 0, 640, 448) == 0, "the wrestler hold-back without a mask changes nothing");
+                    }
 
                     // a fade (a translucent black layer over everything) goes through the effects: it does not leave the picture unprocessed
                     setLive(off);

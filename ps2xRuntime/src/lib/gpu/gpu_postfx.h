@@ -55,6 +55,12 @@ namespace ps2x_postfx
         float bloomThreshold = 0.75f;
         float bloomKnee = 0.5f;
         float bloomIntensity = 0.0f;
+        // Task fx3 (docs/hd-lighting-tier3.md, "Bloom on lit wrestlers"): how the threshold measures brightness, from the largest channel (0) to
+        // Rec.709 luminance (1), so saturated warm skin is not "bright"; and how much of what passes the threshold the wrestlers' pixels keep
+        // (the T1 wrestler mask; with no mask in the job it does nothing). At 0 and 1 the bloom runs exactly as it did before fx3. The presets
+        // set them only when the match lights are on (presetParams).
+        float bloomLuma = 0.0f;
+        float bloomWrestler = 1.0f;
         // colour grading
         float exposure = 0.0f;    // stops
         float contrast = 1.0f;
@@ -101,8 +107,12 @@ namespace ps2x_postfx
     };
     const char *presetName(Preset preset);            // "off", "subtle", "strong"
     bool parsePreset(const std::string &text, Preset &out);
-    // The values of a preset (enabled is false for Off).
-    Params presetParams(Preset preset);
+    // The values of a preset (enabled is false for Off). `lit`: the match lights are on (task fx3). Lit wrestlers are brighter and more
+    // saturated than the game's own, and the lights-off grading on top of them clipped a third of their pixels to white, so with the lights
+    // on Subtle and Strong measure the bloom's brightness as luminance, keep a third of the wrestlers' glow and grade more gently.
+    Params presetParams(Preset preset, bool lit = false);
+    // The setting `light` (PS2X_LIGHT first, then the settings store): whether the presets take their lit values.
+    bool lightsOn();
 
     // The parameters as the settings say (fx, fx_preset and any fx_<name> overrides, each from its environment variable first, then the
     // settings store) ...
